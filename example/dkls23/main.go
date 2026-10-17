@@ -1,8 +1,9 @@
 // This example demonstrates a complete 3-of-3 DKLS23 threshold ECDSA flow:
 //
-//  1. Key Generation  — Feldman VSS DKG, no trusted dealer
-//  2. Pairwise Setup  — Base OT + OT Extension + VOLE + FZero
-//  3. Signing         — 3-round threshold ECDSA
+//  1. Key Generation  — Feldman VSS DKG (commit-then-reveal), no trusted dealer
+//  2. Pairwise Setup  — one-time base OTs + FZero seeds
+//  3. Signing         — 3-round threshold ECDSA; each session runs a fresh
+//     OT extension and VOLE over the base OTs
 //  4. Key Refresh     — rotate shares without changing the public key
 //  5. Persistence     — encrypted key shares saved to disk and reloaded
 //
@@ -41,7 +42,7 @@ func main() {
 	fmt.Println("DKLS23 Threshold ECDSA — 3-of-3 Demo")
 	fmt.Println()
 
-	nodes, pubKey := loadOrGenerate()
+	nodes, pubKey, enc := loadOrGenerate()
 
 	// ── Signing (before refresh) ────────────────────────────────────
 
@@ -54,6 +55,10 @@ func main() {
 	fmt.Println("Phase: Key Refresh")
 	refresh(nodes)
 	fmt.Println("  shares rotated, public key unchanged")
+	// Persist the refreshed shares: the pre-refresh shares on disk are now
+	// stale and must not be used again.
+	saveShares(nodes, enc)
+	fmt.Printf("  refreshed shares saved (epoch %d)\n", nodes[0].Epoch())
 	fmt.Println()
 
 	// ── Signing (after refresh) ─────────────────────────────────────
@@ -66,15 +71,27 @@ func main() {
 
 // loadOrGenerate loads existing shares from disk or runs the full ceremony
 // (DKG → pairwise setup → refresh → persist) if no shares exist.
-func loadOrGenerate() (nodes []*node.Node, pubKey []byte) {
+func loadOrGenerate() (nodes []*node.Node, pubKey []byte, enc *shared.AESEncryptor) {
 	enc, loaded, err := shared.LoadOrCreateKey(shareDir)
 	if err != nil {
 		log.Fatalf("encryption key: %v", err)
 	}
 	if loaded {
-		return loadShares(enc)
+		nodes, pubKey = loadShares(enc)
+		return nodes, pubKey, enc
 	}
-	return generateAndSave(enc)
+	nodes, pubKey = generateAndSave(enc)
+	return nodes, pubKey, enc
+}
+
+// saveShares encrypts and writes every node's SignerSetup to disk.
+func saveShares(nodes []*node.Node, enc *shared.AESEncryptor) {
+	for _, n := range nodes {
+		p := filepath.Join(shareDir, fmt.Sprintf("node-%d.enc", n.ID))
+		if err := n.SaveSetup(p, enc); err != nil {
+			log.Fatalf("save node %d: %v", n.ID, err)
+		}
+	}
 }
 
 // loadShares reads encrypted share files and returns ready-to-sign nodes.
@@ -138,14 +155,14 @@ func generateAndSave(enc *shared.AESEncryptor) ([]*node.Node, []byte) {
 
 	// ── Pairwise Setup ──────────────────────────────────────────
 
-	fmt.Println("Phase 2: Pairwise Setup (one-time)")
+	fmt.Println("Phase 2: Pairwise Setup (one-time base OTs + FZero)")
 
 	for i := 0; i < len(nodes); i++ {
 		for j := i + 1; j < len(nodes); j++ {
 			if err := nodes[i].SetupPairwiseWith(nodes[j]); err != nil {
 				log.Fatalf("pairwise setup %d↔%d: %v", nodes[i].ID, nodes[j].ID, err)
 			}
-			fmt.Printf("  node %d ↔ node %d: VOLE + FZero established\n", nodes[i].ID, nodes[j].ID)
+			fmt.Printf("  node %d ↔ node %d: base OTs + FZero established\n", nodes[i].ID, nodes[j].ID)
 		}
 	}
 	fmt.Println()
@@ -154,12 +171,9 @@ func generateAndSave(enc *shared.AESEncryptor) ([]*node.Node, []byte) {
 
 	fmt.Println("Phase 3: Saving Key Shares")
 
+	saveShares(nodes, enc)
 	for _, n := range nodes {
-		p := filepath.Join(shareDir, fmt.Sprintf("node-%d.enc", n.ID))
-		if err := n.SaveSetup(p, enc); err != nil {
-			log.Fatalf("save node %d: %v", n.ID, err)
-		}
-		fmt.Printf("  node %d → %s\n", n.ID, p)
+		fmt.Printf("  node %d → %s\n", n.ID, filepath.Join(shareDir, fmt.Sprintf("node-%d.enc", n.ID)))
 	}
 	fmt.Println()
 

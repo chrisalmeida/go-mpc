@@ -11,22 +11,53 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// buildSetups constructs a complete SignerSetup for each party: DKG + pairwise
-// VOLE/FZero, with pairwise work parallelised across goroutines.
-func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
-	// ---- Phase 1: DKG (sequential, fast) ----
+// runBaseOT runs the one-time base OT for one directed VOLE pair and returns
+// Alice's receiver seeds (she is the base-OT receiver with choice bits sigma)
+// and Bob's sender seed pairs.
+func runBaseOT() (*BaseOTReceiverSeeds, *BaseOTSenderSeeds, error) {
+	sigmaBytes := make([]byte, (LambdaC+7)/8)
+	if _, err := rand.Read(sigmaBytes); err != nil {
+		return nil, nil, err
+	}
+	sigma := make([]bool, LambdaC)
+	for k := 0; k < LambdaC; k++ {
+		sigma[k] = (sigmaBytes[k/8]>>(uint(k)%8))&1 == 1
+	}
+
+	// Alice (base-OT receiver) speaks first; Bob (base-OT sender) replies and
+	// derives both seed pairs; Alice finalizes to obtain K^{sigma_k}_k.
+	state, msg, err := BaseOTReceiverRound1(sigma)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer state.Zero()
+	bobSeeds0, bobSeeds1, reply, err := BaseOTSenderRound2(msg)
+	if err != nil {
+		return nil, nil, err
+	}
+	aliceSeeds, err := BaseOTReceiverFinalize(state, reply)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &BaseOTReceiverSeeds{Seeds: aliceSeeds, Sigma: sigma},
+		&BaseOTSenderSeeds{Seeds0: bobSeeds0, Seeds1: bobSeeds1}, nil
+}
+
+// runDKGSetups runs the full DKG and returns a SignerSetup per party with
+// empty pairwise maps.
+func runDKGSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 	configs := map[int]DKGPartyConfig{}
-	coeffs := map[int][]btcec.ModNScalar{}
+	privs := map[int]*DKGPrivateState{}
 	r1 := map[int]*DKGRound1Output{}
 	for _, id := range allIDs {
 		cfg := DKGPartyConfig{MyID: id, AllIDs: allIDs, Threshold: threshold}
 		configs[id] = cfg
-		out, c, err := DKGRound1(cfg)
+		out, priv, err := DKGRound1(cfg)
 		if err != nil {
 			return nil, err
 		}
 		r1[id] = out
-		coeffs[id] = c
+		privs[id] = priv
 	}
 	r2 := map[int]*DKGRound2Output{}
 	for _, id := range allIDs {
@@ -36,7 +67,7 @@ func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 				peers[j] = r1[j]
 			}
 		}
-		out, err := DKGRound2(configs[id], coeffs[id], peers)
+		out, err := DKGRound2(configs[id], privs[id], peers)
 		if err != nil {
 			return nil, err
 		}
@@ -45,21 +76,31 @@ func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 
 	setups := map[int]*SignerSetup{}
 	for _, id := range allIDs {
-		share, pk, err := DKGFinalize(configs[id], coeffs[id], r1, r2)
+		share, pk, err := DKGFinalize(configs[id], privs[id], r1, r2)
 		if err != nil {
 			return nil, err
 		}
+		privs[id].Zero()
 		setups[id] = &SignerSetup{
 			MyID: id, AllIDs: allIDs, Share: share, PubKey: pk,
-			Threshold:  threshold,
-			VoleAlice:  make(map[int]*VOLEAliceState),
-			VoleBob:    make(map[int]*VOLEBobState),
-			FZeroSeeds: make(map[int][16]byte),
-			Blacklist:  make(map[int]bool),
+			Threshold:   threshold,
+			AliceBaseOT: make(map[int]*BaseOTReceiverSeeds),
+			BobBaseOT:   make(map[int]*BaseOTSenderSeeds),
+			FZeroSeeds:  make(map[int][16]byte),
+			Blacklist:   make(map[int]bool),
 		}
 	}
+	return setups, nil
+}
 
-	// ---- Phase 2: Pairwise VOLE + FZero (parallel) ----
+// buildSetups constructs a complete SignerSetup for each party: DKG + pairwise
+// base OT (both directions) + FZero, with pairwise work parallelised across goroutines.
+func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
+	setups, err := runDKGSetups(allIDs, threshold)
+	if err != nil {
+		return nil, err
+	}
+
 	type pair struct{ i, j int }
 	var pairs []pair
 	for pi := 0; pi < len(allIDs); pi++ {
@@ -69,8 +110,8 @@ func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 	}
 
 	type pairResult struct {
-		aliceIJ, aliceJI *VOLEAliceState
-		bobIJ, bobJI     *VOLEBobState
+		aliceIJ, aliceJI *BaseOTReceiverSeeds
+		bobIJ, bobJI     *BaseOTSenderSeeds
 		fzeroIJ, fzeroJI [16]byte
 		err              error
 	}
@@ -83,11 +124,13 @@ func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 			defer wg.Done()
 			r := &results[idx]
 
-			r.aliceIJ, r.bobIJ, r.err = runVOLEPairwise()
+			// Direction i→j: i is Alice (base-OT receiver), j is Bob (base-OT sender).
+			r.aliceIJ, r.bobIJ, r.err = runBaseOT()
 			if r.err != nil {
 				return
 			}
-			r.aliceJI, r.bobJI, r.err = runVOLEPairwise()
+			// Direction j→i.
+			r.aliceJI, r.bobJI, r.err = runBaseOT()
 			if r.err != nil {
 				return
 			}
@@ -121,10 +164,10 @@ func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 		if r.err != nil {
 			return nil, r.err
 		}
-		setups[p.i].VoleAlice[p.j] = r.aliceIJ
-		setups[p.j].VoleBob[p.i] = r.bobIJ
-		setups[p.j].VoleAlice[p.i] = r.aliceJI
-		setups[p.i].VoleBob[p.j] = r.bobJI
+		setups[p.i].AliceBaseOT[p.j] = r.aliceIJ
+		setups[p.j].BobBaseOT[p.i] = r.bobIJ
+		setups[p.j].AliceBaseOT[p.i] = r.aliceJI
+		setups[p.i].BobBaseOT[p.j] = r.bobJI
 		setups[p.i].FZeroSeeds[p.j] = r.fzeroIJ
 		setups[p.j].FZeroSeeds[p.i] = r.fzeroJI
 	}
@@ -268,68 +311,39 @@ func (f *failingEncryptor) Decrypt([]byte) ([]byte, error) {
 	return nil, errors.New("decrypt failed")
 }
 
-// runVOLEPairwise is a helper for tests: runs a full OTE+VOLE setup between Alice and Bob.
+// runVOLEPairwise is a helper for tests: runs the one-time base OT and then
+// ONE session's OT-extension batch + VOLE sampling between Alice and Bob.
 // Returns (aliceState, bobState) ready for VOLEAliceMultiply / VOLEBobReceive.
 func runVOLEPairwise() (*VOLEAliceState, *VOLEBobState, error) {
-	// Bob plays base OT sender; Alice plays base OT receiver.
-	bobPrivKeys, bobPubKeys, err := BaseSenderRound1(LambdaC)
+	alice, bob, err := runBaseOT()
 	if err != nil {
 		return nil, nil, err
 	}
+	return runVOLESession(alice, bob, []byte("test-vole-session"))
+}
 
-	// Alice's choices sigma.
-	sigmaBytes := make([]byte, (LambdaC+7)/8)
-	if _, err = rand.Read(sigmaBytes); err != nil {
-		return nil, nil, err
-	}
-	sigma := make([]bool, LambdaC)
-	for k := 0; k < LambdaC; k++ {
-		sigma[k] = (sigmaBytes[k/8]>>(uint(k)%8))&1 == 1
-	}
-
-	responses, aliceSeeds, err := BaseReceiverRound1(bobPubKeys, sigma)
+// runVOLESession runs one OT-extension batch + VOLE sampling for the given
+// session id over existing base-OT seeds.
+func runVOLESession(alice *BaseOTReceiverSeeds, bob *BaseOTSenderSeeds, sid []byte) (*VOLEAliceState, *VOLEBobState, error) {
+	beta, err := sampleBeta()
 	if err != nil {
 		return nil, nil, err
 	}
-	bobSeeds0, bobSeeds1, err := BaseSenderFinalize(bobPrivKeys, bobPubKeys, responses)
+	oteMsg, gamma, err := OTExtReceive(bob.Seeds0, bob.Seeds1, beta, sid)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	// Bob's random beta.
-	betaBytes := make([]byte, (Xi+7)/8)
-	if _, err = rand.Read(betaBytes); err != nil {
-		return nil, nil, err
-	}
-	var beta [Xi]bool
-	for j := 0; j < Xi; j++ {
-		beta[j] = (betaBytes[j/8]>>(uint(j)%8))&1 == 1
-	}
-
-	corrections, err := OTExtReceiverCorrections(bobSeeds0, bobSeeds1, beta)
+	alpha0, alpha1, err := OTExtSend(alice.Seeds, alice.Sigma, sid, oteMsg)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	alpha0, alpha1, err := OTExtSenderExpand(aliceSeeds, sigma, corrections)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	gamma, err := OTExtReceiverExpand(bobSeeds0, beta, corrections)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	aliceState, err := VOLEAliceSetup(alpha0, alpha1)
 	if err != nil {
 		return nil, nil, err
 	}
-
 	bobState, err := VOLEBobSample(gamma, beta)
 	if err != nil {
 		return nil, nil, err
 	}
-
 	return aliceState, bobState, nil
 }

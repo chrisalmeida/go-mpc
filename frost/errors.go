@@ -18,10 +18,18 @@ import (
 //	    // caller bug, don't retry
 //	}
 
-// CheatingPartyError indicates one or more parties failed verification checks.
-// The protocol detected dishonest behaviour (bad Feldman, bad commitment, bad signature share).
-// Action: blacklist the listed parties; the protocol can continue without them
-// if enough honest parties remain above the threshold.
+// CheatingPartyError indicates that messages attributed to one or more parties
+// failed verification (a DKG proof of knowledge, a Feldman or hash commitment,
+// a refresh share, or a signature share). Action: abort the session.
+//
+// Whether to also blacklist PartyIDs is an application decision. The
+// attribution is only as good as the channel: RFC 9591 Section 5.4 states
+// that "FROST assumes the network channel is authenticated to identify the
+// signer that misbehaved". For Aggregate in particular, an equivocating
+// Coordinator can make an honest signer's share fail verification, so see
+// the caveats on Aggregate and SignerState.Blacklist before blacklisting
+// automatically. The protocol can continue without the excluded parties if
+// enough honest parties remain above the threshold.
 type CheatingPartyError struct {
 	PartyIDs []int
 	Phase    string // e.g. "DKGFinalize", "Aggregate"

@@ -10,6 +10,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// dkgTestContext is the DKG context string Φ shared by all test parties.
+var dkgTestContext = []byte("go-mpc frost tests: DKG session context")
+
 // buildDKG runs a complete distributed DKG for the given party IDs and threshold.
 // Returns a KeyShare per party.
 func buildDKG(allIDs []int, threshold int) (map[int]*KeyShare, error) {
@@ -18,7 +21,7 @@ func buildDKG(allIDs []int, threshold int) (map[int]*KeyShare, error) {
 	r1 := make(map[int]*DKGRound1Output)
 
 	for _, id := range allIDs {
-		cfg := DKGPartyConfig{MyID: id, AllIDs: allIDs, Threshold: threshold}
+		cfg := DKGPartyConfig{MyID: id, AllIDs: allIDs, Threshold: threshold, Context: dkgTestContext}
 		configs[id] = cfg
 		out, c, err := DKGRound1(cfg)
 		if err != nil {
@@ -30,7 +33,7 @@ func buildDKG(allIDs []int, threshold int) (map[int]*KeyShare, error) {
 
 	r2 := make(map[int]*DKGRound2Output)
 	for _, id := range allIDs {
-		out, err := DKGRound2(configs[id], coeffs[id])
+		out, err := DKGRound2(configs[id], coeffs[id], r1)
 		if err != nil {
 			return nil, err
 		}

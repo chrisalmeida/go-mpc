@@ -29,6 +29,190 @@ findings. **All 10 findings have been resolved.**
 **frost review** identified **0 high**, **2 medium**, and **2 low** severity
 findings. **All 4 findings have been resolved.**
 
+**2026-10-16 follow-up review** (see the next section) found that the
+original review was incomplete: it identified **1 critical**, **1 high**,
+**4 medium**, and **5 low** additional findings, including a confirmed
+full-key-recovery attack on dkls23 that was demonstrated with a
+proof-of-concept test. All of them are resolved in the current source.
+
+---
+
+## 2026-10-16 Follow-up Review
+
+**Scope**: all production source in `dkls23/` and `frost/`, reviewed against
+the DKLS23 paper (ePrint 2023/765, Protocols 3.6, 5.2, 7.1, §5.1, §8.1-8.2),
+RFC 9591, the FROST paper (ePrint 2020/852, Figure 1) and MR19 (ePrint
+2019/706, Figure 8, Appendix D.1).
+**Method**: independent source review, exploit construction, and
+re-implementation of the deviating components to match the cited
+specifications. The exploit for FU-CRIT-1 was written as a Go test and run
+against the code as it stood; it recovered the master private key.
+
+### FU-CRIT-1: VOLE correlation reused across signing sessions — RESOLVED
+
+**File**: `vole.go` (`VOLEAliceMultiply`), `sign.go`, `persistence.go`
+**Severity**: Critical
+**Category**: Key recovery
+
+The OT extension was run once during pairwise setup and its outputs
+(`VOLEAliceState.Alpha0/Alpha1`, `VOLEBobState.Gamma`) were persisted and
+reused by every signing session. Alice's multiply message is
+`ã = α0 − α1 + a` with `a = (r_i, sk_i)`, so the difference of two sessions'
+messages equals the difference of her nonces. A co-signer, who also knows its
+own nonces, therefore learns the difference of the two combined ECDSA nonces
+and recovers the private key from two signatures by solving two linear
+equations. A proof-of-concept test (2-of-2, party 2 passive) recovered the
+key on the first run. The library's own test suite exercised exactly this
+usage (`TestSign3of3MultipleMessages`).
+
+**Resolution**: Per Functionality 5.1 (fresh `sid` per batch) and §8.2 ("setup
+for endemic OT extension is performed once per pair of parties, and reused
+thereafter in all instances of the protocol realizing FEOTE"), only the λc
+base-OT seeds are persistent. `SignRound1` now runs a fresh OT-extension
+batch for every counterparty (carried in `Round1Msg.OTExt`, realizing
+`(sample, sid)` of Protocol 3.6 step 6) and `SignRound2` derives the
+session's VOLE correlation from it (Protocol 5.2 steps 2-3). No VOLE state is
+serialized in `SignerSetup`. Regression test: `TestSignSessionsUseFreshVOLE`.
+
+### FU-HIGH-1: IKNP OT extension without consistency check — RESOLVED
+
+**File**: `ot_extension.go`
+**Severity**: High
+**Category**: Selective-failure attack / key recovery
+
+The extension was plain IKNP, which is only passively secure against the
+receiver. A malicious Bob can send inconsistent correction rows and learn
+Alice's base-OT choice bits σ through selective abort; with σ he obtains both
+OT messages and reads Alice's nonce and key share from her multiply message.
+
+**Resolution**: KOS15 (Figure 7) consistency check made one-message by
+deriving the challenge with Fiat-Shamir from the correction matrix, with the
+statistical parameter replaced by λc, exactly as prescribed in DKLS23 §5.1.
+The batch is padded with 2λc sacrificial OTs (ℓ' = ξ + 2λc), the check runs
+in constant-time GF(2^128) arithmetic (`gf128.go`), and a failing check
+aborts the FRVOLE instance and blacklists the sender (Protocol 3.6 step 8).
+
+### FU-MED-1: DKG revealed Feldman commitments before commitment — RESOLVED
+
+**File**: `dkg.go`
+**Severity**: Medium
+**Category**: Protocol deviation (public-key bias)
+
+Protocol 7.1 step 2 has each party *commit* via FCom to its Feldman
+commitments and to each pairwise share, and only release them in step 3 once
+all commitments are known. The implementation broadcast the Feldman points in
+round 1, letting a rushing last party choose its polynomial after seeing the
+others' and bias the group key.
+
+**Resolution**: `DKGRound1Output` now carries only FCom commitments;
+`DKGRound2` requires every other party's round 1 commitment before releasing
+the Feldman vector, its salt, the shares and their salts; `DKGFinalize` opens
+both commitments before the Feldman check.
+
+### FU-MED-2: Feldman commitment count not validated — RESOLVED
+
+**File**: `dkg.go`, `refresh.go`
+**Severity**: Medium
+**Category**: Input validation (liveness)
+
+A party could commit to a polynomial of the wrong degree; the resulting key
+would not be reconstructible by any t parties. **Resolution**: exactly t
+commitments (t−1 for refresh) are required; share encodings that overflow the
+group order are rejected.
+
+### FU-MED-3: FROST DKG had no proof of knowledge — RESOLVED
+
+**File**: `frost/keygen.go`, `frost/hash.go`
+**Severity**: Medium
+**Category**: Protocol deviation (rogue-key / public-key bias)
+
+The DKG was plain Pedersen DKG. The FROST paper (Figure 1) requires each
+participant to prove knowledge of its constant term a_i0 with a Schnorr
+proof σ_i = (R_i, μ_i), c_i = H(i, Φ, φ_i0, R_i), verified by every other
+participant before round-2 shares are sent, "to protect against rogue key
+attacks".
+
+**Resolution**: `DKGRound1Output` now carries `ProofR`/`ProofMu`;
+`DKGPartyConfig.Context` supplies Φ; `DKGRound2` takes all round-1 outputs
+and verifies every proof before releasing shares, and `DKGFinalize` verifies
+them again. The proof hash is this package's instantiation of the paper's H
+(`SHA-512(ContextString || "dkg" || id || Φ || φ_i0 || R_i) mod L`), since
+RFC 9591 specifies no DKG. The nonce k is zeroized.
+
+### FU-MED-4: FROST element decoding and conformance not verified — RESOLVED
+
+**File**: `frost/sign.go`, `frost/keygen.go`, `frost/verify.go`,
+`frost/vectors_test.go`
+**Severity**: Medium
+**Category**: Specification conformance
+
+Received group elements were decoded with `edwards25519.Point.SetBytes`,
+which accepts non-canonical encodings and does not reject the identity or
+elements outside the prime-order subgroup, contrary to RFC 9591 §6.1
+`DeserializeElement`; the earlier audit nevertheless claimed non-canonical
+point rejection. No RFC test vectors were run.
+
+**Resolution**: `deserializeElement` implements §6.1 (RFC 8032 decoding,
+canonical re-encoding check, identity and small-order rejection) and is used
+for every received element (Feldman commitments, nonce commitments,
+verification shares, group public key, proof R). `frost/vectors_test.go`
+runs the RFC 9591 Appendix E.1 FROST(Ed25519, SHA-512) vectors through the
+implementation: nonce generation, commitments, binding-factor inputs and
+factors, both signature shares and the final signature all match exactly,
+and the signature is accepted by `crypto/ed25519.Verify`. The cofactored
+verification equation is pinned by a test using an order-8 component.
+
+### FU-LOW-1: `SignCounter` did not guard anything — RESOLVED
+
+The counter was incremented but never checked, contrary to its
+documentation. It is removed; with FU-CRIT-1 resolved there is no stored
+session material to protect from rollback.
+
+### FU-LOW-2: `SignCombine` double-counted the caller's fragment — RESOLVED
+
+Passing `SignRound3`'s full output map (which includes the caller's own
+entry) together with the explicit own-fragment arguments produced an invalid
+signature. The own entry is now ignored.
+
+### FU-LOW-3: No wire-format version — RESOLVED
+
+`SignerSetup` JSON now carries `"version": 1`; unknown or missing versions
+are rejected on deserialization.
+
+### FU-LOW-5: FROST wire format unversioned; blacklisting advice overstated — RESOLVED
+
+`KeyShare` and `SignerState` JSON now carry `"version": 1` and reject
+missing or unknown versions. The documentation of `Aggregate`,
+`SignerState.Blacklist` and `CheatingPartyError` now states, with the RFC
+9591 §5.4 and §7 text, that identifiable abort assumes an authenticated
+channel and a non-equivocating Coordinator: a Coordinator that hands signers
+different commitment lists makes an honest signer's share fail verification,
+so automatic permanent blacklisting is only safe with an honest or
+reliable-broadcast Coordinator.
+
+### FU-LOW-4: Base OT was not the specified protocol — RESOLVED
+
+**File**: `ot.go`
+**Severity**: Low
+**Category**: Protocol deviation / documentation
+
+The base OT was a Chou-Orlandi-style construction (receiver response
+`R = bG + c·T`) documented as Masny-Rindal. DKLS23 §8.1 specifies the
+two-round UC-secure endemic OT of Masny and Rindal instantiated from DDH
+over the signing curve.
+
+**Resolution**: `ot.go` now implements MR19 Figure 8 (1-out-of-2) with the
+Diffie-Hellman key agreement of MR19 Appendix D.1: the receiver samples
+`r_{1-c}` uniformly and sets `r_c = a·G − H_c(r_{1-c})`; the sender recovers
+`m_{A,j} = r_j + H_j(r_{1-j})`, replies with `b_j·G` and derives
+`s_{B,j} = b_j·m_{A,j}`; the receiver derives `s_{A,c} = a·m_{B,c}`. Output
+seeds are derived from the agreed key through the random oracle (Remark D.4).
+`H_j` is a hash-to-curve random oracle with unknown discrete log. All
+choice-bit-dependent selections are constant-time byte copies on affine
+coordinates; a message that would force an agreed key to the point at
+infinity is rejected. The receiver now speaks first (two rounds), and the
+receiver's key-agreement secrets are zeroized after finalization.
+
 ---
 
 ## Findings
@@ -476,7 +660,7 @@ runtime, or the deployment environment:
 | Low | 2 | 2 |
 | **Total** | **4** | **4** |
 
-### Combined
+### Combined (original review)
 
 | Severity | Found | Resolved |
 |---|---|---|
@@ -485,6 +669,16 @@ runtime, or the deployment environment:
 | Medium | 6 | 6 |
 | Low | 7 | 7 |
 | **Total** | **14** | **14** |
+
+### 2026-10-16 follow-up review
+
+| Severity | Found | Resolved |
+|---|---|---|
+| Critical | 1 | 1 |
+| High | 1 | 1 |
+| Medium | 4 | 4 |
+| Low | 5 | 5 |
+| **Total** | **11** | **11** |
 
 ---
 

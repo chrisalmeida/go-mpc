@@ -20,8 +20,7 @@ type Node struct {
 	Threshold int
 	Setup     *dkls23.SignerSetup
 
-	dkgCoeffs []btcec.ModNScalar
-	dkgRound1 *dkls23.DKGRound1Output
+	dkgPriv *dkls23.DKGPrivateState
 
 	refreshCoeffs []btcec.ModNScalar
 	refreshSeed   [16]byte
@@ -32,7 +31,8 @@ func New(id int, allIDs []int, threshold int) *Node {
 	return &Node{ID: id, AllIDs: allIDs, Threshold: threshold}
 }
 
-// SessionID returns a fresh random session identifier.
+// SessionID returns a fresh random session identifier. Every signing session
+// must use a fresh one (DKLS23 Protocol 3.6 step 4 ignores non-fresh sigids).
 func SessionID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -43,17 +43,19 @@ func SessionID() string {
 
 // ── Key Generation ──────────────────────────────────────────────
 
+// DKGRound1 commits to this node's polynomial (Feldman commitments and
+// pairwise shares) without revealing anything yet.
 func (n *Node) DKGRound1() (*dkls23.DKGRound1Output, error) {
 	cfg := dkls23.DKGPartyConfig{MyID: n.ID, AllIDs: n.AllIDs, Threshold: n.Threshold}
-	out, coeffs, err := dkls23.DKGRound1(cfg)
+	out, priv, err := dkls23.DKGRound1(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("node %d DKGRound1: %w", n.ID, err)
 	}
-	n.dkgCoeffs = coeffs
-	n.dkgRound1 = out
+	n.dkgPriv = priv
 	return out, nil
 }
 
+// DKGRound2 decommits once every other party's round 1 commitment is known.
 func (n *Node) DKGRound2(allRound1 map[int]*dkls23.DKGRound1Output) (*dkls23.DKGRound2Output, error) {
 	cfg := dkls23.DKGPartyConfig{MyID: n.ID, AllIDs: n.AllIDs, Threshold: n.Threshold}
 	peers := make(map[int]*dkls23.DKGRound1Output, len(allRound1)-1)
@@ -62,37 +64,37 @@ func (n *Node) DKGRound2(allRound1 map[int]*dkls23.DKGRound1Output) (*dkls23.DKG
 			peers[id] = r
 		}
 	}
-	out, err := dkls23.DKGRound2(cfg, n.dkgCoeffs, peers)
+	out, err := dkls23.DKGRound2(cfg, n.dkgPriv, peers)
 	if err != nil {
 		return nil, fmt.Errorf("node %d DKGRound2: %w", n.ID, err)
 	}
 	return out, nil
 }
 
-// DKGFinalize verifies shares, computes the Shamir share, and returns the
-// 33-byte compressed master public key.
+// DKGFinalize verifies decommitments and shares, computes the Shamir share,
+// and returns the 33-byte compressed master public key.
 func (n *Node) DKGFinalize(
 	allRound1 map[int]*dkls23.DKGRound1Output,
 	allRound2 map[int]*dkls23.DKGRound2Output,
 ) (pubKey []byte, err error) {
 	cfg := dkls23.DKGPartyConfig{MyID: n.ID, AllIDs: n.AllIDs, Threshold: n.Threshold}
-	share, pk, err := dkls23.DKGFinalize(cfg, n.dkgCoeffs, allRound1, allRound2)
+	share, pk, err := dkls23.DKGFinalize(cfg, n.dkgPriv, allRound1, allRound2)
+	n.dkgPriv.Zero()
+	n.dkgPriv = nil
 	if err != nil {
 		return nil, fmt.Errorf("node %d DKGFinalize: %w", n.ID, err)
 	}
 	n.Setup = &dkls23.SignerSetup{
-		MyID:       n.ID,
-		AllIDs:     n.AllIDs,
-		Share:      share,
-		PubKey:     pk,
-		Threshold:  n.Threshold,
-		VoleAlice:  make(map[int]*dkls23.VOLEAliceState),
-		VoleBob:    make(map[int]*dkls23.VOLEBobState),
-		FZeroSeeds: make(map[int][16]byte),
-		Blacklist:  make(map[int]bool),
+		MyID:        n.ID,
+		AllIDs:      n.AllIDs,
+		Share:       share,
+		PubKey:      pk,
+		Threshold:   n.Threshold,
+		AliceBaseOT: make(map[int]*dkls23.BaseOTReceiverSeeds),
+		BobBaseOT:   make(map[int]*dkls23.BaseOTSenderSeeds),
+		FZeroSeeds:  make(map[int][16]byte),
+		Blacklist:   make(map[int]bool),
 	}
-	n.dkgCoeffs = nil
-	n.dkgRound1 = nil
 	return pk, nil
 }
 
@@ -106,78 +108,59 @@ func (n *Node) PublicKey() []byte {
 
 // ── Pairwise Setup ──────────────────────────────────────────────
 
-// SetupPairwiseWith establishes VOLE and FZero state between two nodes.
-// Must be called after DKGFinalize on both sides.
+// SetupPairwiseWith establishes the one-time base OTs (both directions) and
+// the FZero seed between two nodes. Must be called after DKGFinalize on both
+// sides. The per-session OT extension and VOLE are run inside each signing
+// session, not here.
 func (n *Node) SetupPairwiseWith(peer *Node) error {
-	if err := n.setupVOLEPair(peer); err != nil {
+	if err := n.setupBaseOTPair(peer); err != nil {
 		return err
 	}
 	return n.setupFZeroPair(peer)
 }
 
-func (n *Node) setupVOLEPair(peer *Node) error {
-	// Direction: n → peer (n is Alice, peer is Bob)
-	aliceAB, bobAB, err := setupVOLEOneDirection()
+func (n *Node) setupBaseOTPair(peer *Node) error {
+	// Direction n → peer (n is Alice = base-OT receiver, peer is Bob = base-OT sender).
+	aliceNP, bobNP, err := setupBaseOTOneDirection()
 	if err != nil {
-		return fmt.Errorf("VOLE %d→%d: %w", n.ID, peer.ID, err)
+		return fmt.Errorf("base OT %d→%d: %w", n.ID, peer.ID, err)
 	}
-	n.Setup.VoleAlice[peer.ID] = aliceAB
-	peer.Setup.VoleBob[n.ID] = bobAB
+	n.Setup.AliceBaseOT[peer.ID] = aliceNP
+	peer.Setup.BobBaseOT[n.ID] = bobNP
 
-	// Direction: peer → n (peer is Alice, n is Bob)
-	aliceBA, bobBA, err := setupVOLEOneDirection()
+	// Direction peer → n (peer is Alice, n is Bob).
+	alicePN, bobPN, err := setupBaseOTOneDirection()
 	if err != nil {
-		return fmt.Errorf("VOLE %d→%d: %w", peer.ID, n.ID, err)
+		return fmt.Errorf("base OT %d→%d: %w", peer.ID, n.ID, err)
 	}
-	peer.Setup.VoleAlice[n.ID] = aliceBA
-	n.Setup.VoleBob[peer.ID] = bobBA
+	peer.Setup.AliceBaseOT[n.ID] = alicePN
+	n.Setup.BobBaseOT[peer.ID] = bobPN
 
 	return nil
 }
 
-// setupVOLEOneDirection runs the full base OT → OT extension → VOLE flow
-// and returns the Alice and Bob states.
-func setupVOLEOneDirection() (*dkls23.VOLEAliceState, *dkls23.VOLEBobState, error) {
-	// Base OT
-	senderPriv, senderPub, err := dkls23.BaseSenderRound1(dkls23.LambdaC)
-	if err != nil {
-		return nil, nil, err
-	}
+// setupBaseOTOneDirection runs the LambdaC Masny-Rindal base OTs for one
+// directed VOLE pair and returns Alice's receiver seeds and Bob's sender seed
+// pairs. Alice (base-OT receiver, choice bits sigma) speaks first; Bob
+// (base-OT sender) replies; Alice finalizes. In a networked deployment the
+// BaseOTReceiverMsg and BaseOTSenderMsg values are the two wire messages.
+func setupBaseOTOneDirection() (*dkls23.BaseOTReceiverSeeds, *dkls23.BaseOTSenderSeeds, error) {
 	sigma := randomBools(dkls23.LambdaC)
-	resp, recvSeeds, err := dkls23.BaseReceiverRound1(senderPub, sigma)
+	state, msg, err := dkls23.BaseOTReceiverRound1(sigma)
 	if err != nil {
 		return nil, nil, err
 	}
-	s0, s1, err := dkls23.BaseSenderFinalize(senderPriv, senderPub, resp)
+	defer state.Zero()
+	s0, s1, reply, err := dkls23.BaseOTSenderRound2(msg)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	// OT Extension
-	beta := randomBetaXi()
-	corr, err := dkls23.OTExtReceiverCorrections(s0, s1, beta)
+	recvSeeds, err := dkls23.BaseOTReceiverFinalize(state, reply)
 	if err != nil {
 		return nil, nil, err
 	}
-	a0, a1, err := dkls23.OTExtSenderExpand(recvSeeds, sigma, corr)
-	if err != nil {
-		return nil, nil, err
-	}
-	gam, err := dkls23.OTExtReceiverExpand(s0, beta, corr)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// VOLE
-	alice, err := dkls23.VOLEAliceSetup(a0, a1)
-	if err != nil {
-		return nil, nil, err
-	}
-	bob, err := dkls23.VOLEBobSample(gam, beta)
-	if err != nil {
-		return nil, nil, err
-	}
-	return alice, bob, nil
+	return &dkls23.BaseOTReceiverSeeds{Seeds: recvSeeds, Sigma: sigma},
+		&dkls23.BaseOTSenderSeeds{Seeds0: s0, Seeds1: s1}, nil
 }
 
 func (n *Node) setupFZeroPair(peer *Node) error {
@@ -307,16 +290,4 @@ func randomBools(n int) []bool {
 		out[k] = (buf[k/8]>>(uint(k)%8))&1 == 1
 	}
 	return out
-}
-
-func randomBetaXi() [dkls23.Xi]bool {
-	buf := make([]byte, (dkls23.Xi+7)/8)
-	if _, err := rand.Read(buf); err != nil {
-		panic(err)
-	}
-	var beta [dkls23.Xi]bool
-	for j := 0; j < dkls23.Xi; j++ {
-		beta[j] = (buf[j/8]>>(uint(j)%8))&1 == 1
-	}
-	return beta
 }

@@ -4,18 +4,26 @@
 //
 // # Protocol components
 //
-//   - 2-round DKG using Feldman VSS (Protocol 7.1)
+//   - 2-round commit-then-reveal DKG using Feldman VSS (Protocol 7.1)
 //   - 3-round threshold signing (Protocol 3.6)
-//   - Pairwise VOLE setup via base OT + OT extension (Section 5)
+//   - One-time pairwise base OTs (Masny-Rindal, Section 8.1) and FZero seeds
+//   - Per-session OT extension (one-message KOS, Section 5.1) and random
+//     VOLE (Protocol 5.2), run afresh inside every signing session
 //   - Proactive key refresh following KMOS21
 //
 // # Security model
 //
 // The protocol operates in a t-of-n threshold setting over secp256k1.
 // All secret scalar arithmetic uses constant-time ModNScalar operations.
-// Cheating parties are detected during the VOLE consistency check and
-// the R-commitment decommitment phase; detected parties are blacklisted
-// and excluded from future sessions.
+// Cheating parties are detected by the OT-extension consistency check, the
+// VOLE consistency check, and the R-commitment decommitment and check-value
+// verification; detected parties are blacklisted and excluded from future
+// sessions.
+//
+// Only the base-OT seeds and FZero seeds are persistent (Section 8.2). The
+// OT-extension batch and the VOLE correlation derived from it are specific
+// to one signing session and are never stored or reused: reuse would reveal
+// the difference of a signer's nonces across sessions.
 //
 // # Concurrency
 //
@@ -25,7 +33,8 @@
 //
 // # Usage flow
 //
-// DKG -> pairwise VOLE/FZero setup -> signing -> optional refresh.
+// DKG -> pairwise base-OT/FZero setup -> signing (fresh OT extension + VOLE
+// per session) -> optional refresh.
 // See the example/ directory for a runnable demonstration.
 package dkls23
 
@@ -45,6 +54,15 @@ const (
 	LambdaS = 80
 	// Xi is the number of OT instances per VOLE invocation: Kappa + 2*LambdaS.
 	Xi = Kappa + 2*LambdaS // 416
+	// XiExt is the padded length of one KOS15 OT-extension batch in bits.
+	// KOS15 (Figure 7) extends ℓ useful OTs to ℓ' = ℓ + κ + s columns, where
+	// the extra κ + s columns are sacrificed to the consistency check so that
+	// the receiver's choice bits for the useful ℓ columns stay hidden. Under
+	// the one-message Fiat-Shamir variant of DKLS23 §5.1 the statistical
+	// parameter s must be replaced by the computational parameter κ = LambdaC,
+	// giving ℓ' = Xi + 2*LambdaC = 672 bits = 84 bytes. Only the first Xi
+	// columns yield OT outputs; the remaining 2*LambdaC are discarded.
+	XiExt = Xi + 2*LambdaC // 672
 	// Rho is the number of VOLE check elements: ceil(Kappa/LambdaC).
 	Rho = 2
 	// Ell is the number of VOLE inputs: {r_i, sk_i}.
@@ -57,9 +75,11 @@ const (
 // Centralized here to prevent accidental collisions.
 const (
 	domainBaseOT       = "base-ot"
+	domainBaseOTHash   = "base-ot-h"
 	domainOTEPRG       = "ote-prg"
 	domainOTESeed      = "ote-seed"
 	domainOTEExpand    = "ote-expand"
+	domainOTEKOS       = "ote-kos"
 	domainVOLEFS       = "vole-fs"
 	domainVOLEProof    = "vole-proof"
 	domainVOLERefresh  = "vole-refresh"
@@ -68,7 +88,7 @@ const (
 )
 
 // curveOrder is the secp256k1 group order q.
-// Retained for the 64-byte hash reduction in reduce64Public and oteExpandHash.
+// Retained for the 64-byte reduction of public hash outputs in reduce64Public.
 var curveOrder = btcec.S256().N
 
 // gadget is the precomputed gadget vector g[j] = 2^j mod q for j in [0, Xi).

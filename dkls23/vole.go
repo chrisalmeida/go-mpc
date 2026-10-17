@@ -268,8 +268,8 @@ func VOLEBobReceive(state *VOLEBobState, sid string, msg *VOLEMultiplyMsg) (d_u,
 			}
 			var etaK btcec.ModNScalar
 			etaK.SetByteSlice(msg.Eta[k][:])
-			etaK.Negate()        // -eta[k]
-			etaK.Mul(&betaMask)  // 0 or -eta[k]
+			etaK.Negate()       // -eta[k]
+			etaK.Mul(&betaMask) // 0 or -eta[k]
 			v.Add(&etaK)
 			muPrime[j][k] = v.Bytes()
 		}

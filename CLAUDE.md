@@ -30,18 +30,19 @@ go test -race -timeout 120s ./...
 ## Code Layout
 
 - `dkls23/` — Core protocol package. All cryptographic code lives here.
-  - `dkg.go` — Feldman VSS distributed key generation (Protocol 7.1)
-  - `sign.go` — 3-round threshold signing (Protocol 3.6)
-  - `refresh.go` — Proactive key share refresh (KMOS21)
-  - `vole.go` — Vector OLE (Protocol 5.2)
-  - `ot.go` / `ot_extension.go` — Base OT and IKNP extension
+  - `dkg.go` — Commit-then-reveal Feldman VSS distributed key generation (Protocol 7.1)
+  - `sign.go` — 3-round threshold signing (Protocol 3.6); round 1 carries a fresh OT-extension batch per counterparty, round 2 derives the session's VOLE from it
+  - `refresh.go` — Proactive key share refresh (KMOS21); re-randomizes shares, base-OT seeds, FZero seeds
+  - `vole.go` — Vector OLE (Protocol 5.2), instantiated fresh per signing session
+  - `ot.go` — Masny-Rindal endemic base OT (one-time setup; the only persistent OT material)
+  - `ot_extension.go` / `gf128.go` — KOS15 OT extension with Fiat-Shamir consistency check (paper §5.1) and its GF(2^128) arithmetic
   - `commitment.go` — FCom and FZero primitives
   - `persistence.go` — AES-256-GCM encrypted serialization
   - `encoding.go` — Wire format JSON marshaling
   - `errors.go` — Typed error categories
   - `params.go` — Security constants and package-level docs
 - `frost/` — FROST threshold Schnorr / Ed25519 package (RFC 9591).
-  - `keygen.go` — Feldman VSS distributed key generation (2 rounds)
+  - `keygen.go` — Feldman VSS distributed key generation (2 rounds) with the FROST paper's Schnorr proof of knowledge of each constant term, verified before shares are sent; received elements go through `deserializeElement` (RFC 9591 §6.1)
   - `sign.go` — 2-round threshold signing + aggregation
   - `refresh.go` — Proactive key share refresh
   - `verify.go` — Cofactored Ed25519 verification
@@ -71,14 +72,16 @@ CI runs on resource-constrained GitHub Actions runners where crypto-heavy tests 
 
 ### dkls23 test patterns
 
-1. **Parallel VOLE setup** — `buildSetups()` in `helpers_test.go` runs pairwise VOLE/FZero setup concurrently across goroutines (one per party pair).
-2. **Cached 3-of-3 fixture** — `fullSetup(t)` builds the expensive DKG+VOLE setup once via `sync.Once` and deep-copies via JSON for each caller. Use `fullSetup(t)` for any test that needs a standard 3-of-3. Only call `setupSigners(t, ids, threshold)` for non-standard configs (2-of-3, 2-of-2, etc.).
-3. **`t.Parallel()`** — All tests that do crypto work (VOLE, OT, signing, refresh) must include `t.Parallel()` so they overlap. This is safe because `fullSetup` returns independent deep copies and `setupSigners`/`buildSetups` create fresh state.
+1. **Parallel base-OT setup** — `buildSetups()` in `helpers_test.go` runs pairwise base-OT/FZero setup concurrently across goroutines (one per party pair).
+2. **Cached 3-of-3 fixture** — `fullSetup(t)` builds the expensive DKG+base-OT setup once via `sync.Once` and deep-copies via JSON for each caller. Use `fullSetup(t)` for any test that needs a standard 3-of-3. Only call `setupSigners(t, ids, threshold)` for non-standard configs (2-of-3, 2-of-2, etc.).
+3. **Session helpers** — `runRound1`/`runRound2`/`runRound3`/`runSession` in `sign_test.go` return a `signingSession` whose messages can be tampered with between rounds; `runSigning` wraps a full session plus `SignCombine`. `runVOLEPairwise`/`runVOLESession` in `helpers_test.go` run one OT-extension batch + VOLE sampling over fresh or given base-OT seeds.
+4. **`t.Parallel()`** — All tests that do crypto work (VOLE, OT, signing, refresh) must include `t.Parallel()` so they overlap. This is safe because `fullSetup` returns independent deep copies and `setupSigners`/`buildSetups` create fresh state.
 
 When adding new dkls23 tests:
 - If the test needs a 3-of-3 setup, use `fullSetup(t)` (cached) — **not** `setupSigners(t, []int{1,2,3}, 3)`.
 - Add `t.Parallel()` to any test that takes >100ms or calls `fullSetup`/`setupSigners`/`runVOLEPairwise`.
 - Never share mutable state between parallel tests; each test should own its setup.
+- Never persist or reuse `VOLEAliceState`/`VOLEBobState` across sessions in a test fixture; only base-OT seeds are reusable.
 
 ### frost test patterns
 
@@ -104,7 +107,9 @@ All code in `dkls23/` and `frost/` is security-critical.
 - Persistence (encryption key handling)
 
 ### frost
-- DKG (Feldman VSS commitment verification, commitment count validation)
+- DKG (proof-of-knowledge verification, Feldman VSS commitment verification, commitment count validation)
+- Element deserialization (`deserializeElement`: canonical encoding, non-identity, prime-order subgroup per RFC 9591 §6.1)
+- RFC 9591 Appendix E.1 vectors in `vectors_test.go` must keep passing exactly
 - Signing (hedged nonce generation via `nonce_generate`, nonce reuse prevention)
 - Aggregation (signature share verification for identifiable abort)
 - Key refresh (zero-constant polynomial share re-randomization)

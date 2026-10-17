@@ -6,22 +6,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
-	"sync/atomic"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 )
 
+// SetupWireVersion is the version of the SignerSetup JSON wire format. It is
+// embedded in every serialized SignerSetup and checked on deserialization so
+// that stored key material from an incompatible format is rejected rather
+// than silently misinterpreted.
+const SetupWireVersion = 1
+
 // --- Encoding helpers ---
 
 // scalarToHex serializes a ModNScalar to 64-char hex (32 bytes big-endian).
-// Wire-format compatible with the previous bigToHex implementation.
 func scalarToHex(s *btcec.ModNScalar) string {
 	b := s.Bytes()
 	return hex.EncodeToString(b[:])
 }
 
 // hexToScalar parses a 64-char hex string into a ModNScalar.
-// Wire-format compatible with the previous hexToBig implementation.
 func hexToScalar(s string) (btcec.ModNScalar, error) {
 	var out btcec.ModNScalar
 	if s == "" {
@@ -303,6 +306,33 @@ func decodeBoolArray(s string) ([Xi]bool, error) {
 	return out, nil
 }
 
+// encodeBoolSlice packs a []bool (LSB-first per byte) and base64-encodes it.
+func encodeBoolSlice(data []bool) string {
+	buf := make([]byte, (len(data)+7)/8)
+	for j, b := range data {
+		if b {
+			buf[j/8] |= 1 << (uint(j) % 8)
+		}
+	}
+	return base64.StdEncoding.EncodeToString(buf)
+}
+
+// decodeBoolSlice decodes exactly n bits packed by encodeBoolSlice.
+func decodeBoolSlice(s string, n int) ([]bool, error) {
+	buf, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	if len(buf) != (n+7)/8 {
+		return nil, fmt.Errorf("bool slice size %d, expected %d", len(buf), (n+7)/8)
+	}
+	out := make([]bool, n)
+	for j := 0; j < n; j++ {
+		out[j] = (buf[j/8]>>(uint(j)%8))&1 == 1
+	}
+	return out, nil
+}
+
 // [][]byte ↔ []string (hex)
 func encodeBytesSlice(data [][]byte) []string {
 	out := make([]string, len(data))
@@ -324,21 +354,36 @@ func decodeBytesSlice(data []string) ([][]byte, error) {
 	return out, nil
 }
 
+// decodeSeedSlice decodes exactly LambdaC 32-byte seeds.
+func decodeSeedSlice(data []string) ([][]byte, error) {
+	if len(data) != LambdaC {
+		return nil, fmt.Errorf("expected %d seeds, got %d", LambdaC, len(data))
+	}
+	out, err := decodeBytesSlice(data)
+	if err != nil {
+		return nil, err
+	}
+	for i, s := range out {
+		if len(s) != 32 {
+			return nil, fmt.Errorf("seed %d: expected 32 bytes, got %d", i, len(s))
+		}
+	}
+	return out, nil
+}
+
 // =====================================================================
 // DKGRound1Output
 // =====================================================================
 
 type dkgRound1OutputJSON struct {
-	FeldmanCommitments  []string          `json:"feldman_commitments"`
+	FeldmanCommitment   string            `json:"feldman_commitment"`
 	PairwiseCommitments map[string]string `json:"pairwise_commitments"`
-	PairwiseSalts       map[string]string `json:"pairwise_salts"`
 }
 
 func (o *DKGRound1Output) MarshalJSON() ([]byte, error) {
 	return json.Marshal(dkgRound1OutputJSON{
-		FeldmanCommitments:  encodeBytesSlice(o.FeldmanCommitments),
+		FeldmanCommitment:   hex.EncodeToString(o.FeldmanCommitment[:]),
 		PairwiseCommitments: intMap32ToJSON(o.PairwiseCommitments),
-		PairwiseSalts:       intMap32ToJSON(o.PairwiseSalts),
 	})
 }
 
@@ -348,15 +393,11 @@ func (o *DKGRound1Output) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var err error
-	o.FeldmanCommitments, err = decodeBytesSlice(j.FeldmanCommitments)
+	o.FeldmanCommitment, err = hexToFixed32(j.FeldmanCommitment)
 	if err != nil {
 		return err
 	}
 	o.PairwiseCommitments, err = jsonToIntMap32(j.PairwiseCommitments)
-	if err != nil {
-		return err
-	}
-	o.PairwiseSalts, err = jsonToIntMap32(j.PairwiseSalts)
 	return err
 }
 
@@ -365,12 +406,18 @@ func (o *DKGRound1Output) UnmarshalJSON(data []byte) error {
 // =====================================================================
 
 type dkgRound2OutputJSON struct {
-	SecretShares map[string]string `json:"secret_shares"`
+	FeldmanCommitments []string          `json:"feldman_commitments"`
+	FeldmanSalt        string            `json:"feldman_salt"`
+	SecretShares       map[string]string `json:"secret_shares"`
+	PairwiseSalts      map[string]string `json:"pairwise_salts"`
 }
 
 func (o *DKGRound2Output) MarshalJSON() ([]byte, error) {
 	return json.Marshal(dkgRound2OutputJSON{
-		SecretShares: intMapBytesToJSON(o.SecretShares),
+		FeldmanCommitments: encodeBytesSlice(o.FeldmanCommitments),
+		FeldmanSalt:        hex.EncodeToString(o.FeldmanSalt[:]),
+		SecretShares:       intMapBytesToJSON(o.SecretShares),
+		PairwiseSalts:      intMap32ToJSON(o.PairwiseSalts),
 	})
 }
 
@@ -380,7 +427,75 @@ func (o *DKGRound2Output) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var err error
+	o.FeldmanCommitments, err = decodeBytesSlice(j.FeldmanCommitments)
+	if err != nil {
+		return err
+	}
+	o.FeldmanSalt, err = hexToFixed32(j.FeldmanSalt)
+	if err != nil {
+		return err
+	}
 	o.SecretShares, err = jsonToIntMapBytes(j.SecretShares)
+	if err != nil {
+		return err
+	}
+	o.PairwiseSalts, err = jsonToIntMap32(j.PairwiseSalts)
+	return err
+}
+
+// =====================================================================
+// BaseOTSenderSeeds / BaseOTReceiverSeeds
+// =====================================================================
+
+type baseOTSenderSeedsJSON struct {
+	Seeds0 []string `json:"seeds0"`
+	Seeds1 []string `json:"seeds1"`
+}
+
+func (s *BaseOTSenderSeeds) MarshalJSON() ([]byte, error) {
+	return json.Marshal(baseOTSenderSeedsJSON{
+		Seeds0: encodeBytesSlice(s.Seeds0),
+		Seeds1: encodeBytesSlice(s.Seeds1),
+	})
+}
+
+func (s *BaseOTSenderSeeds) UnmarshalJSON(data []byte) error {
+	var j baseOTSenderSeedsJSON
+	if err := json.Unmarshal(data, &j); err != nil {
+		return err
+	}
+	var err error
+	s.Seeds0, err = decodeSeedSlice(j.Seeds0)
+	if err != nil {
+		return err
+	}
+	s.Seeds1, err = decodeSeedSlice(j.Seeds1)
+	return err
+}
+
+type baseOTReceiverSeedsJSON struct {
+	Seeds []string `json:"seeds"`
+	Sigma string   `json:"sigma"`
+}
+
+func (s *BaseOTReceiverSeeds) MarshalJSON() ([]byte, error) {
+	return json.Marshal(baseOTReceiverSeedsJSON{
+		Seeds: encodeBytesSlice(s.Seeds),
+		Sigma: encodeBoolSlice(s.Sigma),
+	})
+}
+
+func (s *BaseOTReceiverSeeds) UnmarshalJSON(data []byte) error {
+	var j baseOTReceiverSeedsJSON
+	if err := json.Unmarshal(data, &j); err != nil {
+		return err
+	}
+	var err error
+	s.Seeds, err = decodeSeedSlice(j.Seeds)
+	if err != nil {
+		return err
+	}
+	s.Sigma, err = decodeBoolSlice(j.Sigma, LambdaC)
 	return err
 }
 
@@ -506,12 +621,14 @@ func (m *VOLEMultiplyMsg) UnmarshalJSON(data []byte) error {
 // =====================================================================
 
 type round1MsgJSON struct {
-	Commitment string `json:"commitment"`
+	Commitment string            `json:"commitment"`
+	OTExt      *OTExtReceiverMsg `json:"ot_ext"`
 }
 
 func (m *Round1Msg) MarshalJSON() ([]byte, error) {
 	return json.Marshal(round1MsgJSON{
 		Commitment: hex.EncodeToString(m.Commitment[:]),
+		OTExt:      m.OTExt,
 	})
 }
 
@@ -522,7 +639,11 @@ func (m *Round1Msg) UnmarshalJSON(data []byte) error {
 	}
 	var err error
 	m.Commitment, err = hexToFixed32(j.Commitment)
-	return err
+	if err != nil {
+		return err
+	}
+	m.OTExt = j.OTExt
+	return nil
 }
 
 // =====================================================================
@@ -807,17 +928,17 @@ func (o *RefreshRound2Output) UnmarshalJSON(data []byte) error {
 // =====================================================================
 
 type signerSetupJSON struct {
-	MyID        int                        `json:"my_id"`
-	AllIDs      []int                      `json:"all_ids"`
-	Share       string                     `json:"share"`
-	PubKey      string                     `json:"pub_key"`
-	Threshold   int                        `json:"threshold"`
-	VoleAlice   map[string]*VOLEAliceState `json:"vole_alice"`
-	VoleBob     map[string]*VOLEBobState   `json:"vole_bob"`
-	FZeroSeeds  map[string]string          `json:"fzero_seeds"`
-	Blacklist   map[string]bool            `json:"blacklist"`
-	Epoch       int                        `json:"epoch"`
-	SignCounter uint64                     `json:"sign_counter"`
+	Version     int                             `json:"version"`
+	MyID        int                             `json:"my_id"`
+	AllIDs      []int                           `json:"all_ids"`
+	Share       string                          `json:"share"`
+	PubKey      string                          `json:"pub_key"`
+	Threshold   int                             `json:"threshold"`
+	AliceBaseOT map[string]*BaseOTReceiverSeeds `json:"alice_base_ot"`
+	BobBaseOT   map[string]*BaseOTSenderSeeds   `json:"bob_base_ot"`
+	FZeroSeeds  map[string]string               `json:"fzero_seeds"`
+	Blacklist   map[string]bool                 `json:"blacklist"`
+	Epoch       int                             `json:"epoch"`
 }
 
 func (s *SignerSetup) MarshalJSON() ([]byte, error) {
@@ -826,17 +947,17 @@ func (s *SignerSetup) MarshalJSON() ([]byte, error) {
 		bl[strconv.Itoa(k)] = v
 	}
 	return json.Marshal(signerSetupJSON{
+		Version:     SetupWireVersion,
 		MyID:        s.MyID,
 		AllIDs:      s.AllIDs,
 		Share:       scalarToHex(&s.Share),
 		PubKey:      hex.EncodeToString(s.PubKey),
 		Threshold:   s.Threshold,
-		VoleAlice:   intMapKeys(s.VoleAlice),
-		VoleBob:     intMapKeys(s.VoleBob),
+		AliceBaseOT: intMapKeys(s.AliceBaseOT),
+		BobBaseOT:   intMapKeys(s.BobBaseOT),
 		FZeroSeeds:  intMap16ToJSON(s.FZeroSeeds),
 		Blacklist:   bl,
 		Epoch:       s.Epoch,
-		SignCounter: atomic.LoadUint64(&s.SignCounter),
 	})
 }
 
@@ -845,11 +966,13 @@ func (s *SignerSetup) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
+	if j.Version != SetupWireVersion {
+		return fmt.Errorf("dkls23 SignerSetup: unsupported wire format version %d (want %d)", j.Version, SetupWireVersion)
+	}
 	s.MyID = j.MyID
 	s.AllIDs = j.AllIDs
 	s.Threshold = j.Threshold
 	s.Epoch = j.Epoch
-	atomic.StoreUint64(&s.SignCounter, j.SignCounter)
 
 	var err error
 	s.Share, err = hexToScalar(j.Share)
@@ -860,11 +983,11 @@ func (s *SignerSetup) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	s.VoleAlice, err = stringMapKeys(j.VoleAlice)
+	s.AliceBaseOT, err = stringMapKeys(j.AliceBaseOT)
 	if err != nil {
 		return err
 	}
-	s.VoleBob, err = stringMapKeys(j.VoleBob)
+	s.BobBaseOT, err = stringMapKeys(j.BobBaseOT)
 	if err != nil {
 		return err
 	}

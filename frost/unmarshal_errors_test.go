@@ -51,22 +51,45 @@ func TestUnmarshalSignerStateErrors(t *testing.T) {
 
 func TestUnmarshalDKGRound1OutputErrors(t *testing.T) {
 	t.Parallel()
+	// Everything except the proof fields is valid in this prefix.
+	const okPrefix = `{"feldman_commitments":[],"pairwise_commitments":{},"pairwise_salts":{}`
 	cases := []struct {
 		name string
 		json string
+		want string // substring the error must contain ("" = any error)
 	}{
-		{"bad feldman", `{"feldman_commitments":["` + bad + `"],"pairwise_commitments":{},"pairwise_salts":{}}`},
-		{"bad pairwise_commitment", `{"feldman_commitments":[],"pairwise_commitments":{"1":"` + bad + `"},"pairwise_salts":{}}`},
-		{"bad pairwise_salt", `{"feldman_commitments":[],"pairwise_commitments":{},"pairwise_salts":{"1":"` + bad + `"}}`},
-		{"bad pairwise_commitment key", `{"feldman_commitments":[],"pairwise_commitments":{"abc":"aa"},"pairwise_salts":{}}`},
-		{"bad pairwise_salt key", `{"feldman_commitments":[],"pairwise_commitments":{},"pairwise_salts":{"abc":"aa"}}`},
+		{"bad feldman", `{"feldman_commitments":["` + bad + `"],"pairwise_commitments":{},"pairwise_salts":{}}`, ""},
+		{"bad pairwise_commitment", `{"feldman_commitments":[],"pairwise_commitments":{"1":"` + bad + `"},"pairwise_salts":{}}`, ""},
+		{"bad pairwise_salt", `{"feldman_commitments":[],"pairwise_commitments":{},"pairwise_salts":{"1":"` + bad + `"}}`, ""},
+		{"bad pairwise_commitment key", `{"feldman_commitments":[],"pairwise_commitments":{"abc":"aa"},"pairwise_salts":{}}`, ""},
+		{"bad pairwise_salt key", `{"feldman_commitments":[],"pairwise_commitments":{},"pairwise_salts":{"abc":"aa"}}`, ""},
+		// Proof of knowledge σ_i = (R_i, μ_i): strict 32-byte lengths.
+		{"missing proof fields", okPrefix + `}`, "proof_r"},
+		{"missing proof_r", okPrefix + `,"proof_mu":"` + valid32 + `"}`, "proof_r"},
+		{"bad proof_r hex", okPrefix + `,"proof_r":"` + bad + `","proof_mu":"` + valid32 + `"}`, "proof_r"},
+		{"short proof_r", okPrefix + `,"proof_r":"aabb","proof_mu":"` + valid32 + `"}`, "proof_r: expected 32 bytes, got 2"},
+		{"long proof_r", okPrefix + `,"proof_r":"` + valid32 + `00","proof_mu":"` + valid32 + `"}`, "proof_r: expected 32 bytes, got 33"},
+		{"missing proof_mu", okPrefix + `,"proof_r":"` + valid32 + `"}`, "proof_mu"},
+		{"bad proof_mu hex", okPrefix + `,"proof_r":"` + valid32 + `","proof_mu":"` + bad + `"}`, "proof_mu"},
+		{"short proof_mu", okPrefix + `,"proof_r":"` + valid32 + `","proof_mu":"aabb"}`, "proof_mu: expected 32 bytes, got 2"},
+		{"long proof_mu", okPrefix + `,"proof_r":"` + valid32 + `","proof_mu":"` + valid32 + `00"}`, "proof_mu: expected 32 bytes, got 33"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var v DKGRound1Output
-			require.Error(t, json.Unmarshal([]byte(tc.json), &v))
+			err := json.Unmarshal([]byte(tc.json), &v)
+			require.Error(t, err)
+			if tc.want != "" {
+				require.ErrorContains(t, err, tc.want)
+			}
 		})
 	}
+
+	// The same document with 32-byte proof fields parses.
+	var v DKGRound1Output
+	require.NoError(t, json.Unmarshal([]byte(okPrefix+`,"proof_r":"`+valid32+`","proof_mu":"`+valid32+`"}`), &v))
+	require.Len(t, v.ProofR, ElementLen)
+	require.Len(t, v.ProofMu, ScalarLen)
 }
 
 func TestUnmarshalDKGRound2OutputErrors(t *testing.T) {

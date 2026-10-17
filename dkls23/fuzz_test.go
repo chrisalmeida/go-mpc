@@ -38,6 +38,16 @@ func FuzzUnmarshalVOLEMultiplyMsg(f *testing.F) {
 	})
 }
 
+func FuzzUnmarshalRound1Msg(f *testing.F) {
+	f.Add([]byte(`{"commitment":"","ot_ext":null}`))
+	f.Add([]byte(`{"commitment":"","ot_ext":{"u":[],"x_bar":"","t_bar":""}}`))
+	f.Add([]byte(`{}`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var m Round1Msg
+		_ = json.Unmarshal(data, &m)
+	})
+}
+
 func FuzzUnmarshalRound1State(f *testing.F) {
 	f.Add([]byte(`{"sig_id":"","signers":[],"r_i":"","phi_i":"","r_i_point":"","com":"","salt":"","zeta_i":""}`))
 	f.Add([]byte(`{}`))
@@ -57,7 +67,8 @@ func FuzzUnmarshalRound2State(f *testing.F) {
 }
 
 func FuzzUnmarshalSignerSetup(f *testing.F) {
-	f.Add([]byte(`{"my_id":1,"all_ids":[1],"share":"","pub_key":"","threshold":1}`))
+	f.Add([]byte(`{"version":1,"my_id":1,"all_ids":[1],"share":"","pub_key":"","threshold":1}`))
+	f.Add([]byte(`{"version":1,"alice_base_ot":{"2":{"seeds":[],"sigma":""}},"bob_base_ot":{"2":{"seeds0":[],"seeds1":[]}}}`))
 	f.Add([]byte(`{}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var s SignerSetup
@@ -65,10 +76,29 @@ func FuzzUnmarshalSignerSetup(f *testing.F) {
 	})
 }
 
+func FuzzUnmarshalBaseOTSeeds(f *testing.F) {
+	f.Add([]byte(`{"seeds":[],"sigma":""}`))
+	f.Add([]byte(`{"seeds0":[],"seeds1":[]}`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var r BaseOTReceiverSeeds
+		_ = json.Unmarshal(data, &r)
+		var s BaseOTSenderSeeds
+		_ = json.Unmarshal(data, &s)
+	})
+}
+
 func FuzzUnmarshalDKGRound1Output(f *testing.F) {
-	f.Add([]byte(`{"feldman_commitments":[],"pairwise_commitments":{},"pairwise_salts":{}}`))
+	f.Add([]byte(`{"feldman_commitment":"","pairwise_commitments":{}}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var o DKGRound1Output
+		_ = json.Unmarshal(data, &o)
+	})
+}
+
+func FuzzUnmarshalDKGRound2Output(f *testing.F) {
+	f.Add([]byte(`{"feldman_commitments":[],"feldman_salt":"","secret_shares":{},"pairwise_salts":{}}`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var o DKGRound2Output
 		_ = json.Unmarshal(data, &o)
 	})
 }

@@ -27,6 +27,11 @@ The following assumptions apply:
 
 Cheating parties are detected at multiple protocol stages:
 
+- **OT-extension consistency check**: Every signing session runs a fresh
+  OT-extension batch per counterparty (DKLS23 Functionality 5.1 requires a
+  fresh session id per batch). The batch carries a KOS15 consistency proof
+  with a Fiat-Shamir challenge (paper §5.1); a receiver who sends
+  inconsistent corrections is caught by the sender in round 2 and blacklisted.
 - **VOLE consistency check**: Malicious correlation values are caught via a
   SHAKE-256 proof verified with constant-time comparison
   (`subtle.ConstantTimeCompare`).
@@ -40,13 +45,24 @@ Cheating parties are detected at multiple protocol stages:
 
 Cheating detection in FROST is simpler due to Schnorr's linearity:
 
+- **DKG proof of knowledge**: Each party proves knowledge of its polynomial's
+  constant term with a Schnorr proof bound to a context string (FROST paper
+  Figure 1); proofs are verified before any share is sent, which prevents
+  rogue-key attacks on the group key.
 - **Feldman VSS verification**: Each party's DKG share is verified against
   broadcast Feldman commitments. Inconsistent shares are detected.
+- **Element validation**: Every received group element is decoded per RFC
+  9591 §6.1 (canonical encoding, not the identity, in the prime-order
+  subgroup).
 - **Signature share verification**: The aggregator can verify each individual
   signature share (`z_i * B == D_i + rho_i * E_i + c * lambda_i * PK_i`),
   enabling identifiable abort — the specific misbehaving signer is identified.
-- **Blacklisting**: Detected cheaters are permanently blacklisted via
-  `SignerState.Blacklist` and rejected from all future signing sessions.
+- **Blacklisting**: Detected cheaters can be permanently blacklisted via
+  `SignerState.Blacklist`. Per RFC 9591 §5.4 and §7, attribution assumes an
+  authenticated channel and a Coordinator that does not equivocate: a
+  Coordinator that distributes inconsistent commitment lists makes an honest
+  signer's share fail verification, so automatic blacklisting is only safe
+  with an honest or reliable-broadcast Coordinator.
 
 ### Proactive Key Refresh
 
@@ -56,7 +72,9 @@ is compromised.
 
 #### dkls23
 - Shamir shares re-randomized using zero-constant Feldman VSS polynomials.
-- VOLE correlations and FZero seeds refreshed alongside shares (KMOS21).
+- Base-OT seeds (the only persistent OT material) and FZero seeds refreshed
+  alongside shares (KMOS21). VOLE correlations are never persisted: they are
+  regenerated inside every signing session.
 - Refresh sessions tracked by epoch to prevent replay.
 
 #### frost
@@ -79,6 +97,11 @@ preventing timing side-channel attacks on shared hardware.
 - **VOLE Beta selection**: Bob's secret binary vector β is never used as a
   branch condition. All β-dependent operations use branchless multiply-by-mask
   (`condUint32(β) * value`) or `subtle.ConstantTimeCopy` for byte selection.
+- **OT extension**: the KOS15 consistency check is computed in constant-time
+  GF(2^128) arithmetic (`gf128.go`); the sender's choice bits σ and the
+  receiver's choice bits are never branch conditions.
+- **Base OT**: the receiver's choice bits select between precomputed values
+  with `subtle.ConstantTimeCopy`.
 - **Commitment verification**: FCom opening and VOLE proof checks use
   `subtle.ConstantTimeCompare`.
 - **Zeroization**: Ephemeral secrets are zeroized via `ModNScalar.Zero()`
@@ -109,12 +132,16 @@ are derived from public data and are not timing-sensitive.
 
 Both packages maintain comprehensive test suites with 90%+ statement coverage:
 
-- **dkls23**: 15 test files, 12 fuzz targets, 48 unmarshal error cases, race-detector clean.
-- **frost**: 12 test files, 11 fuzz targets, 20 unmarshal error cases, race-detector clean.
+- **dkls23**: fuzz targets for every wire type, unmarshal error cases for
+  every wire type, race-detector clean.
+- **frost**: fuzz targets for every wire type, unmarshal error cases for
+  every wire type, RFC 9591 Appendix E.1 test vectors, race-detector clean.
 
-Edge-case tests cover malicious inputs (corrupted commitments, non-canonical
-scalars, off-curve points, truncated shares), nonce reuse prevention,
-post-persistence functional round-trips, and identifiable abort.
+Edge-case tests cover malicious inputs (corrupted commitments, inconsistent
+OT-extension batches, forged DKG proofs, non-canonical scalars and points,
+small-order points, truncated shares), nonce reuse prevention, independence
+of VOLE messages across signing sessions, post-persistence functional
+round-trips, and identifiable abort.
 
 ## Known Limitations
 
@@ -126,14 +153,18 @@ post-persistence functional round-trips, and identifiable abort.
 - **Physical attacks**: No protection is provided against physical
   side-channel attacks (power analysis, electromagnetic emanation, etc.).
   (Applies to both packages.)
-- **No independent human audit**: Both packages have been audited by Claude
-  Code (Anthropic Claude Opus 4.6), which performed source code
-  review, protocol equation verification against the DKLS23 paper and RFC 9591,
-  compiler output disassembly, escape analysis, fuzz testing, and dependency
-  vulnerability scanning. dkls23 had 10 findings (all resolved); frost had
-  4 findings (all resolved). The full report is in [`AUDIT.md`](AUDIT.md).
-  This is not a substitute for an independent third-party audit by a firm
-  specializing in MPC protocols, and the code has not been formally verified.
+- **Session identifiers**: DKLS23 Protocol 3.6 step 4 requires every signing
+  session to use a fresh `sigid`. The library does not track used session
+  identifiers; callers must generate a fresh random one per session (as the
+  example does with `node.SessionID`).
+- **No independent human audit**: Both packages were first reviewed by an
+  automated audit (Claude Code, Anthropic Claude Opus 4.6). A 2026-10-16
+  follow-up review found that this first audit had missed a critical
+  key-recovery flaw in dkls23 (reuse of the OT-extension batch across signing
+  sessions) and several protocol deviations from the cited specifications; all
+  are resolved and documented in [`AUDIT.md`](AUDIT.md). Automated review is
+  not a substitute for an independent third-party audit by a firm specializing
+  in MPC protocols, and the code has not been formally verified.
 
 ## Responsible Disclosure
 

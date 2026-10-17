@@ -16,15 +16,14 @@ const valid32 = "000000000000000000000000000000000000000000000000000000000000000
 // valid16 is 32 hex chars (16 bytes) — valid for hexToFixed16.
 const valid16 = "00000000000000000000000000000001"
 
-
 func TestUnmarshalDKGRound1OutputErrors(t *testing.T) {
 	cases := []struct {
 		name string
 		json string
 	}{
-		{"bad feldman", `{"feldman_commitments":["` + bad + `"],"pairwise_commitments":{},"pairwise_salts":{}}`},
-		{"bad pairwise_commitments", `{"feldman_commitments":[],"pairwise_commitments":{"1":"` + bad + `"},"pairwise_salts":{}}`},
-		{"bad pairwise_salts", `{"feldman_commitments":[],"pairwise_commitments":{},"pairwise_salts":{"1":"` + bad + `"}}`},
+		{"bad feldman_commitment", `{"feldman_commitment":"` + bad + `","pairwise_commitments":{}}`},
+		{"short feldman_commitment", `{"feldman_commitment":"aabb","pairwise_commitments":{}}`},
+		{"bad pairwise_commitments", `{"feldman_commitment":"` + valid32 + `","pairwise_commitments":{"1":"` + bad + `"}}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -35,8 +34,55 @@ func TestUnmarshalDKGRound1OutputErrors(t *testing.T) {
 }
 
 func TestUnmarshalDKGRound2OutputErrors(t *testing.T) {
-	var v DKGRound2Output
-	require.Error(t, json.Unmarshal([]byte(`{"secret_shares":{"1":"`+bad+`"}}`), &v))
+	cases := []struct {
+		name string
+		json string
+	}{
+		{"bad feldman", `{"feldman_commitments":["` + bad + `"],"feldman_salt":"","secret_shares":{},"pairwise_salts":{}}`},
+		{"bad feldman_salt", `{"feldman_commitments":[],"feldman_salt":"` + bad + `","secret_shares":{},"pairwise_salts":{}}`},
+		{"bad secret_shares", `{"feldman_commitments":[],"feldman_salt":"` + valid32 + `","secret_shares":{"1":"` + bad + `"},"pairwise_salts":{}}`},
+		{"bad pairwise_salts", `{"feldman_commitments":[],"feldman_salt":"` + valid32 + `","secret_shares":{},"pairwise_salts":{"1":"` + bad + `"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var v DKGRound2Output
+			require.Error(t, json.Unmarshal([]byte(tc.json), &v))
+		})
+	}
+}
+
+func TestUnmarshalBaseOTSeedsErrors(t *testing.T) {
+	t.Run("receiver bad seeds", func(t *testing.T) {
+		var v BaseOTReceiverSeeds
+		require.Error(t, json.Unmarshal([]byte(`{"seeds":["`+bad+`"],"sigma":""}`), &v))
+	})
+	t.Run("receiver bad sigma", func(t *testing.T) {
+		seeds := `"` + valid32 + `"`
+		for i := 1; i < LambdaC; i++ {
+			seeds += `,"` + valid32 + `"`
+		}
+		var v BaseOTReceiverSeeds
+		require.Error(t, json.Unmarshal([]byte(`{"seeds":[`+seeds+`],"sigma":"`+bad+`"}`), &v))
+		require.Error(t, json.Unmarshal([]byte(`{"seeds":[`+seeds+`],"sigma":"AA=="}`), &v))
+	})
+	t.Run("sender bad seeds0", func(t *testing.T) {
+		var v BaseOTSenderSeeds
+		require.Error(t, json.Unmarshal([]byte(`{"seeds0":["`+bad+`"],"seeds1":[]}`), &v))
+	})
+	t.Run("sender bad seeds1", func(t *testing.T) {
+		seeds := `"` + valid32 + `"`
+		for i := 1; i < LambdaC; i++ {
+			seeds += `,"` + valid32 + `"`
+		}
+		var v BaseOTSenderSeeds
+		require.Error(t, json.Unmarshal([]byte(`{"seeds0":[`+seeds+`],"seeds1":["`+bad+`"]}`), &v))
+	})
+	t.Run("not json", func(t *testing.T) {
+		var r BaseOTReceiverSeeds
+		require.Error(t, json.Unmarshal([]byte(`nope`), &r))
+		var s BaseOTSenderSeeds
+		require.Error(t, json.Unmarshal([]byte(`nope`), &s))
+	})
 }
 
 func TestUnmarshalVOLEBobStateErrors(t *testing.T) {
@@ -90,6 +136,23 @@ func TestUnmarshalVOLEMultiplyMsgErrors(t *testing.T) {
 	}
 }
 
+func TestUnmarshalRound1MsgErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+	}{
+		{"bad commitment", `{"commitment":"` + bad + `","ot_ext":null}`},
+		{"bad ot_ext", `{"commitment":"` + valid32 + `","ot_ext":{"u":["` + bad + `"],"x_bar":"","t_bar":""}}`},
+		{"not json", `nope`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var v Round1Msg
+			require.Error(t, json.Unmarshal([]byte(tc.json), &v))
+		})
+	}
+}
+
 func TestUnmarshalRound1StateErrors(t *testing.T) {
 	cases := []struct {
 		name string
@@ -101,6 +164,7 @@ func TestUnmarshalRound1StateErrors(t *testing.T) {
 		{"bad com", `{"sig_id":"x","signers":[1],"r_i":"` + valid32 + `","phi_i":"` + valid32 + `","r_i_point":"aa","com":"` + bad + `","salt":"","zeta_i":""}`},
 		{"bad salt", `{"sig_id":"x","signers":[1],"r_i":"` + valid32 + `","phi_i":"` + valid32 + `","r_i_point":"aa","com":"` + valid32 + `","salt":"` + bad + `","zeta_i":""}`},
 		{"bad zeta_i", `{"sig_id":"x","signers":[1],"r_i":"` + valid32 + `","phi_i":"` + valid32 + `","r_i_point":"aa","com":"` + valid32 + `","salt":"` + valid32 + `","zeta_i":"` + bad + `"}`},
+		{"bad vole_bob key", `{"sig_id":"x","signers":[1],"r_i":"` + valid32 + `","phi_i":"` + valid32 + `","r_i_point":"aa","com":"` + valid32 + `","salt":"` + valid32 + `","zeta_i":"` + valid32 + `","vole_bob_for_round2":{"abc":null}}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -200,14 +264,22 @@ func TestUnmarshalRefreshRound2OutputErrors(t *testing.T) {
 }
 
 func TestUnmarshalSignerSetupErrors(t *testing.T) {
+	const head = `{"version":1,"my_id":1,"all_ids":[1],`
 	cases := []struct {
 		name string
 		json string
 	}{
-		{"bad share", `{"my_id":1,"all_ids":[1],"share":"` + bad + `","pub_key":"","threshold":1}`},
-		{"bad pub_key", `{"my_id":1,"all_ids":[1],"share":"` + valid32 + `","pub_key":"` + bad + `","threshold":1}`},
-		{"bad fzero_seeds", `{"my_id":1,"all_ids":[1],"share":"` + valid32 + `","pub_key":"aa","threshold":1,"fzero_seeds":{"1":"` + bad + `"}}`},
-		{"bad blacklist key", `{"my_id":1,"all_ids":[1],"share":"` + valid32 + `","pub_key":"aa","threshold":1,"blacklist":{"notint":true}}`},
+		{"missing version", `{"my_id":1,"all_ids":[1],"share":"` + valid32 + `","pub_key":"aa","threshold":1}`},
+		{"wrong version", `{"version":2,"my_id":1,"all_ids":[1],"share":"` + valid32 + `","pub_key":"aa","threshold":1}`},
+		{"bad share", head + `"share":"` + bad + `","pub_key":"","threshold":1}`},
+		{"bad pub_key", head + `"share":"` + valid32 + `","pub_key":"` + bad + `","threshold":1}`},
+		{"bad alice_base_ot key", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"alice_base_ot":{"abc":null}}`},
+		{"bad alice_base_ot value", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"alice_base_ot":{"2":{"seeds":["` + bad + `"],"sigma":""}}}`},
+		{"bad bob_base_ot key", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"bob_base_ot":{"abc":null}}`},
+		{"bad bob_base_ot value", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"bob_base_ot":{"2":{"seeds0":["` + bad + `"],"seeds1":[]}}}`},
+		{"bad fzero_seeds", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"fzero_seeds":{"1":"` + bad + `"}}`},
+		{"bad blacklist key", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"blacklist":{"notint":true}}`},
+		{"not json", `nope`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -215,11 +287,6 @@ func TestUnmarshalSignerSetupErrors(t *testing.T) {
 			require.Error(t, json.Unmarshal([]byte(tc.json), &v))
 		})
 	}
-}
-
-func TestUnmarshalOTExtCorrectionsMsgErrors(t *testing.T) {
-	var v OTExtCorrectionsMsg
-	require.Error(t, json.Unmarshal([]byte(`{"corrections":["`+bad+`"]}`), &v))
 }
 
 func TestUnmarshalFZeroCommitMsgErrors(t *testing.T) {

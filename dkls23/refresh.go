@@ -21,10 +21,13 @@ package dkls23
 //
 // Secret preserved: Lagrange(share', 0) = Lagrange(share, 0) since Σ_i f_i(0) = 0.
 //
-// VOLE re-randomization (KMOS21 §4 – Beaver OT re-randomization):
-// A public SHAKE-256 stream seeded from a collectively committed combined seed
-// drives per-instance bit flips and mask XORs that maintain the OT correlation
-// invariant: gamma[k] = alpha_{beta[k]}[k].
+// Base-OT re-randomization (KMOS21 §4 – OT re-randomization):
+// The only persistent OT material is the λc base-OT seed pairs per directed
+// pair (DKLS23 §8.2); the OT-extension batches are regenerated per signing
+// session and never stored. A public SHAKE-256 stream seeded from a
+// collectively committed combined seed drives per-instance bit flips and mask
+// XORs that maintain the base-OT correlation invariant:
+// Alice's seed[k] = Bob's seed_{sigma[k]}[k].
 //
 // FZero seed refresh: per-pair seeds re-derived from the combined seed so that
 // zero-sharing remains unbiased in future signing sessions.
@@ -73,7 +76,7 @@ type RefreshRound2Output struct {
 // Pi samples a zero-constant polynomial f_i(x) = δ_1·x + … + δ_{t-1}·x^{t-1},
 // broadcasts Feldman commitments C_{i,k} = δ_k·G for k = 1..t-1, commits to
 // f_i(j) for each peer j via FCom, and commits to a fresh 16-byte seed that will
-// be used to re-randomize VOLE and FZero state in RefreshFinalize.
+// be used to re-randomize base-OT and FZero state in RefreshFinalize.
 //
 // Returns the broadcast output, the polynomial coefficients (kept private until
 // RefreshRound2), and the seed (kept private until RefreshRound2).
@@ -175,7 +178,7 @@ func RefreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byt
 //  3. Verifies seed FCom decommitment.
 //  4. Derives combinedSeed = XOR of all n party seeds.
 //  5. Updates the Shamir share: share += Σ_j f_j(myID) mod q.
-//  6. Re-randomizes all VOLE states via Beaver OT refresh (KMOS21 §4).
+//  6. Re-randomizes all base-OT seeds via OT re-randomization (KMOS21 §4).
 //  7. Derives new per-pair FZero seeds from combinedSeed.
 //  8. Increments setup.Epoch.
 //
@@ -232,8 +235,16 @@ func RefreshFinalize(
 		}
 
 		// Step 2: Feldman verification: f_j(myID)·G = Σ_{k=1}^{t-1} C_{j,k}·myID^k.
+		// The committed polynomial must have exactly t-1 non-constant coefficients.
+		if len(r1j.FeldmanCommitments) != setup.Threshold-1 {
+			badSenders = append(badSenders, j)
+			continue
+		}
 		var shareVal btcec.ModNScalar
-		shareVal.SetByteSlice(shareBytes)
+		if overflow := shareVal.SetByteSlice(shareBytes); overflow {
+			badSenders = append(badSenders, j)
+			continue
+		}
 		if err := refreshFeldmanVerify(&shareVal, setup.MyID, r1j.FeldmanCommitments); err != nil {
 			badSenders = append(badSenders, j)
 			continue
@@ -279,24 +290,24 @@ func RefreshFinalize(
 	var newShare btcec.ModNScalar
 	newShare.Add2(&setup.Share, &shareAdd)
 
-	// Step 6: Re-randomize VOLE states into temporary maps.
+	// Step 6: Re-randomize base-OT seeds into temporary maps.
 	// Built separately so setup is untouched if any step fails.
-	newVoleAlice := make(map[int]*VOLEAliceState, len(setup.AllIDs)-1)
-	newVoleBob := make(map[int]*VOLEBobState, len(setup.AllIDs)-1)
+	newAlice := make(map[int]*BaseOTReceiverSeeds, len(setup.AllIDs)-1)
+	newBob := make(map[int]*BaseOTSenderSeeds, len(setup.AllIDs)-1)
 	for _, j := range setup.AllIDs {
 		if j == setup.MyID {
 			continue
 		}
-		a, err := refreshVOLEAlice(setup.VoleAlice[j], setup.MyID, j, combinedSeed)
+		a, err := refreshBaseOTReceiver(setup.AliceBaseOT[j], setup.MyID, j, combinedSeed)
 		if err != nil {
-			return fmt.Errorf("dkls23 RefreshFinalize: refreshVOLEAlice(%d→%d): %w", setup.MyID, j, err)
+			return fmt.Errorf("dkls23 RefreshFinalize: refreshBaseOTReceiver(%d→%d): %w", setup.MyID, j, err)
 		}
-		b, err := refreshVOLEBob(setup.VoleBob[j], j, setup.MyID, combinedSeed)
+		b, err := refreshBaseOTSender(setup.BobBaseOT[j], j, setup.MyID, combinedSeed)
 		if err != nil {
-			return fmt.Errorf("dkls23 RefreshFinalize: refreshVOLEBob(%d→%d): %w", j, setup.MyID, err)
+			return fmt.Errorf("dkls23 RefreshFinalize: refreshBaseOTSender(%d→%d): %w", j, setup.MyID, err)
 		}
-		newVoleAlice[j] = a
-		newVoleBob[j] = b
+		newAlice[j] = a
+		newBob[j] = b
 	}
 
 	// Step 7: Derive new FZero seeds from combinedSeed.
@@ -313,8 +324,8 @@ func RefreshFinalize(
 
 	// All mutations succeed atomically from this point.
 	setup.Share = newShare
-	setup.VoleAlice = newVoleAlice
-	setup.VoleBob = newVoleBob
+	setup.AliceBaseOT = newAlice
+	setup.BobBaseOT = newBob
 	setup.FZeroSeeds = newFZeroSeeds
 	setup.Epoch++
 	return nil
@@ -392,94 +403,89 @@ func refreshFeldmanVerify(share *btcec.ModNScalar, x int, nonConstFeldman [][]by
 	return nil
 }
 
-// refreshVOLEAlice applies Beaver OT re-randomization to Alice's VOLE state
-// for the directed pair (aliceID → bobID). Returns a new state; the original
-// is not modified.
-func refreshVOLEAlice(state *VOLEAliceState, aliceID, bobID int, combinedSeed [16]byte) (*VOLEAliceState, error) {
+// refreshBaseOTSender applies KMOS21 OT re-randomization to Bob's base-OT
+// sender seed pairs for the directed pair (aliceID → bobID). For each instance
+// k the public stream yields a bit b'_k and masks (r0_k, r1_k); the pair is
+// swapped when b'_k = 1 and then masked. Returns a new state; the original is
+// not modified.
+func refreshBaseOTSender(state *BaseOTSenderSeeds, aliceID, bobID int, combinedSeed [16]byte) (*BaseOTSenderSeeds, error) {
+	if state == nil || len(state.Seeds0) != LambdaC || len(state.Seeds1) != LambdaC {
+		return nil, errors.New("dkls23 refreshBaseOTSender: base-OT sender seeds must have LambdaC entries")
+	}
 	xof := newVOLERefreshStream(combinedSeed, aliceID, bobID)
 
-	newAlpha0 := make([][Ell + Rho][32]byte, Xi)
-	newAlpha1 := make([][Ell + Rho][32]byte, Xi)
-
+	newSeeds0 := make([][]byte, LambdaC)
+	newSeeds1 := make([][]byte, LambdaC)
 	var bPrimeBuf [1]byte
-	for k := 0; k < Xi; k++ {
+	var r0, r1 [32]byte
+	for k := 0; k < LambdaC; k++ {
 		xof.Read(bPrimeBuf[:])
 		bPrime := (bPrimeBuf[0] & 1) == 1
-
-		var r0, r1 [Ell + Rho][32]byte
-		for i := 0; i < Ell+Rho; i++ {
-			xof.Read(r0[i][:])
-			xof.Read(r1[i][:])
+		xof.Read(r0[:])
+		xof.Read(r1[:])
+		if len(state.Seeds0[k]) != 32 || len(state.Seeds1[k]) != 32 {
+			return nil, fmt.Errorf("dkls23 refreshBaseOTSender: seed %d must be 32 bytes", k)
 		}
 
-		var src0, src1 [Ell + Rho][32]byte
+		// b' is public (derived from the committed combined seed), so the swap
+		// may branch on it. The seeds themselves are only XORed.
+		src0, src1 := state.Seeds0[k], state.Seeds1[k]
 		if bPrime {
-			src0 = state.Alpha1[k]
-			src1 = state.Alpha0[k]
-		} else {
-			src0 = state.Alpha0[k]
-			src1 = state.Alpha1[k]
+			src0, src1 = src1, src0
 		}
-
-		for i := 0; i < Ell+Rho; i++ {
-			for b := 0; b < 32; b++ {
-				newAlpha0[k][i][b] = src0[i][b] ^ r0[i][b]
-				newAlpha1[k][i][b] = src1[i][b] ^ r1[i][b]
-			}
+		n0 := make([]byte, 32)
+		n1 := make([]byte, 32)
+		for b := 0; b < 32; b++ {
+			n0[b] = src0[b] ^ r0[b]
+			n1[b] = src1[b] ^ r1[b]
 		}
+		newSeeds0[k] = n0
+		newSeeds1[k] = n1
 	}
-
-	newState, err := VOLEAliceSetup(newAlpha0, newAlpha1)
-	if err != nil {
-		return nil, fmt.Errorf("dkls23 refreshVOLEAlice: VOLEAliceSetup: %w", err)
-	}
-	return newState, nil
+	return &BaseOTSenderSeeds{Seeds0: newSeeds0, Seeds1: newSeeds1}, nil
 }
 
-// refreshVOLEBob applies Beaver OT re-randomization to Bob's VOLE state
-// for the directed pair (aliceID → bobID). Returns a new state; the original
-// is not modified.
-func refreshVOLEBob(state *VOLEBobState, aliceID, bobID int, combinedSeed [16]byte) (*VOLEBobState, error) {
+// refreshBaseOTReceiver applies KMOS21 OT re-randomization to Alice's base-OT
+// receiver seeds for the directed pair (aliceID → bobID), mirroring
+// refreshBaseOTSender: sigma'_k = sigma_k XOR b'_k and the seed is masked with
+// r_{sigma'_k}. The mask selection is branchless because sigma is secret.
+// Returns a new state; the original is not modified.
+func refreshBaseOTReceiver(state *BaseOTReceiverSeeds, aliceID, bobID int, combinedSeed [16]byte) (*BaseOTReceiverSeeds, error) {
+	if state == nil || len(state.Seeds) != LambdaC || len(state.Sigma) != LambdaC {
+		return nil, errors.New("dkls23 refreshBaseOTReceiver: base-OT receiver seeds must have LambdaC entries")
+	}
 	xof := newVOLERefreshStream(combinedSeed, aliceID, bobID)
 
-	var newBeta [Xi]bool
-	newGamma := make([][Ell + Rho][32]byte, Xi)
-
+	newSeeds := make([][]byte, LambdaC)
+	newSigma := make([]bool, LambdaC)
 	var bPrimeBuf [1]byte
-	for k := 0; k < Xi; k++ {
+	var r0, r1 [32]byte
+	for k := 0; k < LambdaC; k++ {
 		xof.Read(bPrimeBuf[:])
 		bPrime := (bPrimeBuf[0] & 1) == 1
-
-		var r0, r1 [Ell + Rho][32]byte
-		for i := 0; i < Ell+Rho; i++ {
-			xof.Read(r0[i][:])
-			xof.Read(r1[i][:])
+		xof.Read(r0[:])
+		xof.Read(r1[:])
+		if len(state.Seeds[k]) != 32 {
+			return nil, fmt.Errorf("dkls23 refreshBaseOTReceiver: seed %d must be 32 bytes", k)
 		}
 
-		newBeta[k] = state.Beta[k] != bPrime // XOR of booleans
+		newSigma[k] = state.Sigma[k] != bPrime // XOR of booleans
 
 		// Branchless mask selection: start with r0, conditionally overwrite with r1.
-		sel := int(condUint32(newBeta[k]))
+		sel := int(condUint32(newSigma[k]))
 		mask := r0
-		for i := 0; i < Ell+Rho; i++ {
-			subtle.ConstantTimeCopy(sel, mask[i][:], r1[i][:])
+		subtle.ConstantTimeCopy(sel, mask[:], r1[:])
+		n := make([]byte, 32)
+		for b := 0; b < 32; b++ {
+			n[b] = state.Seeds[k][b] ^ mask[b]
 		}
-		for i := 0; i < Ell+Rho; i++ {
-			for b := 0; b < 32; b++ {
-				newGamma[k][i][b] = state.Gamma[k][i][b] ^ mask[i][b]
-			}
-		}
+		newSeeds[k] = n
 	}
-
-	return &VOLEBobState{
-		Beta:  newBeta,
-		Gamma: newGamma,
-		Chi:   GadgetInnerProduct(newBeta),
-	}, nil
+	return &BaseOTReceiverSeeds{Seeds: newSeeds, Sigma: newSigma}, nil
 }
 
-// newVOLERefreshStream returns a SHAKE-256 XOF for re-randomizing the directed
-// VOLE pair (aliceID → bobID).
+// newVOLERefreshStream returns a SHAKE-256 XOF for re-randomizing the base-OT
+// seeds of the directed VOLE pair (aliceID → bobID).
 func newVOLERefreshStream(combinedSeed [16]byte, aliceID, bobID int) sha3.ShakeHash {
 	xof := sha3.NewShake256()
 	xof.Write([]byte(domainVOLERefresh))

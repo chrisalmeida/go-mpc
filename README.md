@@ -23,7 +23,8 @@ Implementation of the [DKLS23 protocol](https://eprint.iacr.org/2023/765) (Doern
 - **Flexible t-of-n** — 2-of-3, 3-of-5, or any threshold configuration
 - **Key Share Refresh** — proactive share rotation without changing the public key (KMOS21)
 - **Cheating Detection** — cryptographic verification with party blacklisting
-- **Constant-Time Crypto** — branchless scalar arithmetic, branchless VOLE operations, Fermat's little theorem inversion
+- **Fresh OT Extension per Session** — one-time Masny-Rindal base OTs; every signing session runs a KOS15 OT-extension batch with a Fiat-Shamir consistency check and derives a fresh VOLE from it (paper §5.1, §8.2)
+- **Constant-Time Crypto** — branchless scalar arithmetic, branchless VOLE and OT operations, Fermat's little theorem inversion
 - **Encrypted Persistence** — pluggable encryption for key share storage
 
 **Quick start:**
@@ -39,9 +40,10 @@ import "github.com/chrisalmeida/go-mpc/dkls23"
 config := dkls23.DKGPartyConfig{MyID: 1, AllIDs: []int{1, 2, 3}, Threshold: 2}
 round1Out, coeffs, _ := dkls23.DKGRound1(config)
 
-// 2. Exchange round 1 messages, run round 2, finalize → get share + public key
-// 3. Run pairwise VOLE + FZero setup (one-time per party pair)
+// 2. Exchange round 1 commitments, decommit in round 2, finalize → get share + public key
+// 3. Run pairwise base OT + FZero setup (one-time per party pair)
 // 4. Sign: SignRound1 → SignRound2 → SignRound3 → SignCombine → standard ECDSA (r, s)
+//    (each session runs a fresh OT extension + VOLE over the base OTs)
 ```
 
 See [example/dkls23/](example/dkls23/) for a complete runnable 3-of-3 flow — DKG, pairwise setup, signing, verification, and key refresh:
@@ -55,7 +57,9 @@ cd example/dkls23 && go run .
 Implementation of [RFC 9591](https://www.rfc-editor.org/rfc/rfc9591.html) (FROST: Flexible Round-Optimized Schnorr Threshold Signatures) using the FROST(Ed25519, SHA-512) ciphersuite. Two signing rounds, no trusted dealer, signatures compatible with standard Ed25519 verification (RFC 8032).
 
 **Features:**
-- **Distributed Key Generation (DKG)** — Feldman VSS with no trusted dealer (2 rounds)
+- **Distributed Key Generation (DKG)** — Feldman VSS with no trusted dealer (2 rounds), with the FROST paper's proof of knowledge of each party's secret against rogue-key attacks
+- **RFC 9591 Test Vectors** — the Appendix E.1 FROST(Ed25519, SHA-512) vectors are reproduced exactly by the test suite
+- **Strict Element Decoding** — received points are validated per RFC 9591 §6.1 (canonical, non-identity, prime-order subgroup)
 - **2-Round Threshold Signing** — Schnorr's linearity means no OT or VOLE needed
 - **Flexible t-of-n** — 2-of-3, 3-of-5, or any threshold configuration
 - **RFC 8032 Compatible** — FROST signatures verify with `crypto/ed25519.Verify`
@@ -100,9 +104,10 @@ dkls23/              Threshold ECDSA (secp256k1)
   dkg.go             Distributed key generation (Feldman VSS)
   sign.go            3-round threshold signing
   refresh.go         Proactive key share refresh (KMOS21)
-  vole.go            Vector OLE
-  ot.go              Masny-Rindal base oblivious transfer
-  ot_extension.go    IKNP OT extension
+  vole.go            Vector OLE (fresh correlation per signing session)
+  ot.go              Masny-Rindal endemic base oblivious transfer (one-time setup)
+  ot_extension.go    KOS15 OT extension with Fiat-Shamir consistency check
+  gf128.go           Constant-time GF(2^128) arithmetic for the consistency check
   commitment.go      FCom / FZero primitives
   persistence.go     Encrypted key share serialization
   params.go          Security parameters and constants
@@ -136,7 +141,7 @@ make ci            # full CI pipeline locally
 
 All secret scalar operations are constant-time across both packages. No `math/big` arithmetic on secret data. dkls23 uses branchless VOLE Beta selection; frost uses `filippo.io/edwards25519` constant-time scalar arithmetic. Both use Fermat's little theorem for modular inversion.
 
-Both packages have been audited by Claude Code (Anthropic Claude Opus 4.6) — covering source review, protocol equation-by-equation verification against the DKLS23 paper and RFC 9591, compiler output disassembly, escape analysis, fuzz testing, and dependency vulnerability scanning. 14 total findings across both packages were identified and resolved. See [AUDIT.md](AUDIT.md) for the full report.
+Both packages were reviewed by an automated audit (Claude Code), and a 2026-10-16 follow-up review found that the first audit had missed a critical key-recovery flaw in dkls23 (the OT-extension batch was reused across signing sessions) along with several deviations from the cited specifications. All findings from both reviews are resolved; see [AUDIT.md](AUDIT.md) for the full report, including the proof-of-concept that confirmed the critical finding.
 
 See [SECURITY.md](SECURITY.md) for the threat model, constant-time guarantees, known limitations, and responsible disclosure process.
 
