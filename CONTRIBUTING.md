@@ -2,7 +2,7 @@
 
 ## Development Setup
 
-Requires Go 1.25 or later; `go.mod` pins the toolchain that CI uses.
+Requires Go 1.26 or later; `go.mod` pins the toolchain that CI uses.
 
 ```bash
 make ci

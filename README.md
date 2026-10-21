@@ -19,7 +19,7 @@ Both protocols share the same shape: a distributed key generation with no truste
 
 ## Requirements
 
-- Go 1.25 or later (`go.mod` pins the toolchain used by CI).
+- Go 1.26 or later (`go.mod` pins the toolchain used by CI).
 - Dependencies are kept to what the cryptography needs: `btcec` (secp256k1), `filippo.io/edwards25519` (Ed25519), and `golang.org/x/crypto` (SHAKE-256).
 
 ```bash
@@ -128,7 +128,7 @@ This major version changes the protocol structure, the APIs, and the persisted f
 - **DKLS23 key generation** is commit-then-reveal. `DKGRound1` returns a `*DKGPrivateState` instead of raw coefficients, `DKGRound2` requires every other party's round 1 output, and the Feldman commitments are released in round 2.
 - **DKLS23 pairwise setup** stores only base-OT seeds (`SignerSetup.AliceBaseOT`, `SignerSetup.BobBaseOT`). The base OT is Masny-Rindal and the receiver speaks first: `BaseOTReceiverRound1` → `BaseOTSenderRound2` → `BaseOTReceiverFinalize`. The former VOLE setup functions, `SignSetupPairwise`, `SignCounter`, and the persisted VOLE state are gone.
 - **DKLS23 round 1 messages** carry the session's OT-extension batch, so they are larger than before and specific to each counterparty.
-- **FROST key generation** adds `DKGPartyConfig.Context` and the proof fields on `DKGRound1Output`; `DKGRound2` now takes all parties' round 1 outputs and verifies the proofs.
+- **FROST key generation** adds `DKGPartyConfig.Context`, which must be non-empty and identical across parties, and the proof fields on `DKGRound1Output`; `DKGRound2` now takes all parties' round 1 outputs and verifies the proofs.
 - **FROST input validation is stricter.** Non-canonical point encodings, the identity, and small-order or mixed-order points are rejected wherever an element is received.
 
 The reasons for these changes are documented in the 2026-10-16 follow-up section of [AUDIT.md](AUDIT.md), including a confirmed key-recovery flaw in the v0.x DKLS23 implementation.

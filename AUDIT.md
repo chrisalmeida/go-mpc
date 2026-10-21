@@ -644,11 +644,11 @@ in stdlib modules (`crypto/tls`, `crypto/x509`, `html/template`, `net/url`,
 
 | Dependency | Version | Used by | Status |
 |---|---|---|---|
-| `btcsuite/btcd/btcec/v2` | v2.3.6 | dkls23 | Latest |
-| `decred/dcrd/dcrec/secp256k1/v4` | v4.0.1 | dkls23 (indirect) | Pinned by btcec |
+| `btcsuite/btcd/btcec/v2` | v2.5.0 | dkls23 | Current as of 2026-10-21 |
+| `decred/dcrd/dcrec/secp256k1/v4` | v4.4.1 | dkls23 (indirect; holds the constant-time scalar and field code) | Raised explicitly above btcec's minimum (v4.4.0) |
 | `filippo.io/edwards25519` | v1.2.0 | frost | Latest |
-| `golang.org/x/crypto` | v0.49.0 | dkls23 | Latest |
-| `stretchr/testify` | v1.11.1 | both (test only) | Latest |
+| `golang.org/x/crypto` | v0.58.0 | dkls23 | Current as of 2026-10-21; requires Go 1.26 |
+| `stretchr/testify` | v1.12.1 | both (test only) | Current as of 2026-10-21 |
 
 ---
 

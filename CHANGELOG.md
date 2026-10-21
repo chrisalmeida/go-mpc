@@ -72,6 +72,19 @@ v0.x, and several APIs changed shape. See "Upgrading from v0.x" in the README.
   govulncheck; `make fmt`, `make fuzz`, `make vuln`, `make examples`.
 - A follow-up review section in AUDIT.md documenting every finding above.
 
+### Changed
+
+- Minimum Go version is 1.26 (required by `golang.org/x/crypto` v0.58.0);
+  `go.mod` pins `toolchain go1.26.1`.
+- Dependencies refreshed: `btcec` v2.5.0, `decred/secp256k1` v4.4.1,
+  `golang.org/x/crypto` v0.58.0, `testify` v1.12.1.
+- frost: `DKGPartyConfig.Context` must be non-empty; `DKGRound1`,
+  `DKGRound2` and `DKGFinalize` reject an empty context with
+  `InvalidInputError`, since an empty Φ gives the proofs of knowledge no
+  replay protection.
+- CI and `make test-race` allow 600 seconds per package for the
+  race-detected suite.
+
 ### Fixed
 
 - dkls23 demo now persists refreshed shares so a reload uses the current

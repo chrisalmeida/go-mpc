@@ -10,7 +10,7 @@ Threshold signing library in Go. Two protocols, implemented strictly from their 
 - **FROST** — Threshold Schnorr / Ed25519 ([RFC 9591](https://www.rfc-editor.org/rfc/rfc9591.html), FROST(Ed25519, SHA-512)), with the DKG of the [FROST paper](https://eprint.iacr.org/2020/852).
 
 - **Module**: `github.com/chrisalmeida/go-mpc`
-- **Go**: `go 1.25.0` minimum, `toolchain go1.26.1` pinned in `go.mod` (CI reads it via `go-version-file`)
+- **Go**: `go 1.26.0` minimum (required by `golang.org/x/crypto`), `toolchain go1.26.1` pinned in `go.mod` (CI reads it via `go-version-file`)
 - **Scope**: cryptography only. Callers supply transport, authentication, broadcast, session ids, and storage. No resharing (changing t or n), no key derivation.
 
 ## Repository Map

@@ -207,6 +207,35 @@ func TestDKGInvalidInputs(t *testing.T) {
 	assert.Error(t, err, "zero party ID")
 }
 
+// TestDKGRejectsEmptyContext: the context string Φ is what makes a proof of
+// knowledge non-replayable (FROST paper Figure 1), so an empty Φ is refused by
+// every DKG round before any proof is produced or verified.
+func TestDKGRejectsEmptyContext(t *testing.T) {
+	t.Parallel()
+	var inputErr *InvalidInputError
+
+	for _, ctx := range [][]byte{nil, {}} {
+		_, _, err := DKGRound1(DKGPartyConfig{MyID: 1, AllIDs: []int{1, 2, 3}, Threshold: 2, Context: ctx})
+		require.ErrorAs(t, err, &inputErr)
+		assert.Contains(t, inputErr.Detail, "context")
+	}
+
+	// A party whose config lost its context after round 1 cannot continue:
+	// round 2 and finalize refuse rather than verifying proofs under Φ = "".
+	s := runDKGRound1(t, []int{1, 2, 3}, 2)
+	runDKGRound2(t, s)
+	noCtx := s.configs[1]
+	noCtx.Context = nil
+	_, err := DKGRound2(noCtx, s.coeffs[1], s.r1)
+	require.ErrorAs(t, err, &inputErr)
+	_, err = DKGFinalize(noCtx, s.coeffs[1], s.r1, s.r2)
+	require.ErrorAs(t, err, &inputErr)
+
+	// With the context restored the same inputs finalize.
+	_, err = DKGFinalize(s.configs[1], s.coeffs[1], s.r1, s.r2)
+	require.NoError(t, err)
+}
+
 func TestDKGRound2AndFinalizeInvalidInputs(t *testing.T) {
 	t.Parallel()
 	s := runDKGRound1(t, []int{1, 2, 3}, 2)

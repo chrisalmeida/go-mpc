@@ -42,12 +42,22 @@ type DKGPartyConfig struct {
 	Threshold int
 	// Context is the context string Φ bound into each party's proof of
 	// knowledge (FROST paper Figure 1, Round 1 step 2: "Φ being a context
-	// string to prevent replay attacks"). All parties in a DKG session MUST
-	// use the same value, and it SHOULD be unique per session (for example an
+	// string to prevent replay attacks"). It MUST be non-empty: an empty Φ
+	// offers no replay protection, so DKGRound1, DKGRound2 and DKGFinalize
+	// reject it with InvalidInputError. All parties in a DKG session MUST use
+	// the same value, and it SHOULD be unique per session (for example an
 	// application identifier plus a fresh session identifier) so that a proof
 	// captured in one session cannot be replayed in another. A proof made under
 	// a different Context fails verification.
 	Context []byte
+}
+
+// validateContext rejects an empty DKG context string.
+func validateContext(config DKGPartyConfig, phase string) error {
+	if len(config.Context) == 0 {
+		return &InvalidInputError{Phase: phase, Detail: "DKG context must be non-empty (FROST paper Figure 1: Φ prevents replay of proofs of knowledge)"}
+	}
+	return nil
 }
 
 // KeyShare holds a single participant's secret share and the group public key.
@@ -300,6 +310,9 @@ func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []*edwards25519.Scalar,
 	if !found {
 		return nil, nil, &InvalidInputError{Phase: "DKGRound1", Detail: fmt.Sprintf("myID %d not in AllIDs", config.MyID)}
 	}
+	if err := validateContext(config, "DKGRound1"); err != nil {
+		return nil, nil, err
+	}
 	t := config.Threshold
 
 	// Sample polynomial coefficients a_{i,0}, ..., a_{i,t-1}.
@@ -372,6 +385,9 @@ func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []*edwards25519.Scalar,
 func DKGRound2(config DKGPartyConfig, myCoeffs []*edwards25519.Scalar, allRound1 map[int]*DKGRound1Output) (*DKGRound2Output, error) {
 	if config.Threshold <= 0 || len(myCoeffs) != config.Threshold {
 		return nil, &InvalidInputError{Phase: "DKGRound2", Detail: fmt.Sprintf("expected %d polynomial coefficients, got %d", config.Threshold, len(myCoeffs))}
+	}
+	if err := validateContext(config, "DKGRound2"); err != nil {
+		return nil, err
 	}
 	if bad := verifyRound1Proofs(config, allRound1); len(bad) > 0 {
 		return nil, &CheatingPartyError{PartyIDs: bad, Phase: "DKGRound2", Detail: "round 1 proof of knowledge missing or invalid"}
@@ -447,6 +463,9 @@ func DKGFinalize(
 ) (*KeyShare, error) {
 	if config.Threshold <= 0 || len(myCoeffs) != config.Threshold {
 		return nil, &InvalidInputError{Phase: "DKGFinalize", Detail: fmt.Sprintf("expected %d polynomial coefficients, got %d", config.Threshold, len(myCoeffs))}
+	}
+	if err := validateContext(config, "DKGFinalize"); err != nil {
+		return nil, err
 	}
 
 	var badSenders []int

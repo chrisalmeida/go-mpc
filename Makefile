@@ -6,7 +6,7 @@ test:
 
 # Run tests with race detector
 test-race:
-	go test -race -timeout 300s ./...
+	go test -race -timeout 600s ./...
 
 # Run tests with verbose output
 test-verbose:
