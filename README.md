@@ -20,7 +20,7 @@ Both protocols share the same shape: a distributed key generation with no truste
 ## Requirements
 
 - Go 1.26 or later (`go.mod` pins the toolchain used by CI).
-- Dependencies are kept to what the cryptography needs: `btcec` (secp256k1), `filippo.io/edwards25519` (Ed25519), and `golang.org/x/crypto` (SHAKE-256).
+- Dependencies are kept to what the cryptography needs: `bytemare/secp256k1` (constant-time point operations), `btcec` (scalar arithmetic and ECDSA verification), `filippo.io/edwards25519` (Ed25519), and `golang.org/x/crypto` (SHAKE-256).
 
 ```bash
 go get github.com/chrisalmeida/go-mpc
@@ -34,7 +34,7 @@ Implementation of "Threshold ECDSA in Three Rounds" (Doerner, Kondi, Lee, shelat
 
 - **Key generation** — commit-then-reveal Feldman VSS (Protocol 7.1). Parties commit to their Feldman commitments and shares before anything is revealed, so a party cannot choose its polynomial after seeing the others'.
 - **One-time pairwise setup** — the λc base OTs of the Masny-Rindal endemic OT (§8.1), plus an FZero seed, per pair of parties. These seeds are the only pairwise material that is stored.
-- **Per-session OT extension and VOLE** — every signing session runs a fresh KOS15 OT-extension batch with the one-message Fiat-Shamir consistency check of §5.1, and derives a fresh random VOLE (Protocol 5.2) from it. Nothing produced inside a session is stored or reused.
+- **Per-session OT extension and VOLE** — every signing session runs a fresh KOS15 OT-extension batch with the one-message Fiat-Shamir consistency check of §5.1, and derives a fresh random VOLE (Protocol 5.2) from it. Session correlations are never reused across signing sessions.
 - **Signing** — Protocol 3.6: commit to the nonce share, multiply through the VOLE, verify the consistency checks, combine, and verify the final ECDSA signature before releasing it.
 - **Refresh** — KMOS21 proactive refresh re-randomizes the Shamir shares, the base-OT seeds, and the FZero seeds without changing the public key.
 - **Cheating detection** — a party whose OT-extension batch, VOLE proof, decommitment, or check values fail verification is identified and excluded from all future sessions.
@@ -117,8 +117,21 @@ cd example/frost && go run .
 
 - **Transport, authentication, and broadcast.** Both protocols assume authenticated point-to-point channels and, for identifiable abort, a coordinator or broadcast that does not equivocate. See [SECURITY.md](SECURITY.md).
 - **Session management.** Callers generate the session ids. DKLS23 rejects a session id that the setup has already used in the current epoch (`SessionIDReusedError`) and runs each round of a session exactly once, but two copies of a setup restored from the same snapshot cannot see each other's records, so ids must still be unique in practice. FROST DKGs need a fresh context per run. The example programs show one way to do both.
+- **Crash recovery and refresh coordination.** Callers must durably record DKLS23 session reservations before sending outputs, prevent reuse of the same private session state across restored copies, and authenticate fresh peer refresh transcripts. The library rejects duplicate refresh finalization on live signer objects; it does not coordinate distributed epoch activation or recovery. See [SECURITY.md](SECURITY.md).
 - **Resharing.** Refresh keeps the same parties and threshold. Adding or removing parties, or changing t or n, is not supported.
 - **Key derivation.** There is no BIP32-style derivation of child keys.
+
+## Unreleased hardening changes
+
+FROST serializes round-2 calls on one `SignerState`; copies of a returned
+`Round1State` share a consumption guard with its own mutex. DKLS23 replaces
+variable-time secret point operations and secret FZero reduction with
+constant-time primitives. Treat exported state fields as read-only.
+
+Both packages reject repeated application of a completed refresh contribution
+on a live signer. Rejected imports leave active state unchanged. Existing APIs,
+persisted formats, protocol transcripts and restoration behavior are retained;
+the RFC 9591 Appendix E.1 vectors and fresh-VOLE regression remain unchanged.
 
 ## Upgrading from v0.2.x
 
@@ -144,6 +157,7 @@ dkls23/              Threshold ECDSA (secp256k1)
   ot.go              Masny-Rindal endemic base OT (one-time setup)
   ot_extension.go    KOS15 OT extension with Fiat-Shamir consistency check
   gf128.go           Constant-time GF(2^128) arithmetic for the consistency check
+  curve.go           Constant-time secp256k1 point operations and SEC1 encoding
   commitment.go      FCom / FZero primitives
   setup_messages.go  Wire types for the one-time pairwise setup
   encoding.go        Versioned JSON wire format
@@ -180,11 +194,11 @@ make ci            # everything CI runs
 
 ## Security
 
-Secret scalar arithmetic is constant-time in both packages, with no `math/big` operations on secret data. DKLS23 handles its OT choice bits and VOLE selections with masks rather than branches; FROST relies on `filippo.io/edwards25519` constant-time arithmetic. Both use Fermat's little theorem for modular inversion.
+Secret scalar arithmetic uses constant-time operations in both packages. DKLS23 uses `bytemare/secp256k1` for point operations and `btcec.ModNScalar` for scalar arithmetic, including reduction of secret FZero outputs. Its OT choice bits select with masks and constant-time copies. FROST uses `filippo.io/edwards25519`. These implementation choices have not been independently audited or established as side-channel resistant on every supported target.
 
-Both packages were reviewed by an automated audit, and a 2026-10-16 follow-up review found that the first audit had missed a critical key-recovery flaw in dkls23 along with several deviations from the cited specifications. All findings from both reviews are resolved; [AUDIT.md](AUDIT.md) has the full report, including the proof of concept that confirmed the critical finding.
+Both packages have had automated reviews. A 2026-10-16 follow-up found a previously missed critical key-recovery flaw; further hardening found nonce concurrency, curve-operation and secret-reduction defects. [AUDIT.md](AUDIT.md) records fixes, evidence limits and open findings. Passing tests does not establish cryptographic security.
 
-[SECURITY.md](SECURITY.md) describes the threat model, constant-time guarantees, known limitations, and the responsible disclosure process. An independent third-party audit by a firm specializing in MPC protocols is recommended before production deployment with real assets.
+[SECURITY.md](SECURITY.md) describes the security assumptions, limitations, disclosure process and remaining production review gates. These include an independent specialist MPC audit of a pinned release and verification of its fixes; this library is not approved for production custody.
 
 ## Authors
 

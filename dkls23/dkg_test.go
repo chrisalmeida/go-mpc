@@ -123,8 +123,10 @@ func TestDKGSharesAreShamir(t *testing.T) {
 	btcec.ScalarBaseMultNonConst(&reconstructedScalar, &lhs)
 	lhs.ToAffine()
 
-	pkPoint, err := compressedToPoint(pubKey)
+	pk, err := btcec.ParsePubKey(pubKey)
 	require.NoError(t, err)
+	var pkPoint btcec.JacobianPoint
+	pk.AsJacobian(&pkPoint)
 	pkPoint.ToAffine()
 
 	require.True(t, lhs.X.Equals(&pkPoint.X) && lhs.Y.Equals(&pkPoint.Y),

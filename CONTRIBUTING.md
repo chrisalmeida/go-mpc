@@ -26,9 +26,11 @@ runs everything CI runs: gofmt, `go mod tidy` check, `go vet`, staticcheck, the 
 ## Pull Requests
 
 - Keep PRs focused on a single change
-- Include tests for new functionality
+- Include tests for new functionality, and for every security property a PR states in a comment, GoDoc, or `SECURITY.md`: the test that would fail if the property were false is the evidence, not the sentence
 - Update `CHANGELOG.md`
 
 ## Security-Sensitive Changes
 
 All code in `dkls23/` and `frost/` is security-critical. Changes to it must follow the cited specifications (the DKLS23 paper, RFC 9591, the FROST paper, and the papers they reference) rather than introduce new constructions, and must say which section they implement. Please coordinate with the maintainers before submitting large changes to these areas, and report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
+When reviewing or changing this code, do not take a property on trust because a function name, a comment, an existing document, or a dependency's README asserts it. Two reviews of this repository found claims that had been read and repeated rather than tested. Find or write the test that would fail if the claim were false before relying on it; see rule 11 in [CLAUDE.md](CLAUDE.md).

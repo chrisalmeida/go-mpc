@@ -36,6 +36,19 @@ Implementation of **RFC 9591** ("Two-Round Threshold Schnorr Signatures with FRO
 
 `Aggregate` verifies each share against the signer's verification share, names misbehaving signers in a `CheatingPartyError`, and verifies the final signature before returning it. Per RFC 9591 §5.4 and §7, that attribution assumes an authenticated channel and a coordinator that gives every signer the same commitment list.
 
+Per RFC 9591 §5.1–5.2, each nonce pair is used once. Round 2 takes the
+signer's write lock; copies of a state returned by `SignRound1` share one
+consumption record protected by its own mutex, including across equivalent
+signer wrappers. The state checks the matching key, participant set and epoch.
+Treat exported fields as read-only and never reuse nonces for another session.
+These local checks do not change the
+signing equations, hash transcripts, message encoding or RFC test vectors.
+
+Refresh finalization records completed local contributions on the live signer
+and rejects repeats. This local record is not serialized. Pending contribution
+restoration is unchanged; durable replay protection, fresh authenticated peer
+session routing and coordinated epoch activation remain caller responsibilities.
+
 ---
 
 ## Conformance

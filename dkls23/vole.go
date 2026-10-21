@@ -63,9 +63,9 @@ func voleFiatShamir(sid string, aTilde [Xi][Ell + Rho][32]byte) [Ell][Rho]btcec.
 	var theta [Ell][Rho]btcec.ModNScalar
 	for i := 0; i < Ell; i++ {
 		for k := 0; k < Rho; k++ {
-			raw := make([]byte, 64)
-			h.Read(raw)
-			theta[i][k] = reduce64Public(raw)
+			var raw [64]byte
+			h.Read(raw[:])
+			theta[i][k] = reduce64(&raw)
 		}
 	}
 	return theta

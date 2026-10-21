@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 
@@ -25,8 +26,10 @@ import (
 // SignerState holds a signer's persistent state for signing sessions.
 // It wraps a KeyShare and tracks blacklisted parties.
 //
-// SignerState is safe for concurrent use: read-only operations (signing round 1/2)
-// acquire a read lock, while mutating operations (blacklisting) acquire a write lock.
+// SignerState is safe for concurrent use. Round 1 takes a read lock; round 2
+// takes a write lock while consuming its nonce state (RFC 9591 Section 5.2).
+// Callers must not mutate exported fields while a protocol call is running.
+// A SignerState must not be copied after first use.
 type SignerState struct {
 	mu sync.RWMutex
 	// KeyShare is this signer's key material from DKG.
@@ -57,6 +60,9 @@ type SignerState struct {
 	// Epoch is the proactive refresh epoch counter, starting at 0 and
 	// incremented on each RefreshFinalize.
 	Epoch int
+	// completedRefresh records applied local refresh contributions. Seeds are
+	// public after refresh round 2. This local replay record is not serialized.
+	completedRefresh map[refreshContribution]bool
 }
 
 // NewSignerState creates a SignerState from a KeyShare.
@@ -78,6 +84,9 @@ type NonceCommitment struct {
 
 // Round1State holds Pi's private nonce state after round 1.
 // This state is consumed exactly once in round 2; nonces are zeroized after use.
+// Treat its fields as read-only. Copies returned by SignRound1 share the same
+// consumption guard. Use it with the matching key share, participant set and
+// epoch, and never reuse private nonce material for another session.
 type Round1State struct {
 	// Signers are the party IDs participating in this signing session.
 	Signers []int
@@ -89,6 +98,20 @@ type Round1State struct {
 	Commitment *NonceCommitment
 	// consumed tracks whether this state has been used.
 	consumed bool
+	// use is shared by copies of states returned by SignRound1. Its own lock
+	// protects consumption even when the same state is used with restored signers.
+	use *nonceUse
+}
+
+// nonceUse binds RFC 9591 Section 5.1's locally stored nonce pair to the
+// signing key, participant and key epoch. It adds no protocol message or hash input.
+type nonceUse struct {
+	mu        sync.Mutex
+	epoch     int
+	id        int
+	publicKey string
+	signers   []int
+	consumed  bool
 }
 
 // Round2Input bundles the data each signer needs for round 2.
@@ -175,17 +198,29 @@ func SignRound1(signer *SignerState, signers []int) (*Round1State, *NonceCommitm
 	}
 	bindingNonce, err := nonceGenerate(signer.KeyShare.SecretShare)
 	if err != nil {
+		hidingNonce.Set(edwards25519.NewScalar())
 		return nil, nil, fmt.Errorf("frost SignRound1: generate binding nonce: %w", err)
 	}
 
 	state := &Round1State{
-		Signers:      signers,
+		Signers:      append([]int(nil), signers...),
 		HidingNonce:  hidingNonce,
 		BindingNonce: bindingNonce,
 		Commitment:   commitNonces(hidingNonce, bindingNonce),
+		use: &nonceUse{
+			epoch: signer.Epoch, id: signer.KeyShare.ID,
+			publicKey: string(signer.KeyShare.PublicKey),
+			signers:   append([]int(nil), signers...),
+		},
 	}
 
-	return state, state.Commitment, nil
+	// Keep the locally stored commitment independent of the caller's outbound
+	// message, as required by the round-2 own-commitment check (Section 5.2).
+	commitment := &NonceCommitment{
+		HidingNonceCommitment:  append([]byte(nil), state.Commitment.HidingNonceCommitment...),
+		BindingNonceCommitment: append([]byte(nil), state.Commitment.BindingNonceCommitment...),
+	}
+	return state, commitment, nil
 }
 
 // commitNonces computes (D_i, E_i) = (hiding_nonce * B, binding_nonce * B)
@@ -244,11 +279,37 @@ func deriveNonce(randomBytes [32]byte, secret []byte) *edwards25519.Scalar {
 //  4. Compute z_i = d_i + rho_i * e_i + lambda_i * s_i * c.
 //  5. Zeroize d_i and e_i; the Round1State cannot be used again.
 func SignRound2(signer *SignerState, state *Round1State, input *Round2Input) (*SignatureShare, error) {
-	signer.mu.RLock()
-	defer signer.mu.RUnlock()
+	if signer == nil || state == nil || input == nil {
+		return nil, &InvalidInputError{Phase: "SignRound2", Detail: "signer, round 1 state, and input are required"}
+	}
+	signer.mu.Lock()
+	defer signer.mu.Unlock()
 
-	if state.consumed {
+	if signer.KeyShare == nil || state.HidingNonce == nil || state.BindingNonce == nil {
+		return nil, &CorruptStateError{Phase: "SignRound2", Detail: "missing key share or nonce material"}
+	}
+	if state.use != nil {
+		// Lock the shared nonce record as well as the signer. Equivalent signer
+		// wrappers have independent mutexes but must still consume these nonces once.
+		state.use.mu.Lock()
+		defer state.use.mu.Unlock()
+		if state.use.epoch != signer.Epoch ||
+			state.use.id != signer.KeyShare.ID || state.use.publicKey != string(signer.KeyShare.PublicKey) ||
+			!slices.Equal(state.use.signers, state.Signers) {
+			return nil, &CorruptStateError{Phase: "SignRound2", Detail: "round 1 state belongs to another signer or key epoch"}
+		}
+	}
+	if state.consumed || (state.use != nil && state.use.consumed) {
 		return nil, &CorruptStateError{Phase: "SignRound2", Detail: "round 1 state already consumed (nonce reuse prevented)"}
+	}
+	if err := validatePartyIDs(state.Signers, "SignRound2"); err != nil {
+		return nil, err
+	}
+	if err := checkBlacklist(signer, state.Signers, "SignRound2"); err != nil {
+		return nil, err
+	}
+	if len(state.Signers) < signer.KeyShare.Threshold || !slices.Contains(state.Signers, signer.KeyShare.ID) {
+		return nil, &InvalidInputError{Phase: "SignRound2", Detail: "invalid signing participant set"}
 	}
 	if _, err := deserializeElement(signer.KeyShare.PublicKey); err != nil {
 		return nil, &CorruptStateError{Phase: "SignRound2", Detail: fmt.Sprintf("invalid group public key: %v", err)}
@@ -272,6 +333,14 @@ func SignRound2(signer *SignerState, state *Round1State, input *Round2Input) (*S
 		subtle.ConstantTimeCompare(own.HidingNonceCommitment, state.Commitment.HidingNonceCommitment) != 1 ||
 		subtle.ConstantTimeCompare(own.BindingNonceCommitment, state.Commitment.BindingNonceCommitment) != 1 {
 		return nil, &InvalidInputError{Phase: "SignRound2", Detail: fmt.Sprintf("commitment list entry for signer %d is not this signer's round 1 commitment", myID)}
+	}
+	// Also check the locally supplied nonce pair against its commitment. This
+	// rejects corrupted state, including a copy of manually supplied nonces
+	// whose shared scalar objects were already erased by an earlier call.
+	actual := commitNonces(state.HidingNonce, state.BindingNonce)
+	if subtle.ConstantTimeCompare(actual.HidingNonceCommitment, own.HidingNonceCommitment) != 1 ||
+		subtle.ConstantTimeCompare(actual.BindingNonceCommitment, own.BindingNonceCommitment) != 1 {
+		return nil, &CorruptStateError{Phase: "SignRound2", Detail: "nonce material does not match the round 1 commitment"}
 	}
 
 	// Step 1: Compute binding factors.
@@ -310,6 +379,9 @@ func SignRound2(signer *SignerState, state *Round1State, input *Round2Input) (*S
 	lambdaSC.Set(zeroScalar)
 	sk.Set(zeroScalar)
 	state.consumed = true
+	if state.use != nil {
+		state.use.consumed = true
+	}
 
 	return &SignatureShare{
 		SignerID: myID,

@@ -106,6 +106,9 @@ type SignerSetup struct {
 	// epochs cannot collide with the new seeds. Between refreshes it grows by
 	// one entry per session.
 	SessionIDs map[string]int
+	// completedRefresh records applied local refresh contributions. Seeds are
+	// public after refresh round 2. This local replay record is not serialized.
+	completedRefresh map[refreshContribution]bool
 }
 
 // Signing-session stages recorded in SignerSetup.SessionIDs.
@@ -145,7 +148,9 @@ func voleSIDForPair(sigID string, aliceID, bobID int) string {
 	return fmt.Sprintf("%s:vole:%d->%d", sigID, aliceID, bobID)
 }
 
-// Round1State holds Pi's private state after signing round 1.
+// Round1State holds Pi's private state after signing round 1 (Protocol 3.6).
+// Treat its fields as read-only and retain the corresponding setup and session
+// progress when restoring it. SessionIDs enforces the existing round ordering.
 type Round1State struct {
 	// SigID uniquely identifies this signing session.
 	SigID string
@@ -311,7 +316,7 @@ func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 
 	state := &Round1State{
 		SigID:            sigID,
-		Signers:          signers,
+		Signers:          append([]int(nil), signers...),
 		R_i:              r_i,
 		Phi_i:            phi_i,
 		R_iPoint:         R_iPoint,
@@ -368,6 +373,9 @@ type Round2Msg struct {
 // instance with Pj has aborted: j is blacklisted and a CheatingPartyError is
 // returned (paper step 8).
 func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round1Msg) (*Round2State, map[int]*Round2Msg, error) {
+	if setup == nil || state == nil {
+		return nil, nil, &InvalidInputError{Phase: "SignRound2", Detail: "setup and round 1 state are required"}
+	}
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, state.Signers, "SignRound2"); err != nil {
@@ -506,6 +514,9 @@ type Round3Msg struct {
 // The returned map contains one entry per counterparty plus an entry under
 // Pi's own ID holding Pi's own fragment (for use with SignCombine).
 func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRound2 map[int]*Round2Msg) (map[int]*Round3Msg, error) {
+	if setup == nil || state2 == nil || state2.Round1State == nil {
+		return nil, &InvalidInputError{Phase: "SignRound3", Detail: "setup and round 2 state are required"}
+	}
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, state2.Signers, "SignRound3"); err != nil {
@@ -519,8 +530,8 @@ func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRoun
 	}
 
 	// Collect R_j and pk_j from all parties.
-	RPoints := make(map[int]*btcec.JacobianPoint)
-	pkjPoints := make(map[int]*btcec.JacobianPoint)
+	RPoints := make(map[int]*curvePoint)
+	pkjPoints := make(map[int]*curvePoint)
 	duMap := make(map[int]btcec.ModNScalar)
 	dvMap := make(map[int]btcec.ModNScalar)
 
@@ -607,13 +618,10 @@ func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRoun
 		chiRj := scalarMul(&chiJI, Rj)
 		negGammaU := pointNeg(gammaUJI)
 		lhs1 := pointAdd(chiRj, negGammaU)
-		lhs1.ToAffine()
 
-		var rhs1 btcec.JacobianPoint
-		btcec.ScalarBaseMultNonConst(&du, &rhs1)
-		rhs1.ToAffine()
+		rhs1 := scalarMulG(&du)
 
-		if !lhs1.X.Equals(&rhs1.X) || !lhs1.Y.Equals(&rhs1.Y) {
+		if lhs1.Equal(rhs1) != 1 {
 			badParties = append(badParties, j)
 			setup.Blacklist[j] = true
 			continue
@@ -629,13 +637,10 @@ func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRoun
 		chiPKj := scalarMul(&chiJI, pkj)
 		negGammaV := pointNeg(gammaVJI)
 		lhs2 := pointAdd(chiPKj, negGammaV)
-		lhs2.ToAffine()
 
-		var rhs2 btcec.JacobianPoint
-		btcec.ScalarBaseMultNonConst(&dv, &rhs2)
-		rhs2.ToAffine()
+		rhs2 := scalarMulG(&dv)
 
-		if !lhs2.X.Equals(&rhs2.X) || !lhs2.Y.Equals(&rhs2.Y) {
+		if lhs2.Equal(rhs2) != 1 {
 			badParties = append(badParties, j)
 			setup.Blacklist[j] = true
 			continue
@@ -647,31 +652,31 @@ func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRoun
 	}
 
 	// Step 5: Check 3: sum_k pk_k == master_pk.
-	var sumPK btcec.JacobianPoint
+	sumPK := newCurvePoint()
 	for _, j := range state2.Signers {
-		btcec.AddNonConst(&sumPK, pkjPoints[j], &sumPK)
+		sumPK.Add(pkjPoints[j])
 	}
-	sumPK.ToAffine()
 
 	masterPK, err := compressedToPoint(setup.PubKey)
 	if err != nil {
 		return nil, fmt.Errorf("dkls23 SignRound3: parse master pubkey: %w", err)
 	}
-	masterPK.ToAffine()
-	if !sumPK.X.Equals(&masterPK.X) || !sumPK.Y.Equals(&masterPK.Y) {
+	if sumPK.Equal(masterPK) != 1 {
 		return nil, &CorruptStateError{Phase: "SignRound3", Detail: "public key consistency check failed: sum(pk_k) != master_pk"}
 	}
 
 	// Compute R = sum of all R_j.
-	var R btcec.JacobianPoint
+	R := newCurvePoint()
 	for _, j := range state2.Signers {
-		btcec.AddNonConst(&R, RPoints[j], &R)
+		R.Add(RPoints[j])
 	}
-	R.ToAffine()
 
 	// rx = x-coordinate of R mod q.
-	rxBytes := make([]byte, 32)
-	R.X.PutBytesUnchecked(rxBytes)
+	encodedR, err := pointToCompressed(R)
+	if err != nil {
+		return nil, &CorruptStateError{Phase: "SignRound3", Detail: "aggregate nonce is the point at infinity"}
+	}
+	rxBytes := encodedR[1:]
 	var rx btcec.ModNScalar
 	rx.SetByteSlice(rxBytes)
 
@@ -767,7 +772,7 @@ func ComputeRx(noncePoints map[int][]byte) (btcec.ModNScalar, error) {
 	if len(noncePoints) == 0 {
 		return btcec.ModNScalar{}, &InvalidInputError{Phase: "ComputeRx", Detail: "no nonce points provided"}
 	}
-	var R btcec.JacobianPoint
+	R := newCurvePoint()
 	for id, pt := range noncePoints {
 		Rj, err := compressedToPoint(pt)
 		if err != nil {
@@ -776,11 +781,13 @@ func ComputeRx(noncePoints map[int][]byte) (btcec.ModNScalar, error) {
 				Detail: fmt.Sprintf("invalid nonce point for party %d: %v", id, err),
 			}
 		}
-		btcec.AddNonConst(&R, Rj, &R)
+		R.Add(Rj)
 	}
-	R.ToAffine()
-	rxBytes := make([]byte, 32)
-	R.X.PutBytesUnchecked(rxBytes)
+	encodedR, err := pointToCompressed(R)
+	if err != nil {
+		return btcec.ModNScalar{}, &InvalidInputError{Phase: "ComputeRx", Detail: "aggregate nonce is the point at infinity"}
+	}
+	rxBytes := encodedR[1:]
 	var rx btcec.ModNScalar
 	rx.SetByteSlice(rxBytes)
 	return rx, nil

@@ -46,6 +46,14 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
+// refreshContribution identifies an applied local contribution using existing
+// public values. It is bookkeeping, not a protocol message or hash input.
+type refreshContribution struct {
+	publicKey string
+	partyID   int
+	seed      [16]byte
+}
+
 // RefreshRound1Output is broadcast by each party Pi in refresh round 1.
 // It contains Feldman commitments for a zero-constant polynomial and FCom
 // commitments to the pairwise evaluations and a fresh per-party seed.
@@ -185,6 +193,9 @@ func RefreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byt
 //
 // Returns an error naming all bad senders if any verification fails; setup is
 // NOT modified in that case.
+// A completed local seed contribution cannot be applied again on this setup.
+// This in-memory replay record does not replace durable caller-side routing
+// and replay protection after state restoration.
 func RefreshFinalize(
 	setup *SignerSetup,
 	coeffs []btcec.ModNScalar,
@@ -196,6 +207,10 @@ func RefreshFinalize(
 	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, setup.AllIDs, "RefreshFinalize"); err != nil {
 		return err
+	}
+	contribution := refreshContribution{publicKey: string(setup.PubKey), partyID: setup.MyID, seed: mySeed}
+	if setup.completedRefresh[contribution] {
+		return &CorruptStateError{Phase: "RefreshFinalize", Detail: "local refresh contribution already applied"}
 	}
 	var badSenders []int
 
@@ -334,6 +349,10 @@ func RefreshFinalize(
 	// so ids used in earlier epochs cannot reproduce anything under the new
 	// seeds. Clearing the record bounds its growth to one epoch.
 	setup.SessionIDs = make(map[string]int)
+	if setup.completedRefresh == nil {
+		setup.completedRefresh = make(map[refreshContribution]bool)
+	}
+	setup.completedRefresh[contribution] = true
 	return nil
 }
 
@@ -377,33 +396,22 @@ func refreshFeldmanVerify(share *btcec.ModNScalar, x int, nonConstFeldman [][]by
 	xPow.Set(&xScalar) // x^1
 
 	// RHS = Σ_{k=1}^{t-1} C_{i,k} · x^k.
-	var rhs btcec.JacobianPoint
+	rhs := newCurvePoint()
 	for _, commitBytes := range nonConstFeldman {
 		Cik, err := compressedToPoint(commitBytes)
 		if err != nil {
 			return fmt.Errorf("dkls23: parse refresh Feldman commitment: %w", err)
 		}
 		scaled := scalarMul(&xPow, Cik)
-		btcec.AddNonConst(&rhs, scaled, &rhs)
+		rhs.Add(scaled)
 		xPow.Mul(&xScalar)
 	}
-	rhs.ToAffine()
 
 	// LHS = share · G.
-	var lhs btcec.JacobianPoint
-	btcec.ScalarBaseMultNonConst(share, &lhs)
-	lhs.ToAffine()
+	lhs := scalarMulG(share)
 
-	// Both sides must be the point at infinity (zero share) or equal affine points.
-	lhsInf := lhs.X.IsZero() && lhs.Y.IsZero()
-	rhsInf := rhs.X.IsZero() && rhs.Y.IsZero()
-	if lhsInf != rhsInf {
-		return errors.New("dkls23: refresh Feldman verification failed: point at infinity mismatch")
-	}
-	if lhsInf {
-		return nil
-	}
-	if !lhs.X.Equals(&rhs.X) || !lhs.Y.Equals(&rhs.Y) {
+	// Complete group equality also covers the zero-share / identity case.
+	if lhs.Equal(rhs) != 1 {
 		return errors.New("dkls23: refresh Feldman verification failed: share inconsistent with commitments")
 	}
 	return nil

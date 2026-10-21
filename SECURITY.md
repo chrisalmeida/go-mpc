@@ -12,8 +12,11 @@ below, with protocol-specific details noted where they differ.
 
 ## Threat Model
 
-Both packages implement t-of-n threshold signature protocols with honest majority.
-The following assumptions apply:
+Both packages implement t-of-n threshold signature protocols. A quorum of t
+compromised shares can authorize signatures; security requires fewer than t
+corrupt participants under the assumptions of each cited protocol. This is
+not a claim that this implementation has been proven secure.
+The following integration assumptions apply:
 
 - All parties communicate over authenticated point-to-point channels (e.g., TLS
   or Noise Protocol Framework). Neither package provides a transport
@@ -66,27 +69,39 @@ Cheating detection in FROST is simpler due to Schnorr's linearity:
 
 ### Proactive Key Refresh
 
-Both packages support proactive key share refresh — rotating shares without
-changing the master public key. This limits the exposure window if a share
-is compromised.
+Both packages rotate shares without changing the master public key. The
+proactive security of the complete implementation, including deletion of old
+secrets and DKLS23's auxiliary-state refresh, still requires specialist review.
 
 #### dkls23
 - Shamir shares re-randomized using zero-constant Feldman VSS polynomials.
 - Base-OT seeds (the only persistent OT material) and FZero seeds refreshed
-  alongside shares (KMOS21). VOLE correlations are never persisted: they are
-  regenerated inside every signing session.
-- Refresh sessions tracked by epoch to prevent replay.
+  alongside shares (KMOS21). Fresh OT-extension batches and VOLE correlations
+  are generated for each signing session and never reused across sessions.
+- Successful `RefreshFinalize` calls record the local seed contribution,
+  public key and party id under the setup's write lock. Reapplication on the
+  live setup is rejected. The record is not serialized.
 
 #### frost
 - Shamir shares re-randomized using zero-constant Feldman VSS polynomials.
 - Verification shares updated to match new secret shares.
 - No VOLE/OT state (FROST has none). Simpler than dkls23 refresh.
-- Refresh sessions tracked by epoch to prevent replay.
+- The same completed-contribution check applies to a live `SignerState`.
 
-## Constant-Time Guarantees
+An epoch counter alone is not replay protection. The local records reject
+concurrent and sequential duplicate finalization without requiring pending
+contributions to remain on their original objects. They do not authenticate
+peer transcripts or provide replay protection after a signer is re-created
+from serialized state. The application must route messages to the correct
+fresh session over authenticated channels, durably track applied refreshes,
+and coordinate activation of the new epoch.
 
-All operations on secret values are designed to execute in constant time,
-preventing timing side-channel attacks on shared hardware.
+## Side-Channel Design and Evidence Limits
+
+Secret arithmetic is implemented using constant-time primitives. Source
+inspection, differential tests and functional vectors do not prove resistance
+to side channels. Independent review of the backend integration and compiled
+code on supported architectures remains a production gate.
 
 ### dkls23
 
@@ -94,6 +109,14 @@ preventing timing side-channel attacks on shared hardware.
   `ModNScalar`. Modular inversion uses a constant-time Fermat's little theorem
   implementation (`scalarInverse`: `a^(q-2) mod q` via square-and-multiply with
   fixed public exponent). No `math/big` arithmetic is performed on secret values.
+- **Point arithmetic and encoding**: `github.com/bytemare/secp256k1` v0.5.0
+  provides a fixed 256-bit multiplication ladder, complete point addition
+  and constant-time SEC1 coordinate encoding. btcec's `NonConst` point
+  operations are not used in production protocol code. Final ECDSA
+  verification may use variable-time operations because its inputs are public.
+- **FZero reduction**: 64-byte PRF outputs are secret. Their reduction uses
+  `ModNScalar` on both 256-bit halves and the existing `2^256 mod q` gadget
+  entry. It computes exactly the former reduction without `math/big`.
 - **VOLE Beta selection**: Bob's secret binary vector β is never used as a
   branch condition. All β-dependent operations use branchless multiply-by-mask
   (`condUint32(β) * value`) or `subtle.ConstantTimeCopy` for byte selection.
@@ -104,12 +127,9 @@ preventing timing side-channel attacks on shared hardware.
   with `subtle.ConstantTimeCopy`.
 - **Commitment verification**: FCom opening and VOLE proof checks use
   `subtle.ConstantTimeCompare`.
-- **Zeroization**: Ephemeral secrets are zeroized via `ModNScalar.Zero()`
-  (deterministic, not subject to GC interference).
-
-The only remaining `math/big` usage is `reduce64Public`, which reduces 64-byte
-public hash outputs (Fiat-Shamir challenges, FZero hashes) modulo q. These
-are derived from public data and are not timing-sensitive.
+- **Zeroization**: Explicit clears overwrite scalar objects and selected
+  temporary buffers, including the curve adapter's scalar bytes. They do not
+  guarantee deletion of compiler, backend or garbage-collector copies.
 
 ### frost
 
@@ -125,8 +145,43 @@ are derived from public data and are not timing-sensitive.
 - **Zeroization**: Signing nonces (`HidingNonce`, `BindingNonce`) are zeroized
   to the zero scalar after `SignRound2` computation. The `nonceGenerate` input
   buffer (containing the secret key) is explicitly zeroed after hashing.
-- **Nonce reuse prevention**: `Round1State.consumed` flag prevents a second call
-  to `SignRound2` with the same nonces. Reuse would enable full key recovery.
+- **Nonce reuse prevention**: Round 2 holds the signer's write lock while
+  checking and consuming nonce state (RFC 9591 §5.1–5.2). Copies of a state
+  returned by `SignRound1` share one consumption record with its own mutex,
+  including when used with equivalent signer wrappers. States check the
+  matching key, participant set and epoch; local nonces must
+  match the stored commitment. These checks do not make copied raw secret
+  nonce material safe to reuse.
+
+## Session Lifetime and Persistence
+
+- Treat exported state fields as read-only during their lifetime. Do not
+  copy mutex-bearing signer/setup objects or share their mutable fields
+  between independent wrappers. The locks cover library calls, not direct
+  field mutation by the application.
+- Rejected signer-state imports leave the active signer unchanged. DKLS23
+  private round-state imports also validate all fields before replacement.
+  Regression tests finish the active signing or refresh operation after
+  rejected imports and verify the resulting signatures independently.
+- Retain the matching key, epoch, participant set and session progress with
+  private signing or refresh state. Existing restoration behavior is retained;
+  signer object identity is not an authorization check. Never use a nonce pair
+  or a DKLS23 OT/VOLE correlation in more than one signing session.
+- DKLS23 must reserve a globally unique session id durably before sending its
+  first round output. Before sending later outputs, persist session progress
+  and blacklist changes. If persistence fails, send nothing and abort the
+  session. Restoring state must not roll back completed rounds or recycle ids.
+- Encrypted serialization does not supply atomic writes, durable reservation,
+  rollback detection or coordination of the same ephemeral secrets across
+  copies. Supply transactional storage for those properties. Snapshot
+  restoration and RNG-state cloning must not cause session or nonce reuse.
+- On refresh, quiesce old signing sessions, authenticate the refresh session,
+  agree on success, and persist the new epoch consistently across the group.
+  A local one-use guard cannot solve a partial distributed commit or recovery
+  from old backups. Recovery must not silently activate mixed epochs.
+- The examples demonstrate protocol calls and encryption, not a production
+  storage or recovery system. Their colocated encryption keys and direct
+  `os.WriteFile` calls do not meet these requirements.
 
 ## Test Coverage
 
@@ -142,6 +197,9 @@ OT-extension batches, forged DKG proofs, non-canonical scalars and points,
 small-order points, truncated shares), nonce reuse prevention, independence
 of VOLE messages across signing sessions, post-persistence functional
 round-trips, and identifiable abort.
+Additional tests exercise concurrent nonce consumption and refresh finalization,
+copied and restored state, stale epochs, exact FZero reduction, and differential
+curve operations. These are regression checks, not an independent audit.
 
 ## Known Limitations
 
@@ -162,15 +220,44 @@ round-trips, and identifiable abort.
   a fresh random id per session (as the example does with `node.SessionID`);
   the check is a backstop, and two setups restored from the same snapshot
   cannot see each other's records.
+- **Peer transcript replay and distributed recovery**: Local lifetime checks
+  do not provide reliable broadcast, fresh authenticated peer transcript
+  envelopes, distributed commit, or backup rollback protection. Implement
+  these at the integration layer and test them against crashes and replay.
+- **Private state association**: DKLS23's existing round-state JSON does not
+  carry a key or epoch binding. Callers must restore it with its matching
+  setup and progress record. This remains open as AUDIT.md FU-MED-6; the
+  security fixes retain the existing formats and restoration behavior.
 - **No independent human audit**: Both packages were first reviewed by an
   automated audit (Claude Code, Anthropic Claude Opus 4.6). A 2026-10-16
   follow-up review (Claude Code, Anthropic Claude Fable 5.1) found that this
   first audit had missed a critical
   key-recovery flaw in dkls23 (reuse of the OT-extension batch across signing
-  sessions) and several protocol deviations from the cited specifications; all
-  are resolved and documented in [`AUDIT.md`](AUDIT.md). Automated review is
+  sessions) and several protocol deviations from the cited specifications.
+  Further hardening and remaining assurance gaps are recorded in
+  [`AUDIT.md`](AUDIT.md) and the production review gates below.
+  Automated review is
   not a substitute for an independent third-party audit by a firm specializing
   in MPC protocols, and the code has not been formally verified.
+
+## Production Review Gates
+
+- Independent specialist review of the exact release commit, including
+  DKLS23/KOS15/MR19, FROST DKG and signing, refresh, encoding and persistence;
+  verification of the resulting fixes by the reviewers.
+- A step-by-step refresh conformance review against the cited papers and
+  their corruption/erasure assumptions. Correlation tests alone do not
+  establish proactive security.
+- Independent review of the curve backend integration and compiled secret
+  data paths on supported architectures. Functional tests do not establish
+  timing or cache side-channel resistance.
+- Deployment-specific validation of custody, authorization, authenticated
+  session routing, durable state, recovery and protection against rollback
+  or independently activated copies. Test failures at storage and transfer
+  boundaries using disposable keys.
+- Full CI on the final release candidate, sustained adversarial testing,
+  reviewed dependencies, release provenance and a vulnerability-response
+  process. Keep the published protocol vectors unchanged.
 
 ## Responsible Disclosure
 
@@ -185,7 +272,8 @@ Do not open a public issue for security vulnerabilities.
 
 | Dependency                          | Used by | Purpose                                                                               |
 | ----------------------------------- | ------- | ------------------------------------------------------------------------------------- |
-| `github.com/btcsuite/btcd/btcec/v2` | dkls23  | secp256k1 curve operations (constant-time scalar arithmetic and point multiplication) |
+| `github.com/bytemare/secp256k1`     | dkls23  | Point multiplication, complete addition and SEC1 encoding; pinned v0.5.0, integration audit pending |
+| `github.com/btcsuite/btcd/btcec/v2` | dkls23  | Constant-time scalar arithmetic and public ECDSA verification |
 | `filippo.io/edwards25519`           | frost   | Ed25519 curve operations (constant-time scalar and point arithmetic, RFC 8032 encoding) |
 | `golang.org/x/crypto`               | dkls23  | SHAKE-256 (OT hashing, Fiat-Shamir challenges, VOLE proofs)                           |
 | `github.com/stretchr/testify`       | both    | Test assertions only (not used in production code)                                    |

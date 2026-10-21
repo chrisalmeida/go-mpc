@@ -28,6 +28,14 @@ import (
 	"filippo.io/edwards25519"
 )
 
+// refreshContribution identifies an applied local contribution using existing
+// public values. It is bookkeeping, not a protocol message or hash input.
+type refreshContribution struct {
+	publicKey string
+	partyID   int
+	seed      [16]byte
+}
+
 // RefreshRound1Output is broadcast by each party Pi in refresh round 1.
 type RefreshRound1Output struct {
 	// FeldmanCommitments are the t-1 compressed Edwards points C_{i,k} = δ_{i,k}·B
@@ -212,6 +220,9 @@ func RefreshRound2(signer *SignerState, coeffs []*edwards25519.Scalar, mySeed [1
 // The group public key and group commitments A_0 are unchanged (since Σ f_i(0) = 0).
 // Returns an error naming all bad senders if any verification fails; state is
 // NOT modified in that case.
+// A completed local seed contribution cannot be applied again on this signer.
+// This in-memory replay record does not replace durable caller-side routing
+// and replay protection after state restoration.
 func RefreshFinalize(
 	signer *SignerState,
 	coeffs []*edwards25519.Scalar,
@@ -224,6 +235,10 @@ func RefreshFinalize(
 
 	if err := checkBlacklist(signer, signer.KeyShare.AllIDs, "RefreshFinalize"); err != nil {
 		return err
+	}
+	contribution := refreshContribution{publicKey: string(signer.KeyShare.PublicKey), partyID: signer.KeyShare.ID, seed: mySeed}
+	if signer.completedRefresh[contribution] {
+		return &CorruptStateError{Phase: "RefreshFinalize", Detail: "local refresh contribution already applied"}
 	}
 
 	myID := signer.KeyShare.ID
@@ -322,5 +337,9 @@ func RefreshFinalize(
 	signer.KeyShare.SecretShare = newShare.Bytes()
 	signer.KeyShare.VerificationShare = newVerificationShare
 	signer.Epoch++
+	if signer.completedRefresh == nil {
+		signer.completedRefresh = make(map[refreshContribution]bool)
+	}
+	signer.completedRefresh[contribution] = true
 	return nil
 }

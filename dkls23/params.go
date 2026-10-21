@@ -15,6 +15,8 @@
 //
 // The protocol operates in a t-of-n threshold setting over secp256k1.
 // All secret scalar arithmetic uses constant-time ModNScalar operations.
+// Point operations and SEC1 encoding use github.com/bytemare/secp256k1;
+// the backend integration has not received an independent security audit.
 // Cheating parties are detected by the OT-extension consistency check, the
 // VOLE consistency check, and the R-commitment decommitment and check-value
 // verification; detected parties are blacklisted and excluded from future
@@ -40,11 +42,7 @@
 // See the example/ directory for a runnable demonstration.
 package dkls23
 
-import (
-	"math/big"
-
-	"github.com/btcsuite/btcd/btcec/v2"
-)
+import "github.com/btcsuite/btcd/btcec/v2"
 
 // Security parameters per DKLS23 §2 / Appendix A.
 const (
@@ -88,10 +86,6 @@ const (
 	domainFZero        = "fzero"
 	domainFZeroRefresh = "fzero-refresh"
 )
-
-// curveOrder is the secp256k1 group order q.
-// Retained for the 64-byte reduction of public hash outputs in reduce64Public.
-var curveOrder = btcec.S256().N
 
 // gadget is the precomputed gadget vector g[j] = 2^j mod q for j in [0, Xi).
 // It is used for the binary decomposition inner product in VOLE.
@@ -170,16 +164,18 @@ func scalarInverse(val *btcec.ModNScalar) btcec.ModNScalar {
 	return result
 }
 
-// reduce64Public reduces a 64-byte big-endian value modulo the secp256k1 group order
-// and returns the result as a ModNScalar. This is used for Fiat-Shamir challenge
-// derivation and FZero hashing where the input is a public hash output, so the
-// non-constant-time big.Int reduction is acceptable.
-func reduce64Public(b []byte) btcec.ModNScalar {
-	v := new(big.Int).SetBytes(b)
-	v.Mod(v, curveOrder)
-	var buf [32]byte
-	v.FillBytes(buf[:])
-	var s btcec.ModNScalar
-	s.SetBytes(&buf)
-	return s
+// reduce64 reduces the same 64-byte big-endian hash output modulo q used by
+// DKLS23's FZero (Section 3.1) and VOLE Fiat-Shamir challenges (Protocol 5.2).
+// FZero's PRF output is secret, so reduction must be constant-time too.
+// For b = high*2^256 + low, reduce both halves with ModNScalar and combine
+// using the existing gadget[256] = 2^256 mod q. No hash input or distribution
+// changes. The array parameter fixes the input width independently of value.
+func reduce64(b *[64]byte) btcec.ModNScalar {
+	var high, low btcec.ModNScalar
+	high.SetByteSlice(b[:32])
+	low.SetByteSlice(b[32:])
+	high.Mul(&gadget[Kappa])
+	high.Add(&low)
+	low.Zero()
+	return high
 }

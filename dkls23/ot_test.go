@@ -412,7 +412,7 @@ func TestHashToCurve(t *testing.T) {
 	require.Equal(t, pb, qb)
 
 	// Domain separated by j, by k and by input.
-	variants := map[string]*btcec.JacobianPoint{
+	variants := map[string]*curvePoint{
 		"j=1":         hashToCurve(1, 0, input),
 		"k=1":         hashToCurve(0, 1, input),
 		"other input": hashToCurve(0, 0, other),
@@ -447,25 +447,25 @@ func TestSelectPoint(t *testing.T) {
 	require.NoError(t, err)
 	b, err := sampleScalar()
 	require.NoError(t, err)
-	var p0, p1 btcec.JacobianPoint
-	btcec.ScalarBaseMultNonConst(&a, &p0)
-	btcec.ScalarBaseMultNonConst(&b, &p1)
-	// Non-affine representatives (Z != 1) must be handled too.
-	p0j := pointAdd(&p0, &p1)
-	p1j := pointAdd(&p1, &p1)
+	p0, p1 := scalarMulG(&a), scalarMulG(&b)
+	// Projective representatives from complete addition must be handled too.
+	p0j := pointAdd(p0, p1)
+	p1j := pointAdd(p1, p1)
 
-	encode := func(p *btcec.JacobianPoint) []byte {
-		var c btcec.JacobianPoint
-		c.Set(p)
-		enc, err := pointToCompressed(&c)
+	encode := func(p *curvePoint) []byte {
+		enc, err := pointToCompressed(p)
 		require.NoError(t, err)
 		return enc
 	}
 	want0, want1 := encode(p0j), encode(p1j)
 	require.NotEqual(t, want0, want1)
 
-	require.Equal(t, want0, encode(selectPoint(0, p0j, p1j)))
-	require.Equal(t, want1, encode(selectPoint(1, p0j, p1j)))
+	selected0, err := selectPoint(0, p0j, p1j)
+	require.NoError(t, err)
+	selected1, err := selectPoint(1, p0j, p1j)
+	require.NoError(t, err)
+	require.Equal(t, want0, encode(selected0))
+	require.Equal(t, want1, encode(selected1))
 
 	// Inputs are left unchanged.
 	require.Equal(t, want0, encode(p0j))
@@ -481,24 +481,20 @@ func TestPointSubAndIsInfinity(t *testing.T) {
 	var sum btcec.ModNScalar
 	sum.Add2(&a, &b)
 
-	var aG, bG, sumG btcec.JacobianPoint
-	btcec.ScalarBaseMultNonConst(&a, &aG)
-	btcec.ScalarBaseMultNonConst(&b, &bG)
-	btcec.ScalarBaseMultNonConst(&sum, &sumG)
+	aG, bG, sumG := scalarMulG(&a), scalarMulG(&b), scalarMulG(&sum)
 
 	// (a+b)G − bG == aG.
-	got, err := pointToCompressed(pointSub(&sumG, &bG))
+	got, err := pointToCompressed(pointSub(sumG, bG))
 	require.NoError(t, err)
-	want, err := pointToCompressed(&aG)
+	want, err := pointToCompressed(aG)
 	require.NoError(t, err)
 	require.Equal(t, want, got)
 
 	// P − P is the point at infinity; a finite point is not.
-	require.True(t, isInfinity(pointSub(&aG, &aG)))
-	require.False(t, isInfinity(&aG))
-	var zero btcec.JacobianPoint
-	require.True(t, isInfinity(&zero))
-	_, err = pointToCompressed(pointSub(&aG, &aG))
+	require.True(t, isInfinity(pointSub(aG, aG)))
+	require.False(t, isInfinity(aG))
+	require.True(t, isInfinity(newCurvePoint()))
+	_, err = pointToCompressed(pointSub(aG, aG))
 	require.Error(t, err)
 }
 

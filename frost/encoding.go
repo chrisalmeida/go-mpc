@@ -137,11 +137,15 @@ func (ss *SignerState) UnmarshalJSON(data []byte) error {
 	if err := checkWireVersion("signer state", j.Version); err != nil {
 		return err
 	}
-	ss.KeyShare = j.KeyShare
 	bl, err := stringBoolMapToInt(j.Blacklist)
 	if err != nil {
 		return err
 	}
+	// A rejected import must leave the active key, nonce use records and
+	// pending refresh unchanged. Preserve the receiver's mutex on success too.
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.KeyShare = j.KeyShare
 	ss.Blacklist = bl
 	ss.Epoch = j.Epoch
 	return nil

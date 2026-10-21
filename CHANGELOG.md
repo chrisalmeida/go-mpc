@@ -6,6 +6,42 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **frost: serialize nonce consumption** per RFC 9591 §5.1–5.2. Concurrent
+  round-2 calls and copies of a returned round-1 state share one consumption
+  record protected by its own mutex, including across equivalent signer
+  wrappers. States check the matching key, participant set and epoch.
+  Regression tests verify one successful call and a valid signature.
+  (AUDIT.md FU-HIGH-2)
+- **dkls23: use constant-time secp256k1 point operations and encoding** via
+  `github.com/bytemare/secp256k1` v0.5.0, replacing secret uses of btcec's
+  `NonConst` operations. Scalar arithmetic and independent ECDSA verification
+  continue to use btcec. No protocol equation, hash input or message changes.
+  This backend and its integration still require independent audit.
+  (FU-HIGH-3)
+- **dkls23: reduce FZero PRF outputs in constant time.** The former
+  `reduce64Public` passed secret outputs to `math/big`. The replacement
+  computes the identical 512-bit integer reduction using `ModNScalar` and the
+  existing gadget vector. Differential tests pin the reduction and PRF input.
+  (FU-MED-5)
+- **both: reject duplicate refresh finalization on live signer objects.**
+  Completed local seed contributions are recorded after successful updates
+  under the signer's write lock. Pending contributions retain their existing
+  restoration behavior. The local record is not serialized; durable replay
+  protection and authenticated session routing remain caller responsibilities.
+  (FU-MED-7)
+- **both: preserve live state after rejected imports.** Unsupported versions
+  and malformed fields no longer partially replace signer state, invalidate
+  active signing sessions or erase pending refresh. DKLS23 private round-state
+  decoding also publishes replacements only after validation. Tests complete
+  the original operations and independently verify their signatures. (FU-MED-8)
+
+### Changed
+
+- FROST round 2 takes the signer's write lock. Distinct sessions can interleave
+  between rounds, but their round-2 calls on one signer execute serially.
+
 ## [0.3.0] - 2026-10-21
 
 This release is a breaking change: it is not wire- or storage-compatible with

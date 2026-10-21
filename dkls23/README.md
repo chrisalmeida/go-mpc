@@ -11,7 +11,8 @@ Paper: https://eprint.iacr.org/2023/765.pdf
 |---|---|---|
 | `params.go` | Security constants; gadget vector; `condUint32` branchless helper; `scalarInverse` (Fermat); domain separation tags | §8 |
 | `commitment.go` | **FCom** (SHA-256 hash commitment); **FZero** (pairwise zero-sharing) | §3.1 |
-| `ot.go` | **Masny-Rindal endemic base OT** (MR19 Figure 8, Diffie-Hellman instantiation) over secp256k1; scalar/point helpers | §8.1 |
+| `ot.go` | **Masny-Rindal endemic base OT** (MR19 Figure 8, Diffie-Hellman instantiation) over secp256k1 | §8.1 |
+| `curve.go` | Constant-time secp256k1 point operations and compressed SEC1 encoding; protocol group operations unchanged | Protocols 3.6, 7.1; MR19 Appendix D.1 |
 | `ot_extension.go` | **KOS15 OT extension** realizing FEOTE(Zq^{l+rho}, xi=416) with a one-message Fiat-Shamir consistency check; one fresh batch per signing session | §5.1 |
 | `gf128.go` | Constant-time GF(2^128) multiplication for the OT-extension consistency check | §5.1 |
 | `vole.go` | **RVOLE** (Protocol 5.2) — Fiat-Shamir proof, Bob verification, constant-time mu check | §5 |
@@ -33,9 +34,19 @@ pairwise values stored in `SignerSetup`.
 
 Every signing session runs, for every counterparty, a fresh OT-extension
 batch under a fresh session id (Functionality 5.1 requires it) and derives a
-fresh VOLE correlation from it. Nothing derived inside a signing session is
-stored or reused: reusing an OT-extension batch across two sessions reveals
+fresh VOLE correlation from it. Session-derived OT/VOLE state is not placed
+in the long-term setup or reused across sessions: reusing a batch reveals
 the difference of the signer's nonces and allows full key recovery.
+
+Existing setup and private round-state JSON remain usable with the matching
+session progress. Callers must retain the correct key/epoch association and
+durably reserve fresh session ids before transmitting outputs. Serialization
+alone does not prevent rollback or reuse of the same secrets across copies.
+
+Refresh finalization records completed local contributions on the live setup
+and rejects repeats. This local record is not serialized. Pending contribution
+restoration is unchanged; durable replay protection, peer transcript freshness
+and consistent epoch activation remain caller responsibilities.
 
 ---
 
@@ -77,6 +88,7 @@ blacklisted and excluded from all future sessions (step 8).
 
 ## Dependencies
 
-- `github.com/btcsuite/btcd/btcec/v2` — secp256k1 curve arithmetic (constant-time `ModNScalar`)
+- `github.com/bytemare/secp256k1` v0.5.0 — constant-time point multiplication, complete addition, and SEC1 encoding; independent integration audit pending
+- `github.com/btcsuite/btcd/btcec/v2` — constant-time `ModNScalar` arithmetic and independent verification of final ECDSA signatures
 - `golang.org/x/crypto/sha3` — SHAKE-256 (PRG expansion, Fiat-Shamir)
-- Standard library: `crypto/rand`, `crypto/sha256`, `crypto/subtle`, `math/big` (public hash reduction only)
+- Standard library: `crypto/rand`, `crypto/sha256`, `crypto/subtle`

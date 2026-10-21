@@ -47,8 +47,10 @@
 //
 // # Concurrency
 //
-// [SignerState] is safe for concurrent reads (parallel signing sessions).
-// Mutating operations acquire a write lock internally.
+// [SignerState] is safe for concurrent protocol calls. Round 2 consumes its
+// nonce state under a write lock. Refresh finalization records completed
+// local contributions under a write lock. Callers must not
+// mutate exported fields during protocol calls or copy mutex-bearing states.
 //
 // # Usage flow
 //

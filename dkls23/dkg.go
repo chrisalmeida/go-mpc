@@ -308,27 +308,24 @@ func feldmanVerify(share *btcec.ModNScalar, x int, feldmanCommitments [][]byte) 
 	xPow.SetInt(1)
 
 	// Compute RHS = sum_{k=0}^{t-1} C_{i,k} * x^k (as EC points).
-	var rhs btcec.JacobianPoint
+	rhs := newCurvePoint()
 	for k := 0; k < t; k++ {
 		Cik, err := compressedToPoint(feldmanCommitments[k])
 		if err != nil {
 			return fmt.Errorf("dkls23: parse Feldman commitment: %w", err)
 		}
 		scaled := scalarMul(&xPow, Cik)
-		btcec.AddNonConst(&rhs, scaled, &rhs)
+		rhs.Add(scaled)
 		xPow.Mul(&xScalar)
 	}
-	rhs.ToAffine()
 
 	// Compute LHS = share * G.
-	var lhs btcec.JacobianPoint
-	btcec.ScalarBaseMultNonConst(share, &lhs)
-	lhs.ToAffine()
+	lhs := scalarMulG(share)
 
-	if lhs.X.IsZero() && lhs.Y.IsZero() {
+	if lhs.IsIdentity() {
 		return errors.New("dkls23: LHS is point at infinity")
 	}
-	if !lhs.X.Equals(&rhs.X) || !lhs.Y.Equals(&rhs.Y) {
+	if lhs.Equal(rhs) != 1 {
 		return errors.New("dkls23: Feldman verification failed: share inconsistent with commitments")
 	}
 	return nil
@@ -423,16 +420,16 @@ func DKGFinalize(
 	}
 
 	// Compute master public key: pk = sum_j C_{j,0} (EC point addition).
-	var pk btcec.JacobianPoint
+	pk := newCurvePoint()
 	for _, j := range config.AllIDs {
 		C_j0, err2 := compressedToPoint(feldmanByParty[j][0])
 		if err2 != nil {
 			return btcec.ModNScalar{}, nil, fmt.Errorf("dkls23: parse C_{%d,0}: %w", j, err2)
 		}
-		btcec.AddNonConst(&pk, C_j0, &pk)
+		pk.Add(C_j0)
 	}
 
-	pkBytes, err2 := pointToCompressed(&pk)
+	pkBytes, err2 := pointToCompressed(pk)
 	if err2 != nil {
 		return btcec.ModNScalar{}, nil, fmt.Errorf("dkls23: serialize public key: %w", err2)
 	}

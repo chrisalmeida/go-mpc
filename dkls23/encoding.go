@@ -681,35 +681,40 @@ func (s *Round1State) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
-	s.SigID = j.SigID
-	s.Signers = j.Signers
+	next := Round1State{SigID: j.SigID, Signers: j.Signers}
 	var err error
-	s.R_i, err = hexToScalar(j.RI)
+	next.R_i, err = hexToScalar(j.RI)
 	if err != nil {
 		return err
 	}
-	s.Phi_i, err = hexToScalar(j.PhiI)
+	next.Phi_i, err = hexToScalar(j.PhiI)
 	if err != nil {
 		return err
 	}
-	s.R_iPoint, err = hex.DecodeString(j.RIPoint)
+	next.R_iPoint, err = hex.DecodeString(j.RIPoint)
 	if err != nil {
 		return err
 	}
-	s.Com, err = hexToFixed32(j.Com)
+	next.Com, err = hexToFixed32(j.Com)
 	if err != nil {
 		return err
 	}
-	s.Salt, err = hexToFixed32(j.Salt)
+	next.Salt, err = hexToFixed32(j.Salt)
 	if err != nil {
 		return err
 	}
-	s.ZetaI, err = hexToScalar(j.ZetaI)
+	next.ZetaI, err = hexToScalar(j.ZetaI)
 	if err != nil {
 		return err
 	}
-	s.VoleBobForRound2, err = stringMapKeys(j.VoleBobForRound2)
-	return err
+	next.VoleBobForRound2, err = stringMapKeys(j.VoleBobForRound2)
+	if err != nil {
+		return err
+	}
+	// Publish only a completely decoded replacement. A rejected load must not
+	// alter active private material or its lifetime metadata.
+	*s = next
+	return nil
 }
 
 // =====================================================================
@@ -739,22 +744,26 @@ func (s *Round2State) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
-	s.Round1State = j.Round1State
+	next := Round2State{Round1State: j.Round1State}
 	var err error
-	s.SK_i, err = hexToScalar(j.SKI)
+	next.SK_i, err = hexToScalar(j.SKI)
 	if err != nil {
 		return err
 	}
-	s.C_u, err = hexToScalarMap(j.CU)
+	next.C_u, err = hexToScalarMap(j.CU)
 	if err != nil {
 		return err
 	}
-	s.C_v, err = hexToScalarMap(j.CV)
+	next.C_v, err = hexToScalarMap(j.CV)
 	if err != nil {
 		return err
 	}
-	s.Round1Commits, err = jsonToIntMap32(j.Round1Commits)
-	return err
+	next.Round1Commits, err = jsonToIntMap32(j.Round1Commits)
+	if err != nil {
+		return err
+	}
+	*s = next
+	return nil
 }
 
 // =====================================================================
@@ -975,46 +984,62 @@ func (s *SignerSetup) UnmarshalJSON(data []byte) error {
 	if j.Version != SetupWireVersion {
 		return fmt.Errorf("dkls23 SignerSetup: unsupported wire format version %d (want %d)", j.Version, SetupWireVersion)
 	}
-	s.MyID = j.MyID
-	s.AllIDs = j.AllIDs
-	s.Threshold = j.Threshold
-	s.Epoch = j.Epoch
+	var next SignerSetup
+	next.MyID = j.MyID
+	next.AllIDs = j.AllIDs
+	next.Threshold = j.Threshold
+	next.Epoch = j.Epoch
 
 	var err error
-	s.Share, err = hexToScalar(j.Share)
+	next.Share, err = hexToScalar(j.Share)
 	if err != nil {
 		return err
 	}
-	s.PubKey, err = hex.DecodeString(j.PubKey)
+	next.PubKey, err = hex.DecodeString(j.PubKey)
 	if err != nil {
 		return err
 	}
-	s.AliceBaseOT, err = stringMapKeys(j.AliceBaseOT)
+	next.AliceBaseOT, err = stringMapKeys(j.AliceBaseOT)
 	if err != nil {
 		return err
 	}
-	s.BobBaseOT, err = stringMapKeys(j.BobBaseOT)
+	next.BobBaseOT, err = stringMapKeys(j.BobBaseOT)
 	if err != nil {
 		return err
 	}
-	s.FZeroSeeds, err = jsonToIntMap16(j.FZeroSeeds)
+	next.FZeroSeeds, err = jsonToIntMap16(j.FZeroSeeds)
 	if err != nil {
 		return err
 	}
-	s.Blacklist = make(map[int]bool, len(j.Blacklist))
+	next.Blacklist = make(map[int]bool, len(j.Blacklist))
 	for k, v := range j.Blacklist {
 		id, err := strconv.Atoi(k)
 		if err != nil {
 			return err
 		}
-		s.Blacklist[id] = v
+		next.Blacklist[id] = v
 	}
-	s.SessionIDs = make(map[string]int, len(j.SessionIDs))
+	next.SessionIDs = make(map[string]int, len(j.SessionIDs))
 	for sigID, stage := range j.SessionIDs {
 		if sigID == "" || stage < sessionRound1Done || stage > sessionRound3Done {
 			return fmt.Errorf("dkls23 SignerSetup: invalid session_ids entry %q: %d", sigID, stage)
 		}
-		s.SessionIDs[sigID] = stage
+		next.SessionIDs[sigID] = stage
 	}
+	// Keep the receiver's mutex and publish the replacement only after every
+	// field is decoded. Failed imports leave active sessions and refresh intact.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.MyID = next.MyID
+	s.AllIDs = next.AllIDs
+	s.Threshold = next.Threshold
+	s.Epoch = next.Epoch
+	s.Share = next.Share
+	s.PubKey = next.PubKey
+	s.AliceBaseOT = next.AliceBaseOT
+	s.BobBaseOT = next.BobBaseOT
+	s.FZeroSeeds = next.FZeroSeeds
+	s.Blacklist = next.Blacklist
+	s.SessionIDs = next.SessionIDs
 	return nil
 }

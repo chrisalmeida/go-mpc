@@ -105,9 +105,10 @@ func FZeroSample(sharedSeeds map[int][16]byte, myID int, index []byte) btcec.Mod
 		xof.Write(buf4[:])
 		xof.Write(index)
 
-		out := make([]byte, 64)
-		xof.Read(out)
-		h := reduce64Public(out)
+		var out [64]byte
+		xof.Read(out[:])
+		h := reduce64(&out)
+		clear(out[:])
 
 		if myID < j {
 			// Party with smaller ID subtracts.

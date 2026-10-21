@@ -138,97 +138,6 @@ func sampleScalar() (btcec.ModNScalar, error) {
 	}
 }
 
-// pointToCompressed serializes a JacobianPoint to 33-byte compressed form.
-func pointToCompressed(p *btcec.JacobianPoint) ([]byte, error) {
-	p.ToAffine()
-	if p.X.IsZero() && p.Y.IsZero() {
-		return nil, errors.New("dkls23: cannot serialize point at infinity")
-	}
-	pub := btcec.NewPublicKey(&p.X, &p.Y)
-	return pub.SerializeCompressed(), nil
-}
-
-// compressedToPoint parses a 33-byte compressed point.
-func compressedToPoint(b []byte) (*btcec.JacobianPoint, error) {
-	pub, err := btcec.ParsePubKey(b)
-	if err != nil {
-		return nil, err
-	}
-	var jp btcec.JacobianPoint
-	pub.AsJacobian(&jp)
-	return &jp, nil
-}
-
-// scalarMulGCompressed computes s*G and returns the compressed 33-byte encoding.
-func scalarMulGCompressed(s *btcec.ModNScalar) ([]byte, error) {
-	var result btcec.JacobianPoint
-	btcec.ScalarBaseMultNonConst(s, &result)
-	return pointToCompressed(&result)
-}
-
-// scalarMul computes s*P and returns the result as a JacobianPoint.
-func scalarMul(s *btcec.ModNScalar, p *btcec.JacobianPoint) *btcec.JacobianPoint {
-	var result btcec.JacobianPoint
-	btcec.ScalarMultNonConst(s, p, &result)
-	return &result
-}
-
-// pointAdd computes P+Q.
-func pointAdd(p, q *btcec.JacobianPoint) *btcec.JacobianPoint {
-	var result btcec.JacobianPoint
-	btcec.AddNonConst(p, q, &result)
-	return &result
-}
-
-// pointNeg returns -P.
-func pointNeg(p *btcec.JacobianPoint) *btcec.JacobianPoint {
-	neg := *p
-	neg.ToAffine()
-	neg.Y.Negate(1)
-	neg.Y.Normalize()
-	return &neg
-}
-
-// pointSub computes P−Q.
-func pointSub(p, q *btcec.JacobianPoint) *btcec.JacobianPoint {
-	return pointAdd(p, pointNeg(q))
-}
-
-// isInfinity reports whether p is the point at infinity (the group identity).
-// p is not modified.
-func isInfinity(p *btcec.JacobianPoint) bool {
-	var q btcec.JacobianPoint
-	q.Set(p)
-	q.ToAffine()
-	return q.X.IsZero() && q.Y.IsZero()
-}
-
-// selectPoint returns a copy of p1 when c == 1 and a copy of p0 when c == 0.
-// The selection is a constant-time copy of the affine coordinates, so neither
-// control flow nor memory access depends on c. c must be 0 or 1. Neither
-// input is modified.
-func selectPoint(c int, p0, p1 *btcec.JacobianPoint) *btcec.JacobianPoint {
-	var a0, a1 btcec.JacobianPoint
-	a0.Set(p0)
-	a1.Set(p1)
-	a0.ToAffine()
-	a1.ToAffine()
-
-	var x, y, x1, y1 [32]byte
-	a0.X.PutBytesUnchecked(x[:])
-	a0.Y.PutBytesUnchecked(y[:])
-	a1.X.PutBytesUnchecked(x1[:])
-	a1.Y.PutBytesUnchecked(y1[:])
-	subtle.ConstantTimeCopy(c, x[:], x1[:])
-	subtle.ConstantTimeCopy(c, y[:], y1[:])
-
-	var out btcec.JacobianPoint
-	out.X.SetByteSlice(x[:])
-	out.Y.SetByteSlice(y[:])
-	out.Z.SetInt(1)
-	return &out
-}
-
 // hashToCurve realizes the random oracles H_j : G → G of MR19 Figure 8 for OT
 // instance k. The XOF SHAKE256(domainBaseOTHash || j || k || input) is read as
 // successive 32-byte candidate x-coordinates, and the first candidate that
@@ -243,7 +152,7 @@ func selectPoint(c int, p0, p1 *btcec.JacobianPoint) *btcec.JacobianPoint {
 // H_1. input is the 33-byte compressed encoding of the other r-value, which
 // is public (it is sent on the wire), so the variable trial count is not a
 // side channel.
-func hashToCurve(j byte, k int, input []byte) *btcec.JacobianPoint {
+func hashToCurve(j byte, k int, input []byte) *curvePoint {
 	h := sha3.NewShake256()
 	h.Write([]byte(domainBaseOTHash))
 	h.Write([]byte{j})
@@ -306,18 +215,21 @@ func BaseOTReceiverRound1(choices []bool) (*BaseOTReceiverState, *BaseOTReceiver
 			state.Zero()
 			return nil, nil, fmt.Errorf("dkls23 BaseOTReceiverRound1: sampling a at instance %d: %w", k, err)
 		}
-		var mA btcec.JacobianPoint
-		btcec.ScalarBaseMultNonConst(&state.A[k], &mA)
+		mA := scalarMulG(&state.A[k])
 
 		// Compute both H_0(r_{1-c}) and H_1(r_{1-c}) on the public value
 		// r_{1-c} and select H_c with a constant-time copy.
 		c := int(condUint32(state.Choices[k]))
 		h0 := hashToCurve(0, k, rOther)
 		h1 := hashToCurve(1, k, rOther)
-		hc := selectPoint(c, h0, h1)
+		hc, err := selectPoint(c, h0, h1)
+		if err != nil {
+			state.Zero()
+			return nil, nil, fmt.Errorf("dkls23 BaseOTReceiverRound1: select point: %w", err)
+		}
 
 		// r_c = m_A − H_c(r_{1-c}).
-		rcBytes, err := pointToCompressed(pointSub(&mA, hc))
+		rcBytes, err := pointToCompressed(pointSub(mA, hc))
 		if err != nil {
 			// Only reachable if a·G == H_c(r_{1-c}), probability 1/q.
 			state.Zero()
@@ -367,7 +279,7 @@ func BaseOTSenderRound2(msg *BaseOTReceiverMsg) (seeds0, seeds1 [][]byte, reply 
 	}
 
 	for k := 0; k < n; k++ {
-		var r [2]*btcec.JacobianPoint
+		var r [2]*curvePoint
 		rBytes := [2][]byte{msg.R0[k], msg.R1[k]}
 		for j := 0; j < 2; j++ {
 			r[j], err = compressedToPoint(rBytes[j])
@@ -464,7 +376,10 @@ func BaseOTReceiverFinalize(state *BaseOTReceiverState, reply *BaseOTSenderMsg) 
 
 		// s_{A,c} = a·m_{B,c}.
 		c := int(condUint32(state.Choices[k]))
-		mBc := selectPoint(c, m0, m1)
+		mBc, err := selectPoint(c, m0, m1)
+		if err != nil {
+			return nil, fmt.Errorf("dkls23 BaseOTReceiverFinalize: select point: %w", err)
+		}
 		sBytes, err := pointToCompressed(scalarMul(&state.A[k], mBc))
 		if err != nil {
 			// Unreachable for a valid state: a ≠ 0 and m_{B,c} ≠ O in a
