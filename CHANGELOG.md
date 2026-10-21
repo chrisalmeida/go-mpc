@@ -6,8 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-This release is a major version: it is not wire- or storage-compatible with
-v0.x, and several APIs changed shape. See "Upgrading from v0.x" in the README.
+## [0.3.0] - 2026-10-21
+
+This release is a breaking change: it is not wire- or storage-compatible with
+v0.2.x, and several APIs changed shape. See "Upgrading from v0.2.x" in the
+README. The library stays at v0.x until an independent audit; v1.0.0 will
+mark the point where the public API is frozen.
 
 ### Security
 
@@ -115,6 +119,7 @@ v0.x, and several APIs changed shape. See "Upgrading from v0.x" in the README.
   key generation, 3-round signing, proactive key refresh, and encrypted
   persistence.
 
-[Unreleased]: https://github.com/chrisalmeida/go-mpc/compare/v0.2.0...develop
+[Unreleased]: https://github.com/chrisalmeida/go-mpc/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/chrisalmeida/go-mpc/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/chrisalmeida/go-mpc/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/chrisalmeida/go-mpc/releases/tag/v0.1.0

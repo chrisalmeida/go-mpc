@@ -120,9 +120,9 @@ cd example/frost && go run .
 - **Resharing.** Refresh keeps the same parties and threshold. Adding or removing parties, or changing t or n, is not supported.
 - **Key derivation.** There is no BIP32-style derivation of child keys.
 
-## Upgrading from v0.x
+## Upgrading from v0.2.x
 
-This major version changes the protocol structure, the APIs, and the persisted formats. It is not wire- or storage-compatible with v0.x.
+v0.3.0 changes the protocol structure, the APIs, and the persisted formats. It is not wire- or storage-compatible with v0.2.x or earlier.
 
 - **Stored key material must be regenerated.** `SignerSetup` (DKLS23) and `KeyShare` / `SignerState` (FROST) now carry a wire-format version and reject blobs without it. Run a fresh key generation and setup; the demos do this when their `shares/` directory is removed.
 - **DKLS23 key generation** is commit-then-reveal. `DKGRound1` returns a `*DKGPrivateState` instead of raw coefficients, `DKGRound2` requires every other party's round 1 output, and the Feldman commitments are released in round 2.
