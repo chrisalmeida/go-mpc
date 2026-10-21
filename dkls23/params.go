@@ -27,9 +27,11 @@
 //
 // # Concurrency
 //
-// [SignerSetup] is safe for concurrent reads (parallel signing sessions).
-// Mutating operations such as key refresh and party blacklisting acquire
-// a write lock internally.
+// [SignerSetup] is safe for concurrent use. Each signing round, refresh, and
+// blacklisting operation takes the setup's write lock for its duration, so
+// concurrent sessions interleave at round granularity. Each session id may
+// complete each signing round exactly once per setup and epoch; a reuse is
+// rejected with [SessionIDReusedError] (Protocol 3.6 step 4).
 //
 // # Usage flow
 //

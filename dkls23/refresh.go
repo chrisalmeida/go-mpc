@@ -180,7 +180,8 @@ func RefreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byt
 //  5. Updates the Shamir share: share += Σ_j f_j(myID) mod q.
 //  6. Re-randomizes all base-OT seeds via OT re-randomization (KMOS21 §4).
 //  7. Derives new per-pair FZero seeds from combinedSeed.
-//  8. Increments setup.Epoch.
+//  8. Increments setup.Epoch and clears the record of used session ids (the
+//     new seeds re-key everything a session id feeds into).
 //
 // Returns an error naming all bad senders if any verification fails; setup is
 // NOT modified in that case.
@@ -328,6 +329,11 @@ func RefreshFinalize(
 	setup.BobBaseOT = newBob
 	setup.FZeroSeeds = newFZeroSeeds
 	setup.Epoch++
+	// Every quantity derived from a session id (OT-extension PRF rows, OT
+	// output seeds, FZero values) is keyed by seeds that were just replaced,
+	// so ids used in earlier epochs cannot reproduce anything under the new
+	// seeds. Clearing the record bounds its growth to one epoch.
+	setup.SessionIDs = make(map[string]int)
 	return nil
 }
 

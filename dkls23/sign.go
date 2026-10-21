@@ -61,9 +61,11 @@ type BaseOTReceiverSeeds struct {
 // and the VOLE correlation derived from it are regenerated inside every
 // signing session; they must never be stored and reused.
 //
-// SignerSetup is safe for concurrent use: read-only operations acquire a read
-// lock, while mutating operations (refresh, blacklisting) acquire a write lock.
-// A SignerSetup must not be copied after first use.
+// SignerSetup is safe for concurrent use. Every signing round takes the write
+// lock for its duration, because each round records the session's progress
+// (see SessionIDs) and may blacklist a party; concurrent sessions therefore
+// execute their rounds one at a time within one SignerSetup. Refresh takes
+// the write lock as well. A SignerSetup must not be copied after first use.
 type SignerSetup struct {
 	// mu protects all mutable fields below. Unexported so it is excluded from
 	// JSON serialization and cannot be misused by callers.
@@ -92,6 +94,48 @@ type SignerSetup struct {
 	Blacklist map[int]bool
 	// Epoch is the proactive refresh epoch counter, starting at 0 and incremented on each RefreshFinalize.
 	Epoch int
+	// SessionIDs records, for every signing session id used with this setup in
+	// the current epoch, the last signing round completed for it (1, 2 or 3).
+	// It enforces DKLS23 Protocol 3.6 step 4 ("sigid is not fresh" requests
+	// are ignored): SignRound1 rejects an id that was already used, SignRound2
+	// requires round 1 and rejects a second round 2, SignRound3 requires round
+	// 2 and rejects a second round 3. A session id reuse would reproduce the
+	// session's OT-extension batch, so the map is part of the persisted state.
+	// RefreshFinalize clears it: the refreshed base-OT and FZero seeds re-key
+	// every quantity that depends on the session id, so ids from earlier
+	// epochs cannot collide with the new seeds. Between refreshes it grows by
+	// one entry per session.
+	SessionIDs map[string]int
+}
+
+// Signing-session stages recorded in SignerSetup.SessionIDs.
+const (
+	sessionUnused     = 0
+	sessionRound1Done = 1
+	sessionRound2Done = 2
+	sessionRound3Done = 3
+)
+
+// requireSessionStage checks that sigID has completed exactly the round `want`
+// on this setup. The caller must hold setup.mu.
+func (setup *SignerSetup) requireSessionStage(sigID string, want int, phase string) error {
+	got := setup.SessionIDs[sigID]
+	switch {
+	case got == want:
+		return nil
+	case got > want:
+		return &SessionIDReusedError{SigID: sigID, Phase: phase, Detail: fmt.Sprintf("round %d already completed for this session", got)}
+	default:
+		return &InvalidInputError{Phase: phase, Detail: fmt.Sprintf("session id %q has not completed round %d on this SignerSetup", sigID, want)}
+	}
+}
+
+// markSessionStage records that sigID completed `stage`. The caller must hold setup.mu.
+func (setup *SignerSetup) markSessionStage(sigID string, stage int) {
+	if setup.SessionIDs == nil {
+		setup.SessionIDs = make(map[string]int)
+	}
+	setup.SessionIDs[sigID] = stage
 }
 
 // voleSIDForPair constructs the session ID of the FRVOLE instance between
@@ -173,8 +217,8 @@ func sampleBeta() ([Xi]bool, error) {
 // OT-extension batch (Functionality 5.1, fresh sid) whose receiver message is
 // carried in Round1Msg.OTExt.
 func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, map[int]*Round1Msg, error) {
-	setup.mu.RLock()
-	defer setup.mu.RUnlock()
+	setup.mu.Lock()
+	defer setup.mu.Unlock()
 	if err := validatePartyIDs(signers, "SignRound1"); err != nil {
 		return nil, nil, err
 	}
@@ -193,6 +237,13 @@ func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 	}
 	if !myIDFound {
 		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: "myID not in signers list"}
+	}
+	// Paper step 4: ignore the request unless sigid is fresh.
+	if sigID == "" {
+		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: "session id must be non-empty"}
+	}
+	if err := setup.requireSessionStage(sigID, sessionUnused, "SignRound1"); err != nil {
+		return nil, nil, err
 	}
 
 	// Sample nonce and inversion mask.
@@ -269,6 +320,9 @@ func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 		ZetaI:            zetaI,
 		VoleBobForRound2: bobStates,
 	}
+	// The session's OT-extension batches are about to leave this process:
+	// from here on the id is spent.
+	setup.markSessionStage(sigID, sessionRound1Done)
 	return state, outMsgs, nil
 }
 
@@ -317,6 +371,11 @@ func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, state.Signers, "SignRound2"); err != nil {
+		return nil, nil, err
+	}
+	// Round 2 consumes the counterparties' batches and sends this party's VOLE
+	// multiply messages; it may run exactly once per session on this setup.
+	if err := setup.requireSessionStage(state.SigID, sessionRound1Done, "SignRound2"); err != nil {
 		return nil, nil, err
 	}
 
@@ -420,6 +479,7 @@ func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 		C_v:           c_v,
 		Round1Commits: round1Commits,
 	}
+	setup.markSessionStage(state.SigID, sessionRound2Done)
 	return state2, outMsgs, nil
 }
 
@@ -449,6 +509,12 @@ func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRoun
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, state2.Signers, "SignRound3"); err != nil {
+		return nil, err
+	}
+	// Round 3 releases this party's signature fragments, which are a function
+	// of the counterparties' round 2 values; releasing fragments for two
+	// different sets of round 2 inputs would reveal r_i. Exactly once per session.
+	if err := setup.requireSessionStage(state2.SigID, sessionRound2Done, "SignRound3"); err != nil {
 		return nil, err
 	}
 
@@ -679,6 +745,7 @@ func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRoun
 	// Also return my own fragment through the "self" entry (key = myID).
 	outMsgs[setup.MyID] = &Round3Msg{W_i: wArr[:], U_i: uArr[:]}
 
+	setup.markSessionStage(state2.SigID, sessionRound3Done)
 	return outMsgs, nil
 }
 

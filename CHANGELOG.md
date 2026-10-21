@@ -32,6 +32,11 @@ v0.x, and several APIs changed shape. See "Upgrading from v0.x" in the README.
   reproduced exactly by the test suite. (FU-MED-4)
 - **dkls23: the base OT is now Masny-Rindal** (MR19 Figure 8, Diffie-Hellman
   instantiation) as DKLS23 §8.1 specifies. (FU-LOW-4)
+- **dkls23: session-id freshness is enforced** (Protocol 3.6 step 4).
+  `SignerSetup.SessionIDs` records each session's progress; a reused id, a
+  replayed `Round1State`, or a second round 3 is rejected with
+  `SessionIDReusedError`. The record is persisted and cleared by refresh.
+  (FU-LOW-6)
 
 ### Changed (breaking)
 
@@ -49,6 +54,9 @@ v0.x, and several APIs changed shape. See "Upgrading from v0.x" in the README.
 - dkls23 `Round1Msg` carries the session's OT-extension batch for its
   recipient.
 - dkls23 `SignCombine` ignores an entry under the caller's own party ID.
+- dkls23 `SignRound1` takes the setup's write lock (it records the session),
+  so rounds of concurrent sessions execute one at a time per `SignerSetup`;
+  `SignerSetup` gains `SessionIDs` and its JSON gains `session_ids`.
 - frost `DKGPartyConfig` gains `Context`; `DKGRound1Output` gains `ProofR` and
   `ProofMu`; `DKGRound2` takes all parties' round 1 outputs.
 - frost rejects non-canonical, identity, and non-prime-order points wherever

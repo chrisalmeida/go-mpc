@@ -54,6 +54,22 @@ func (e *CorruptStateError) Error() string {
 	return fmt.Sprintf("dkls23 %s: corrupt state: %s", e.Phase, e.Detail)
 }
 
+// SessionIDReusedError indicates that a signing round was invoked for a session
+// id that this SignerSetup has already completed that round for (DKLS23
+// Protocol 3.6 step 4: a request whose sigid is not fresh is ignored).
+// Reusing a session id would reuse the session's OT-extension correlation
+// and leak the signer's nonce; the call is rejected and nothing is computed.
+// Action: start a new session with a fresh session id.
+type SessionIDReusedError struct {
+	SigID  string
+	Phase  string
+	Detail string
+}
+
+func (e *SessionIDReusedError) Error() string {
+	return fmt.Sprintf("dkls23 %s: session id %q reused: %s", e.Phase, e.SigID, e.Detail)
+}
+
 // BlacklistedPartyError indicates an operation was rejected because one or more
 // parties in the requested set have been blacklisted for prior cheating.
 type BlacklistedPartyError struct {

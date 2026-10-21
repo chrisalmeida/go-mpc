@@ -154,9 +154,14 @@ round-trips, and identifiable abort.
   side-channel attacks (power analysis, electromagnetic emanation, etc.).
   (Applies to both packages.)
 - **Session identifiers**: DKLS23 Protocol 3.6 step 4 requires every signing
-  session to use a fresh `sigid`. The library does not track used session
-  identifiers; callers must generate a fresh random one per session (as the
-  example does with `node.SessionID`).
+  session to use a fresh `sigid`. `SignerSetup` records the last completed
+  round of every session id used in the current epoch and rejects a reuse
+  with `SessionIDReusedError`; each round of a session can run exactly once.
+  The record is persisted with the setup and cleared by a refresh, which
+  re-keys everything a session id feeds into. Callers should still generate
+  a fresh random id per session (as the example does with `node.SessionID`);
+  the check is a backstop, and two setups restored from the same snapshot
+  cannot see each other's records.
 - **No independent human audit**: Both packages were first reviewed by an
   automated audit (Claude Code, Anthropic Claude Opus 4.6). A 2026-10-16
   follow-up review (Claude Code, Anthropic Claude Fable 5.1) found that this

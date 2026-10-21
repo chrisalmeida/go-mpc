@@ -69,6 +69,7 @@ func FuzzUnmarshalRound2State(f *testing.F) {
 func FuzzUnmarshalSignerSetup(f *testing.F) {
 	f.Add([]byte(`{"version":1,"my_id":1,"all_ids":[1],"share":"","pub_key":"","threshold":1}`))
 	f.Add([]byte(`{"version":1,"alice_base_ot":{"2":{"seeds":[],"sigma":""}},"bob_base_ot":{"2":{"seeds0":[],"seeds1":[]}}}`))
+	f.Add([]byte(`{"version":1,"my_id":1,"all_ids":[1],"share":"","pub_key":"","threshold":1,"session_ids":{"sid":2}}`))
 	f.Add([]byte(`{}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var s SignerSetup

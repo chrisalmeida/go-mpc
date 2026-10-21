@@ -1,6 +1,7 @@
 package dkls23
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 
@@ -365,6 +366,33 @@ func TestRefreshBaseOTSeedsStayCorrelated(t *testing.T) {
 			require.NoError(t, err, "pair %d→%d: OT extension over refreshed seeds", i, j)
 		}
 	}
+}
+
+// TestRefreshClearsSessionIDs: a refresh replaces every seed a session id
+// feeds into, so the record of used ids is reset and an id from an earlier
+// epoch is accepted again, with a valid signature as the result.
+func TestRefreshClearsSessionIDs(t *testing.T) {
+	t.Parallel()
+	allIDs := []int{1, 2, 3}
+	setups := fullSetup(t)
+	msg := []byte("same id, new epoch")
+
+	s := runSession(t, setups, "sid-epoch", allIDs, msg)
+	r, sig := s.combine(t, setups, msg)
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+	_, _, err := SignRound1(setups[1], "sid-epoch", allIDs)
+	var reused *SessionIDReusedError
+	require.True(t, errors.As(err, &reused))
+
+	runRefresh(t, setups)
+	for _, id := range allIDs {
+		require.Empty(t, setups[id].SessionIDs, "party %d", id)
+	}
+
+	s2 := runSession(t, setups, "sid-epoch", allIDs, msg)
+	r, sig = s2.combine(t, setups, msg)
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+	require.NotEqual(t, s.r1Msgs[2][1].OTExt.U, s2.r1Msgs[2][1].OTExt.U, "refreshed seeds give a different batch for the same id")
 }
 
 // TestRefreshSigningWorksAcrossEpochs runs several refresh cycles and signs

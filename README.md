@@ -116,7 +116,7 @@ cd example/frost && go run .
 ## What the library does not do
 
 - **Transport, authentication, and broadcast.** Both protocols assume authenticated point-to-point channels and, for identifiable abort, a coordinator or broadcast that does not equivocate. See [SECURITY.md](SECURITY.md).
-- **Session management.** Callers must use a fresh session id for every DKLS23 signing session and a fresh context for every FROST DKG. The example programs show one way to do this.
+- **Session management.** Callers generate the session ids. DKLS23 rejects a session id that the setup has already used in the current epoch (`SessionIDReusedError`) and runs each round of a session exactly once, but two copies of a setup restored from the same snapshot cannot see each other's records, so ids must still be unique in practice. FROST DKGs need a fresh context per run. The example programs show one way to do both.
 - **Resharing.** Refresh keeps the same parties and threshold. Adding or removing parties, or changing t or n, is not supported.
 - **Key derivation.** There is no BIP32-style derivation of child keys.
 

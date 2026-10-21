@@ -939,12 +939,17 @@ type signerSetupJSON struct {
 	FZeroSeeds  map[string]string               `json:"fzero_seeds"`
 	Blacklist   map[string]bool                 `json:"blacklist"`
 	Epoch       int                             `json:"epoch"`
+	SessionIDs  map[string]int                  `json:"session_ids"`
 }
 
 func (s *SignerSetup) MarshalJSON() ([]byte, error) {
 	bl := make(map[string]bool, len(s.Blacklist))
 	for k, v := range s.Blacklist {
 		bl[strconv.Itoa(k)] = v
+	}
+	sessions := make(map[string]int, len(s.SessionIDs))
+	for k, v := range s.SessionIDs {
+		sessions[k] = v
 	}
 	return json.Marshal(signerSetupJSON{
 		Version:     SetupWireVersion,
@@ -958,6 +963,7 @@ func (s *SignerSetup) MarshalJSON() ([]byte, error) {
 		FZeroSeeds:  intMap16ToJSON(s.FZeroSeeds),
 		Blacklist:   bl,
 		Epoch:       s.Epoch,
+		SessionIDs:  sessions,
 	})
 }
 
@@ -1002,6 +1008,13 @@ func (s *SignerSetup) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		s.Blacklist[id] = v
+	}
+	s.SessionIDs = make(map[string]int, len(j.SessionIDs))
+	for sigID, stage := range j.SessionIDs {
+		if sigID == "" || stage < sessionRound1Done || stage > sessionRound3Done {
+			return fmt.Errorf("dkls23 SignerSetup: invalid session_ids entry %q: %d", sigID, stage)
+		}
+		s.SessionIDs[sigID] = stage
 	}
 	return nil
 }

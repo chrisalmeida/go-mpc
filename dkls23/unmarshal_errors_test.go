@@ -279,6 +279,9 @@ func TestUnmarshalSignerSetupErrors(t *testing.T) {
 		{"bad bob_base_ot value", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"bob_base_ot":{"2":{"seeds0":["` + bad + `"],"seeds1":[]}}}`},
 		{"bad fzero_seeds", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"fzero_seeds":{"1":"` + bad + `"}}`},
 		{"bad blacklist key", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"blacklist":{"notint":true}}`},
+		{"session stage too low", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"session_ids":{"sid":0}}`},
+		{"session stage too high", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"session_ids":{"sid":4}}`},
+		{"empty session id", head + `"share":"` + valid32 + `","pub_key":"aa","threshold":1,"session_ids":{"":1}}`},
 		{"not json", `nope`},
 	}
 	for _, tc := range cases {

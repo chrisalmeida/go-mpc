@@ -31,7 +31,7 @@ findings. **All 4 findings have been resolved.**
 
 **2026-10-16 follow-up review** (see the next section) found that the
 original review was incomplete: it identified **1 critical**, **1 high**,
-**4 medium**, and **5 low** additional findings, including a confirmed
+**4 medium**, and **6 low** additional findings, including a confirmed
 full-key-recovery attack on dkls23 that was demonstrated with a
 proof-of-concept test. All of them are resolved in the current source.
 
@@ -191,6 +191,29 @@ channel and a non-equivocating Coordinator: a Coordinator that hands signers
 different commitment lists makes an honest signer's share fail verification,
 so automatic permanent blacklisting is only safe with an honest or
 reliable-broadcast Coordinator.
+
+### FU-LOW-6: Session-id freshness was a caller obligation only — RESOLVED
+
+**File**: `sign.go`, `refresh.go`, `encoding.go`
+**Severity**: Low (as shipped: documented requirement; High if violated)
+**Category**: Defense in depth
+
+Protocol 3.6 step 4 has a party ignore a signing request whose `sigid` is not
+fresh. The library documented this for callers but did not check it. The
+OT-extension rows are a PRF of the base seeds and the session id, so a reused
+id reproduces the session's OT correlation on every column whose choice bit
+happens to repeat, and from such columns a counterparty reads the signer's
+nonce difference directly, the same class of leak as FU-CRIT-1.
+
+**Resolution**: `SignerSetup.SessionIDs` records the last completed round of
+every session id in the current epoch and is persisted with the setup.
+`SignRound1` rejects an id already used, `SignRound2` requires round 1 and
+rejects a second round 2, and `SignRound3` requires round 2 and rejects a
+second round 3, each with `SessionIDReusedError`; a failed round does not
+spend the id. `RefreshFinalize` clears the record because the refreshed
+base-OT and FZero seeds re-key everything a session id feeds into. The check
+is a backstop: two setups restored from the same snapshot cannot see each
+other's records, so callers must still generate unique ids.
 
 The sections that follow this one are the original review's text, preserved
 as a historical record. Where it describes mechanisms that the follow-up
@@ -685,8 +708,8 @@ runtime, or the deployment environment:
 | Critical | 1 | 1 |
 | High | 1 | 1 |
 | Medium | 4 | 4 |
-| Low | 5 | 5 |
-| **Total** | **11** | **11** |
+| Low | 6 | 6 |
+| **Total** | **12** | **12** |
 
 ---
 

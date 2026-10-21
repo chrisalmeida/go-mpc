@@ -510,14 +510,11 @@ func TestSignBadVOLEMessage(t *testing.T) {
 // TestSignRound3RejectsMalformedCheckValues: every round 2 field that round 3
 // parses (Γ^u, Γ^v, pk_i, the decommitted R_j) is replaced in turn with a
 // wrong or unparseable value; the sender must be identified and blacklisted.
+// Each case runs its own session, since a session's round 3 runs only once.
 func TestSignRound3RejectsMalformedCheckValues(t *testing.T) {
 	t.Parallel()
-	setups := fullSetup(t)
 	signers := []int{1, 2, 3}
 	message := []byte("bad gamma test")
-
-	s := runRound1(t, setups, "test-bad-gamma", signers)
-	runRound2(t, setups, s)
 
 	cases := []struct {
 		name   string
@@ -532,28 +529,150 @@ func TestSignRound3RejectsMalformedCheckValues(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Fresh copies of party 1's setup so blacklisting does not leak across cases.
-			local := fullSetup(t)
+			t.Parallel()
+			setups := fullSetup(t)
+			s := runRound1(t, setups, "test-bad-gamma", signers)
+			runRound2(t, setups, s)
+
 			in := s.round2For(1)
-			orig := *in[2]
-			tampered := orig
-			if orig.GammaU != nil {
-				tampered.GammaU = append([]byte(nil), orig.GammaU...)
-				tampered.GammaV = append([]byte(nil), orig.GammaV...)
-				tampered.PKi = append([]byte(nil), orig.PKi...)
-				tampered.Decommitment = append([]byte(nil), orig.Decommitment...)
-			}
+			tampered := *in[2]
+			tampered.GammaU = append([]byte(nil), in[2].GammaU...)
+			tampered.GammaV = append([]byte(nil), in[2].GammaV...)
+			tampered.PKi = append([]byte(nil), in[2].PKi...)
+			tampered.Decommitment = append([]byte(nil), in[2].Decommitment...)
 			tc.tamper(&tampered)
 			in[2] = &tampered
-			// Party 1's round 2 state belongs to setups[1]; its Share and PubKey
-			// are identical in local[1] (same cached fixture).
-			_, err := SignRound3(local[1], s.r2States[1], message, in)
+
+			_, err := SignRound3(setups[1], s.r2States[1], message, in)
 			require.Error(t, err)
 			var cheat *CheatingPartyError
 			require.True(t, errors.As(err, &cheat), "got %v", err)
 			require.Equal(t, []int{2}, cheat.PartyIDs)
+			require.True(t, setups[1].Blacklist[2])
 		})
 	}
+}
+
+// TestSignRejectsReusedSessionID: Protocol 3.6 step 4. A session id that was
+// already used with this setup is rejected by round 1, before any OT-extension
+// batch is generated; a fresh id is accepted; the empty id is never accepted.
+func TestSignRejectsReusedSessionID(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	msg := []byte("session id reuse")
+
+	s := runSession(t, setups, "sid-A", signers, msg)
+	r, sig := s.combine(t, setups, msg)
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+
+	for _, id := range signers {
+		_, _, err := SignRound1(setups[id], "sid-A", signers)
+		var reused *SessionIDReusedError
+		require.True(t, errors.As(err, &reused), "party %d: got %v", id, err)
+		require.Equal(t, "sid-A", reused.SigID)
+		require.Equal(t, sessionRound3Done, setups[id].SessionIDs["sid-A"])
+	}
+
+	// A different signer subset does not make the id fresh either.
+	_, _, err := SignRound1(setups[1], "sid-A", []int{1, 2, 3})
+	require.Error(t, err)
+
+	// A fresh id works, and the empty id is rejected as invalid input.
+	s2 := runSession(t, setups, "sid-B", signers, msg)
+	r, sig = s2.combine(t, setups, msg)
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+	_, _, err = SignRound1(setups[1], "", signers)
+	var inputErr *InvalidInputError
+	require.True(t, errors.As(err, &inputErr))
+}
+
+// TestSignRound1FailureLeavesSessionIDFresh: a round 1 that fails before
+// producing output (here: missing base-OT seeds) does not spend the id.
+func TestSignRound1FailureLeavesSessionIDFresh(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	saved := setups[1].BobBaseOT[2]
+	delete(setups[1].BobBaseOT, 2)
+	_, _, err := SignRound1(setups[1], "sid-retry", signers)
+	require.Error(t, err)
+	require.Equal(t, sessionUnused, setups[1].SessionIDs["sid-retry"])
+
+	setups[1].BobBaseOT[2] = saved
+	_, _, err = SignRound1(setups[1], "sid-retry", signers)
+	require.NoError(t, err)
+	require.Equal(t, sessionRound1Done, setups[1].SessionIDs["sid-retry"])
+}
+
+// TestSignRound2RejectsReplayedRound1State: a Round1State that was serialized
+// after round 1 and restored after round 2 completed must not be able to run
+// round 2 again (it would send a second VOLE multiply message under the same
+// OT-extension correlation), and a Round1State from a setup that never ran
+// round 1 for that id is rejected as well.
+func TestSignRound2RejectsReplayedRound1State(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	s := runRound1(t, setups, "sid-replay", signers)
+
+	snapshot := roundTrip(t, "Round1State", s.r1States[1])
+	runRound2(t, setups, s)
+
+	_, _, err := SignRound2(setups[1], snapshot, s.round1For(1))
+	var reused *SessionIDReusedError
+	require.True(t, errors.As(err, &reused), "got %v", err)
+	require.Equal(t, "SignRound2", reused.Phase)
+
+	// A different copy of the same setup never ran round 1 for this id.
+	other := fullSetup(t)
+	_, _, err = SignRound2(other[1], snapshot, s.round1For(1))
+	var inputErr *InvalidInputError
+	require.True(t, errors.As(err, &inputErr), "got %v", err)
+}
+
+// TestSignRound3IsSingleUsePerSession: fragments are released once; a second
+// round 3 with the same (or different) round 2 inputs is rejected.
+func TestSignRound3IsSingleUsePerSession(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	msg := []byte("single use round 3")
+	s := runSession(t, setups, "sid-once", signers, msg)
+
+	_, err := SignRound3(setups[1], s.r2States[1], msg, s.round2For(1))
+	var reused *SessionIDReusedError
+	require.True(t, errors.As(err, &reused), "got %v", err)
+	require.Equal(t, "SignRound3", reused.Phase)
+
+	// Skipping round 2 is rejected too: a round 1 state cannot go straight to round 3.
+	s2 := runRound1(t, setups, "sid-skip", signers)
+	fake := &Round2State{Round1State: s2.r1States[1]}
+	_, err = SignRound3(setups[1], fake, msg, map[int]*Round2Msg{})
+	var inputErr *InvalidInputError
+	require.True(t, errors.As(err, &inputErr), "got %v", err)
+}
+
+// TestSignSessionIDsSurvivePersistence: the record of used ids is part of the
+// persisted setup, so a restored setup still rejects the ids it has used.
+func TestSignSessionIDsSurvivePersistence(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	msg := []byte("persist session ids")
+	runSession(t, setups, "sid-persisted", signers, msg)
+
+	restored := make(map[int]*SignerSetup)
+	for id, s := range setups {
+		restored[id] = roundTrip(t, "SignerSetup", s)
+		require.Equal(t, sessionRound3Done, restored[id].SessionIDs["sid-persisted"])
+	}
+	_, _, err := SignRound1(restored[1], "sid-persisted", signers)
+	var reused *SessionIDReusedError
+	require.True(t, errors.As(err, &reused), "got %v", err)
+
+	r, sig := runSigning(t, restored, signers, []byte("fresh id after restore"))
+	verifyECDSA(t, restored[1].PubKey, []byte("fresh id after restore"), r, sig)
 }
 
 func TestSignRound3MissingMessage(t *testing.T) {

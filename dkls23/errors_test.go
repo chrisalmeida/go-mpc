@@ -31,6 +31,15 @@ func TestCorruptStateErrorMessage(t *testing.T) {
 	require.Contains(t, err.Error(), "pk mismatch")
 }
 
+func TestSessionIDReusedErrorMessage(t *testing.T) {
+	err := &SessionIDReusedError{SigID: "abc", Phase: "SignRound2", Detail: "round 2 already completed for this session"}
+	require.Contains(t, err.Error(), "SignRound2")
+	require.Contains(t, err.Error(), `"abc"`)
+	require.Contains(t, err.Error(), "reused")
+	var target *SessionIDReusedError
+	require.True(t, errors.As(error(err), &target))
+}
+
 func TestBlacklistedPartyErrorMessage(t *testing.T) {
 	err := &BlacklistedPartyError{PartyIDs: []int{2}, Phase: "SignRound1"}
 	require.Contains(t, err.Error(), "blacklisted")

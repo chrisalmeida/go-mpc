@@ -293,11 +293,19 @@ func TestEncodingSignerSetupWithBlacklist(t *testing.T) {
 	setups := fullSetup(t)
 	setups[1].Blacklist[2] = true
 	setups[1].Epoch = 5
+	setups[1].SessionIDs = map[string]int{"a": sessionRound1Done, "b": sessionRound3Done}
 
 	got := roundTrip(t, "SignerSetup+blacklist", setups[1])
 	require.True(t, got.Blacklist[2])
 	require.False(t, got.Blacklist[3])
 	require.Equal(t, 5, got.Epoch)
+	require.Equal(t, setups[1].SessionIDs, got.SessionIDs)
+
+	// A setup without the field decodes with an empty, non-nil map.
+	setups[1].SessionIDs = nil
+	got = roundTrip(t, "SignerSetup+nil-sessions", setups[1])
+	require.NotNil(t, got.SessionIDs)
+	require.Empty(t, got.SessionIDs)
 }
 
 func TestEncodingSignerSetupFunctional(t *testing.T) {
