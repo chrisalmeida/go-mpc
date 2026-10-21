@@ -76,14 +76,20 @@ func FuzzUnmarshalSignature(f *testing.F) {
 
 func FuzzFeldmanVerify(f *testing.F) {
 	f.Add([]byte{0x01}, uint8(1))
+	f.Add(make([]byte, 32), uint8(1))
 	f.Fuzz(func(t *testing.T, commitData []byte, x uint8) {
-		if x == 0 || len(commitData) < 32 {
+		if x == 0 {
 			return
 		}
 		share := scalarFromInt(int(x))
-		// Single commitment — will almost always fail verification,
-		// but must never panic.
-		_ = feldmanVerify(share, int(x), [][]byte{commitData})
+		// A received commitment vector is parsed with deserializeElement
+		// first (RFC 9591 Section 6.1); garbage must be rejected there, and
+		// anything that parses must verify (or fail) without panicking.
+		points, err := parseFeldmanCommitments([][]byte{commitData})
+		if err != nil {
+			return
+		}
+		_ = feldmanVerify(share, int(x), points)
 	})
 }
 

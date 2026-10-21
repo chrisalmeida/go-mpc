@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setupSigners runs DKG + pairwise VOLE + FZero setup for all parties.
-// Pairwise VOLE setup is parallelised across goroutines.
+// setupSigners runs DKG + pairwise base OT + FZero setup for all parties.
+// Pairwise setup is parallelised across goroutines.
 // For the common 3-of-3 case, prefer fullSetup() which caches the result.
 func setupSigners(t testing.TB, allIDs []int, threshold int) map[int]*SignerSetup {
 	t.Helper()
@@ -34,34 +34,116 @@ func randomBools(t *testing.T, n int) []bool {
 	return out
 }
 
-// randomBetaXi returns a random [Xi]bool.
-func randomBetaXi(t *testing.T) [Xi]bool {
-	t.Helper()
-	buf := make([]byte, (Xi+7)/8)
-	_, err := rand.Read(buf)
-	require.NoError(t, err)
-	var beta [Xi]bool
-	for j := 0; j < Xi; j++ {
-		beta[j] = (buf[j/8]>>(uint(j)%8))&1 == 1
-	}
-	return beta
-}
-
 // computeRx reconstructs R = sum(R_j) from round2 states and returns the x-coordinate mod q.
 func computeRx(t *testing.T, signers []int, round2States map[int]*Round2State) btcec.ModNScalar {
 	t.Helper()
-	var R btcec.JacobianPoint
-	for _, id := range signers {
-		Rj, err := compressedToPoint(round2States[id].R_iPoint)
-		require.NoError(t, err)
-		btcec.AddNonConst(&R, Rj, &R)
+	return computeRxFromStates(signers, round2States)
+}
+
+// signingSession holds every message and state of one signing session so
+// tests can inspect or tamper with them.
+type signingSession struct {
+	sigID    string
+	signers  []int
+	r1States map[int]*Round1State
+	r1Msgs   map[int]map[int]*Round1Msg
+	r2States map[int]*Round2State
+	r2Msgs   map[int]map[int]*Round2Msg
+	r3Frags  map[int]map[int]*Round3Msg
+}
+
+func (s *signingSession) round1For(myID int) map[int]*Round1Msg {
+	m := make(map[int]*Round1Msg)
+	for _, j := range s.signers {
+		if j != myID {
+			m[j] = s.r1Msgs[j][myID]
+		}
 	}
-	R.ToAffine()
-	rxBytes := make([]byte, 32)
-	R.X.PutBytesUnchecked(rxBytes)
-	var rx btcec.ModNScalar
-	rx.SetByteSlice(rxBytes)
-	return rx
+	return m
+}
+
+func (s *signingSession) round2For(myID int) map[int]*Round2Msg {
+	m := make(map[int]*Round2Msg)
+	for _, j := range s.signers {
+		if j != myID {
+			m[j] = s.r2Msgs[j][myID]
+		}
+	}
+	return m
+}
+
+// runRound1 runs round 1 for all signers.
+func runRound1(t *testing.T, setups map[int]*SignerSetup, sigID string, signers []int) *signingSession {
+	t.Helper()
+	s := &signingSession{
+		sigID:    sigID,
+		signers:  signers,
+		r1States: make(map[int]*Round1State),
+		r1Msgs:   make(map[int]map[int]*Round1Msg),
+	}
+	for _, id := range signers {
+		st, msgs, err := SignRound1(setups[id], sigID, signers)
+		require.NoError(t, err, "SignRound1 party %d", id)
+		s.r1States[id] = st
+		s.r1Msgs[id] = msgs
+	}
+	return s
+}
+
+// runRound2 runs round 2 for all signers.
+func runRound2(t *testing.T, setups map[int]*SignerSetup, s *signingSession) {
+	t.Helper()
+	s.r2States = make(map[int]*Round2State)
+	s.r2Msgs = make(map[int]map[int]*Round2Msg)
+	for _, id := range s.signers {
+		st2, msgs, err := SignRound2(setups[id], s.r1States[id], s.round1For(id))
+		require.NoError(t, err, "SignRound2 party %d", id)
+		s.r2States[id] = st2
+		s.r2Msgs[id] = msgs
+	}
+}
+
+// runRound3 runs round 3 for all signers.
+func runRound3(t *testing.T, setups map[int]*SignerSetup, s *signingSession, message []byte) {
+	t.Helper()
+	s.r3Frags = make(map[int]map[int]*Round3Msg)
+	for _, id := range s.signers {
+		frags, err := SignRound3(setups[id], s.r2States[id], message, s.round2For(id))
+		require.NoError(t, err, "SignRound3 party %d", id)
+		s.r3Frags[id] = frags
+	}
+}
+
+// combine runs SignCombine from the point of view of signers[0].
+func (s *signingSession) combine(t *testing.T, setups map[int]*SignerSetup, message []byte) (r, sig []byte) {
+	t.Helper()
+	combiner := s.signers[0]
+	myFrag := s.r3Frags[combiner][combiner]
+	var myW, myU btcec.ModNScalar
+	myW.SetByteSlice(myFrag.W_i)
+	myU.SetByteSlice(myFrag.U_i)
+
+	rx := computeRx(t, s.signers, s.r2States)
+
+	allRound3 := make(map[int]*Round3Msg)
+	for _, j := range s.signers {
+		if j != combiner {
+			allRound3[j] = s.r3Frags[j][combiner]
+		}
+	}
+
+	r, sig, err := SignCombine(setups[combiner], &rx, &myW, &myU, allRound3, message)
+	require.NoError(t, err, "SignCombine")
+	return r, sig
+}
+
+// runSession executes a complete 3-round signing session among signers.
+func runSession(t *testing.T, setups map[int]*SignerSetup, sigID string, signers []int, message []byte) *signingSession {
+	t.Helper()
+	s := runRound1(t, setups, sigID, signers)
+	runRound2(t, setups, s)
+	runRound3(t, setups, s, message)
+	return s
 }
 
 // runSigning executes a complete 3-round signing session among signers and returns (r, s).
@@ -69,74 +151,8 @@ func computeRx(t *testing.T, signers []int, round2States map[int]*Round2State) b
 func runSigning(t *testing.T, setups map[int]*SignerSetup, signers []int, message []byte) (r, s []byte) {
 	t.Helper()
 	sigID := "test-sig-" + string(message[:min(4, len(message))])
-
-	// Round 1.
-	round1States := make(map[int]*Round1State)
-	round1Msgs := make(map[int]map[int]*Round1Msg)
-	for _, id := range signers {
-		st, msgs, err := SignRound1(setups[id], sigID, signers)
-		require.NoError(t, err, "SignRound1 party %d", id)
-		round1States[id] = st
-		round1Msgs[id] = msgs
-	}
-
-	round1For := func(myID int) map[int]*Round1Msg {
-		m := make(map[int]*Round1Msg)
-		for _, j := range signers {
-			if j != myID {
-				m[j] = round1Msgs[j][myID]
-			}
-		}
-		return m
-	}
-
-	// Round 2.
-	round2States := make(map[int]*Round2State)
-	round2Msgs := make(map[int]map[int]*Round2Msg)
-	for _, id := range signers {
-		st2, msgs, err := SignRound2(setups[id], round1States[id], round1For(id))
-		require.NoError(t, err, "SignRound2 party %d", id)
-		round2States[id] = st2
-		round2Msgs[id] = msgs
-	}
-
-	round2For := func(myID int) map[int]*Round2Msg {
-		m := make(map[int]*Round2Msg)
-		for _, j := range signers {
-			if j != myID {
-				m[j] = round2Msgs[j][myID]
-			}
-		}
-		return m
-	}
-
-	// Round 3.
-	round3Frags := make(map[int]map[int]*Round3Msg)
-	for _, id := range signers {
-		frags, err := SignRound3(setups[id], round2States[id], message, round2For(id))
-		require.NoError(t, err, "SignRound3 party %d", id)
-		round3Frags[id] = frags
-	}
-
-	// Combine using signers[0] as combiner.
-	combiner := signers[0]
-	myFrag := round3Frags[combiner][combiner]
-	var myW, myU btcec.ModNScalar
-	myW.SetByteSlice(myFrag.W_i)
-	myU.SetByteSlice(myFrag.U_i)
-
-	rx := computeRx(t, signers, round2States)
-
-	allRound3 := make(map[int]*Round3Msg)
-	for _, j := range signers {
-		if j != combiner {
-			allRound3[j] = round3Frags[j][combiner]
-		}
-	}
-
-	r, s, err := SignCombine(setups[combiner], &rx, &myW, &myU, allRound3, message)
-	require.NoError(t, err, "SignCombine")
-	return r, s
+	sess := runSession(t, setups, sigID, signers, message)
+	return sess.combine(t, setups, message)
 }
 
 // verifyECDSA checks (r,s) against the master public key and message.
@@ -167,7 +183,6 @@ func TestSign3of3(t *testing.T) {
 	require.Len(t, s, 32)
 
 	verifyECDSA(t, setups[1].PubKey, message, r, s)
-	t.Logf("3-of-3 signature verified: r=%x s=%x", r, s)
 }
 
 func TestSign3of3MultipleMessages(t *testing.T) {
@@ -179,155 +194,165 @@ func TestSign3of3MultipleMessages(t *testing.T) {
 		msg := []byte{byte(i), 0x42, 0xde, 0xad}
 		r, s := runSigning(t, setups, allIDs, msg)
 		verifyECDSA(t, setups[1].PubKey, msg, r, s)
-		t.Logf("message %d signature verified", i)
 	}
+}
+
+// TestSignSessionsUseFreshVOLE is the regression test for the audit finding
+// that reused the same VOLE correlation across signing sessions: the
+// difference of Alice's VOLE messages across two sessions must NOT equal the
+// difference of her nonces, and Bob's OT-extension messages must differ.
+func TestSignSessionsUseFreshVOLE(t *testing.T) {
+	t.Parallel()
+	setups := setupSigners(t, []int{1, 2}, 2)
+	signers := []int{1, 2}
+
+	s1 := runSession(t, setups, "session-1", signers, []byte("pay alice 1 BTC"))
+	s2 := runSession(t, setups, "session-2", signers, []byte("pay alice 2 BTC"))
+
+	// Both signatures are valid.
+	r1, sig1 := s1.combine(t, setups, []byte("pay alice 1 BTC"))
+	verifyECDSA(t, setups[1].PubKey, []byte("pay alice 1 BTC"), r1, sig1)
+	r2, sig2 := s2.combine(t, setups, []byte("pay alice 2 BTC"))
+	verifyECDSA(t, setups[1].PubKey, []byte("pay alice 2 BTC"), r2, sig2)
+
+	// Party 1 → party 2 VOLE messages in the two sessions.
+	var a1, a2, leaked btcec.ModNScalar
+	a1.SetByteSlice(s1.r2Msgs[1][2].VoleMsg.ATilde[0][0][:])
+	a2.SetByteSlice(s2.r2Msgs[1][2].VoleMsg.ATilde[0][0][:])
+	leaked.NegateVal(&a1)
+	leaked.Add(&a2)
+
+	var trueDelta btcec.ModNScalar
+	trueDelta.NegateVal(&s1.r1States[1].R_i)
+	trueDelta.Add(&s2.r1States[1].R_i)
+	require.False(t, leaked.Equals(&trueDelta), "VOLE message difference must not reveal the nonce difference")
+
+	// Bob's per-session OT-extension batches are fresh.
+	require.NotEqual(t, s1.r1Msgs[2][1].OTExt.U, s2.r1Msgs[2][1].OTExt.U, "OT-extension batch must be fresh per session")
+	require.NotEqual(t, s1.r1States[2].VoleBobForRound2[1].Beta, s2.r1States[2].VoleBobForRound2[1].Beta, "VOLE beta must be fresh per session")
 }
 
 func TestSignBadRCommitment(t *testing.T) {
 	t.Parallel()
 	// A party that sends a bad round-1 commitment must be detected in round 3.
-	allIDs := []int{1, 2, 3}
 	setups := fullSetup(t)
-	signers := allIDs
-	sigID := "test-bad-commit"
+	signers := []int{1, 2, 3}
 	message := []byte("bad commitment test message!!")
 
-	// Round 1.
-	round1States := make(map[int]*Round1State)
-	round1Msgs := make(map[int]map[int]*Round1Msg)
-	for _, id := range signers {
-		st, msgs, err := SignRound1(setups[id], sigID, signers)
-		require.NoError(t, err)
-		round1States[id] = st
-		round1Msgs[id] = msgs
-	}
+	s := runRound1(t, setups, "test-bad-commit", signers)
 
 	// Party 2 corrupts its commitment sent to all other parties.
 	for _, j := range signers {
-		if j == 2 {
-			continue
+		if j != 2 {
+			s.r1Msgs[2][j].Commitment[0] ^= 0xff
 		}
-		round1Msgs[2][j].Commitment[0] ^= 0xff
 	}
 
-	round1For := func(myID int) map[int]*Round1Msg {
-		m := make(map[int]*Round1Msg)
-		for _, j := range signers {
-			if j != myID {
-				m[j] = round1Msgs[j][myID]
-			}
-		}
-		return m
-	}
-
-	// Round 2.
-	round2States := make(map[int]*Round2State)
-	round2Msgs := make(map[int]map[int]*Round2Msg)
-	for _, id := range signers {
-		st2, msgs, err := SignRound2(setups[id], round1States[id], round1For(id))
-		require.NoError(t, err)
-		round2States[id] = st2
-		round2Msgs[id] = msgs
-	}
-
-	round2For := func(myID int) map[int]*Round2Msg {
-		m := make(map[int]*Round2Msg)
-		for _, j := range signers {
-			if j != myID {
-				m[j] = round2Msgs[j][myID]
-			}
-		}
-		return m
-	}
+	runRound2(t, setups, s)
 
 	// Parties 1 and 3 must detect bad decommitment from party 2 in round 3.
 	for _, id := range []int{1, 3} {
-		_, err := SignRound3(setups[id], round2States[id], message, round2For(id))
+		_, err := SignRound3(setups[id], s.r2States[id], message, s.round2For(id))
 		require.Error(t, err, "party %d must detect bad R commitment from party 2", id)
-		t.Logf("Party %d correctly detected bad R commitment: %v", id, err)
+		var cheat *CheatingPartyError
+		require.True(t, errors.As(err, &cheat))
+		require.Equal(t, []int{2}, cheat.PartyIDs)
+		require.True(t, setups[id].Blacklist[2])
 	}
 }
 
-func TestSignSetupPairwise(t *testing.T) {
+// TestSignBadOTExtension: a Bob who sends an inconsistent OT-extension batch
+// is caught by Alice's consistency check in round 2 and blacklisted.
+func TestSignBadOTExtension(t *testing.T) {
 	t.Parallel()
-	// Direction i→j: j is base-OT sender, i is base-OT receiver (i becomes Alice)
-	jPriv, jPub, err := BaseSenderRound1(LambdaC)
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+
+	s := runRound1(t, setups, "test-bad-ote", signers)
+
+	// Party 2 tampers with the batch it sent to party 1 (party 2 is Bob for
+	// the 1→2 VOLE direction).
+	s.r1Msgs[2][1].OTExt.XBar[0] ^= 0x01
+
+	_, _, err := SignRound2(setups[1], s.r1States[1], s.round1For(1))
+	require.Error(t, err)
+	var cheat *CheatingPartyError
+	require.True(t, errors.As(err, &cheat))
+	require.Equal(t, []int{2}, cheat.PartyIDs)
+	require.True(t, setups[1].Blacklist[2], "party 2 must be blacklisted at party 1")
+
+	// Party 3 did not receive the tampered message and proceeds normally.
+	_, _, err = SignRound2(setups[3], s.r1States[3], s.round1For(3))
 	require.NoError(t, err)
 
-	mySigma := randomBools(t, LambdaC)
-	responses, aliceSeeds, err := BaseReceiverRound1(jPub, mySigma)
-	require.NoError(t, err)
-	jSeeds0, jSeeds1, err := BaseSenderFinalize(jPriv, jPub, responses)
-	require.NoError(t, err)
+	// Party 1 refuses future sessions with party 2.
+	_, _, err = SignRound1(setups[1], "later-session", signers)
+	var bl *BlacklistedPartyError
+	require.True(t, errors.As(err, &bl))
+	require.Equal(t, []int{2}, bl.PartyIDs)
+}
 
-	theirBeta := randomBetaXi(t)
-	theirCorr, err := OTExtReceiverCorrections(jSeeds0, jSeeds1, theirBeta)
-	require.NoError(t, err)
+func TestSignRound2MissingRound1Message(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	s := runRound1(t, setups, "test-missing-r1", signers)
 
-	// Direction j→i: i is base-OT sender, j is base-OT receiver (i becomes Bob)
-	myPriv, myPub, err := BaseSenderRound1(LambdaC)
-	require.NoError(t, err)
+	in := s.round1For(1)
+	delete(in, 3)
+	_, _, err := SignRound2(setups[1], s.r1States[1], in)
+	require.Error(t, err)
+	var inputErr *InvalidInputError
+	require.True(t, errors.As(err, &inputErr))
+	require.Contains(t, inputErr.Detail, "party 3")
 
-	theirSigma := randomBools(t, LambdaC)
-	responses2, _, err := BaseReceiverRound1(myPub, theirSigma)
-	require.NoError(t, err)
-	bobSeeds0, bobSeeds1, err := BaseSenderFinalize(myPriv, myPub, responses2)
-	require.NoError(t, err)
+	in = s.round1For(1)
+	in[3] = &Round1Msg{Commitment: in[3].Commitment} // no OT-extension payload
+	_, _, err = SignRound2(setups[1], s.r1States[1], in)
+	require.Error(t, err)
+	require.True(t, errors.As(err, &inputErr))
+}
 
-	myBeta := randomBetaXi(t)
-	myCorr, err := OTExtReceiverCorrections(bobSeeds0, bobSeeds1, myBeta)
-	require.NoError(t, err)
+func TestSignRound1MissingBaseOT(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	delete(setups[1].BobBaseOT, 2)
+	_, _, err := SignRound1(setups[1], "test-missing-base-ot", []int{1, 2, 3})
+	require.Error(t, err)
+	var corrupt *CorruptStateError
+	require.True(t, errors.As(err, &corrupt))
+	require.Contains(t, corrupt.Detail, "party 2")
+}
 
-	alice, bob, err := SignSetupPairwise(1, 2, bobSeeds0, aliceSeeds, mySigma, theirCorr, myCorr, myBeta)
-	require.NoError(t, err)
-	require.NotNil(t, alice)
-	require.NotNil(t, bob)
-	require.False(t, alice.C_u.IsZero() && alice.C_v.IsZero(), "alice state should be initialized")
-	require.False(t, bob.Chi.IsZero(), "bob chi should be initialized")
-	require.Equal(t, Xi, len(alice.Alpha0))
-	require.Equal(t, Xi, len(bob.Gamma))
+func TestSignRound2MissingBaseOT(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	s := runRound1(t, setups, "test-missing-alice-base-ot", signers)
+	delete(setups[1].AliceBaseOT, 2)
+	_, _, err := SignRound2(setups[1], s.r1States[1], s.round1For(1))
+	require.Error(t, err)
+	var corrupt *CorruptStateError
+	require.True(t, errors.As(err, &corrupt))
+	require.Contains(t, corrupt.Detail, "party 2")
 }
 
 func TestComputeRxFromDecommitments(t *testing.T) {
 	t.Parallel()
 	setups := fullSetup(t)
 	signers := []int{1, 2, 3}
-	sigID := "compute-rx-test"
 
-	// Round 1
-	r1States := map[int]*Round1State{}
-	r1Msgs := map[int]map[int]*Round1Msg{}
-	for _, id := range signers {
-		st, msgs, err := SignRound1(setups[id], sigID, signers)
-		require.NoError(t, err)
-		r1States[id] = st
-		r1Msgs[id] = msgs
-	}
+	s := runRound1(t, setups, "compute-rx-test", signers)
+	runRound2(t, setups, s)
 
-	// Round 2
-	r2States := map[int]*Round2State{}
-	r2Msgs := map[int]map[int]*Round2Msg{}
-	for _, id := range signers {
-		in := map[int]*Round1Msg{}
-		for _, j := range signers {
-			if j != id {
-				in[j] = r1Msgs[j][id]
-			}
-		}
-		st, msgs, err := SignRound2(setups[id], r1States[id], in)
-		require.NoError(t, err)
-		r2States[id] = st
-		r2Msgs[id] = msgs
-	}
-
-	// Compute rx the old way: from local Round2State.R_iPoint
-	rxOld := computeRxFromStates(signers, r2States)
+	// Compute rx the local way: from Round2State.R_iPoint
+	rxOld := computeRxFromStates(signers, s.r2States)
 
 	// Compute rx from decommitments (the distributed pattern)
 	noncePoints := map[int][]byte{
-		1: r2States[1].R_iPoint,
-		2: r2Msgs[2][1].Decommitment,
-		3: r2Msgs[3][1].Decommitment,
+		1: s.r2States[1].R_iPoint,
+		2: s.r2Msgs[2][1].Decommitment,
+		3: s.r2Msgs[3][1].Decommitment,
 	}
 	rxNew, err := ComputeRx(noncePoints)
 	require.NoError(t, err)
@@ -335,9 +360,9 @@ func TestComputeRxFromDecommitments(t *testing.T) {
 
 	// Verify node 2's view produces the same rx
 	noncePoints2 := map[int][]byte{
-		1: r2Msgs[1][2].Decommitment,
-		2: r2States[2].R_iPoint,
-		3: r2Msgs[3][2].Decommitment,
+		1: s.r2Msgs[1][2].Decommitment,
+		2: s.r2States[2].R_iPoint,
+		3: s.r2Msgs[3][2].Decommitment,
 	}
 	rxNode2, err := ComputeRx(noncePoints2)
 	require.NoError(t, err)
@@ -349,66 +374,76 @@ func TestComputeRxUsedInSignCombine(t *testing.T) {
 	setups := fullSetup(t)
 	msg := []byte("ComputeRx end-to-end test")
 	signers := []int{1, 2, 3}
-	sigID := "rx-e2e-test"
 
-	r1s := map[int]*Round1State{}
-	r1m := map[int]map[int]*Round1Msg{}
-	for _, id := range signers {
-		st, msgs, err := SignRound1(setups[id], sigID, signers)
-		require.NoError(t, err)
-		r1s[id] = st
-		r1m[id] = msgs
-	}
-	r2s := map[int]*Round2State{}
-	r2m := map[int]map[int]*Round2Msg{}
-	for _, id := range signers {
-		in := map[int]*Round1Msg{}
-		for _, j := range signers {
-			if j != id {
-				in[j] = r1m[j][id]
-			}
-		}
-		st, msgs, err := SignRound2(setups[id], r1s[id], in)
-		require.NoError(t, err)
-		r2s[id] = st
-		r2m[id] = msgs
-	}
-	r3f := map[int]map[int]*Round3Msg{}
-	for _, id := range signers {
-		in := map[int]*Round2Msg{}
-		for _, j := range signers {
-			if j != id {
-				in[j] = r2m[j][id]
-			}
-		}
-		frags, err := SignRound3(setups[id], r2s[id], msg, in)
-		require.NoError(t, err)
-		r3f[id] = frags
-	}
+	s := runSession(t, setups, "rx-e2e-test", signers, msg)
 
 	noncePoints := map[int][]byte{
-		1: r2s[1].R_iPoint,
-		2: r2m[2][1].Decommitment,
-		3: r2m[3][1].Decommitment,
+		1: s.r2States[1].R_iPoint,
+		2: s.r2Msgs[2][1].Decommitment,
+		3: s.r2Msgs[3][1].Decommitment,
 	}
 	rx, err := ComputeRx(noncePoints)
 	require.NoError(t, err)
 
-	myFrag := r3f[1][1]
+	myFrag := s.r3Frags[1][1]
 	var myW, myU btcec.ModNScalar
 	myW.SetByteSlice(myFrag.W_i)
 	myU.SetByteSlice(myFrag.U_i)
 	allFrags := map[int]*Round3Msg{}
 	for _, j := range signers {
 		if j != 1 {
-			allFrags[j] = r3f[j][1]
+			allFrags[j] = s.r3Frags[j][1]
 		}
 	}
-	r, s, err := SignCombine(setups[1], &rx, &myW, &myU, allFrags, msg)
+	r, sig, err := SignCombine(setups[1], &rx, &myW, &myU, allFrags, msg)
 	require.NoError(t, err)
-	require.NotEmpty(t, r)
-	require.NotEmpty(t, s)
-	t.Logf("Signature with distributed ComputeRx: r=%x s=%x", r[:4], s[:4])
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+}
+
+// TestSignCombineIgnoresOwnFragment: passing SignRound3's full output map
+// (which includes the caller's own fragment) must not double count it.
+func TestSignCombineIgnoresOwnFragment(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	msg := []byte("own fragment test")
+	signers := []int{1, 2, 3}
+
+	s := runSession(t, setups, "own-frag-test", signers, msg)
+
+	myFrag := s.r3Frags[1][1]
+	var myW, myU btcec.ModNScalar
+	myW.SetByteSlice(myFrag.W_i)
+	myU.SetByteSlice(myFrag.U_i)
+	rx := computeRxFromStates(signers, s.r2States)
+
+	allFrags := map[int]*Round3Msg{1: s.r3Frags[1][1], 2: s.r3Frags[2][1], 3: s.r3Frags[3][1], 4: nil}
+	r, sig, err := SignCombine(setups[1], &rx, &myW, &myU, allFrags, msg)
+	require.NoError(t, err)
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+}
+
+func TestSignCombineBadFragment(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	msg := []byte("bad fragment test")
+	signers := []int{1, 2, 3}
+
+	s := runSession(t, setups, "bad-frag-test", signers, msg)
+
+	myFrag := s.r3Frags[1][1]
+	var myW, myU btcec.ModNScalar
+	myW.SetByteSlice(myFrag.W_i)
+	myU.SetByteSlice(myFrag.U_i)
+	rx := computeRxFromStates(signers, s.r2States)
+
+	bad := &Round3Msg{W_i: make([]byte, 32), U_i: make([]byte, 32)}
+	copy(bad.W_i, s.r3Frags[2][1].W_i)
+	copy(bad.U_i, s.r3Frags[2][1].U_i)
+	bad.W_i[0] ^= 0x01
+	allFrags := map[int]*Round3Msg{2: bad, 3: s.r3Frags[3][1]}
+	_, _, err := SignCombine(setups[1], &rx, &myW, &myU, allFrags, msg)
+	require.Error(t, err, "final signature verification must fail")
+	require.Contains(t, err.Error(), "verification failed")
 }
 
 func TestComputeRxEmpty(t *testing.T) {
@@ -454,59 +489,208 @@ func TestComputeRxSinglePoint(t *testing.T) {
 func TestSignBadVOLEMessage(t *testing.T) {
 	t.Parallel()
 	// A party that sends a bad VOLE multiply message must be detected in round 3.
-	allIDs := []int{1, 2, 3}
 	setups := fullSetup(t)
-	signers := allIDs
-	sigID := "test-bad-vole"
+	signers := []int{1, 2, 3}
 	message := []byte("bad vole test message!!!!!!!!")
 
-	// Round 1.
-	round1States := make(map[int]*Round1State)
-	round1Msgs := make(map[int]map[int]*Round1Msg)
-	for _, id := range signers {
-		st, msgs, err := SignRound1(setups[id], sigID, signers)
-		require.NoError(t, err)
-		round1States[id] = st
-		round1Msgs[id] = msgs
-	}
-
-	round1For := func(myID int) map[int]*Round1Msg {
-		m := make(map[int]*Round1Msg)
-		for _, j := range signers {
-			if j != myID {
-				m[j] = round1Msgs[j][myID]
-			}
-		}
-		return m
-	}
-
-	// Round 2.
-	round2States := make(map[int]*Round2State)
-	round2Msgs := make(map[int]map[int]*Round2Msg)
-	for _, id := range signers {
-		st2, msgs, err := SignRound2(setups[id], round1States[id], round1For(id))
-		require.NoError(t, err)
-		round2States[id] = st2
-		round2Msgs[id] = msgs
-	}
+	s := runRound1(t, setups, "test-bad-vole", signers)
+	runRound2(t, setups, s)
 
 	// Party 2 tampers its VOLE multiply message addressed to party 1.
-	round2Msgs[2][1].VoleMsg.ATilde[0][0][0] ^= 0xff
-
-	round2For := func(myID int) map[int]*Round2Msg {
-		m := make(map[int]*Round2Msg)
-		for _, j := range signers {
-			if j != myID {
-				m[j] = round2Msgs[j][myID]
-			}
-		}
-		return m
-	}
+	s.r2Msgs[2][1].VoleMsg.ATilde[0][0][0] ^= 0xff
 
 	// Party 1 must detect party 2's bad VOLE message.
-	_, err := SignRound3(setups[1], round2States[1], message, round2For(1))
+	_, err := SignRound3(setups[1], s.r2States[1], message, s.round2For(1))
 	require.Error(t, err, "party 1 must detect bad VOLE message from party 2")
-	t.Logf("Party 1 correctly detected bad VOLE message: %v", err)
+	var cheat *CheatingPartyError
+	require.True(t, errors.As(err, &cheat))
+	require.Equal(t, []int{2}, cheat.PartyIDs)
+}
+
+// TestSignRound3RejectsMalformedCheckValues: every round 2 field that round 3
+// parses (Γ^u, Γ^v, pk_i, the decommitted R_j) is replaced in turn with a
+// wrong or unparseable value; the sender must be identified and blacklisted.
+// Each case runs its own session, since a session's round 3 runs only once.
+func TestSignRound3RejectsMalformedCheckValues(t *testing.T) {
+	t.Parallel()
+	signers := []int{1, 2, 3}
+	message := []byte("bad gamma test")
+
+	cases := []struct {
+		name   string
+		tamper func(m *Round2Msg)
+	}{
+		{"gamma_u", func(m *Round2Msg) { m.GammaU[1] ^= 0xff }},
+		{"gamma_v", func(m *Round2Msg) { m.GammaV[1] ^= 0xff }},
+		{"pki invalid", func(m *Round2Msg) { m.PKi = []byte{0x00} }},
+		{"gamma_u invalid", func(m *Round2Msg) { m.GammaU = []byte{0x00} }},
+		{"gamma_v invalid", func(m *Round2Msg) { m.GammaV = []byte{0x00} }},
+		{"decommit invalid", func(m *Round2Msg) { m.Decommitment = []byte{0x00} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			setups := fullSetup(t)
+			s := runRound1(t, setups, "test-bad-gamma", signers)
+			runRound2(t, setups, s)
+
+			in := s.round2For(1)
+			tampered := *in[2]
+			tampered.GammaU = append([]byte(nil), in[2].GammaU...)
+			tampered.GammaV = append([]byte(nil), in[2].GammaV...)
+			tampered.PKi = append([]byte(nil), in[2].PKi...)
+			tampered.Decommitment = append([]byte(nil), in[2].Decommitment...)
+			tc.tamper(&tampered)
+			in[2] = &tampered
+
+			_, err := SignRound3(setups[1], s.r2States[1], message, in)
+			require.Error(t, err)
+			var cheat *CheatingPartyError
+			require.True(t, errors.As(err, &cheat), "got %v", err)
+			require.Equal(t, []int{2}, cheat.PartyIDs)
+			require.True(t, setups[1].Blacklist[2])
+		})
+	}
+}
+
+// TestSignRejectsReusedSessionID: Protocol 3.6 step 4. A session id that was
+// already used with this setup is rejected by round 1, before any OT-extension
+// batch is generated; a fresh id is accepted; the empty id is never accepted.
+func TestSignRejectsReusedSessionID(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	msg := []byte("session id reuse")
+
+	s := runSession(t, setups, "sid-A", signers, msg)
+	r, sig := s.combine(t, setups, msg)
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+
+	for _, id := range signers {
+		_, _, err := SignRound1(setups[id], "sid-A", signers)
+		var reused *SessionIDReusedError
+		require.True(t, errors.As(err, &reused), "party %d: got %v", id, err)
+		require.Equal(t, "sid-A", reused.SigID)
+		require.Equal(t, sessionRound3Done, setups[id].SessionIDs["sid-A"])
+	}
+
+	// A different signer subset does not make the id fresh either.
+	_, _, err := SignRound1(setups[1], "sid-A", []int{1, 2, 3})
+	require.Error(t, err)
+
+	// A fresh id works, and the empty id is rejected as invalid input.
+	s2 := runSession(t, setups, "sid-B", signers, msg)
+	r, sig = s2.combine(t, setups, msg)
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+	_, _, err = SignRound1(setups[1], "", signers)
+	var inputErr *InvalidInputError
+	require.True(t, errors.As(err, &inputErr))
+}
+
+// TestSignRound1FailureLeavesSessionIDFresh: a round 1 that fails before
+// producing output (here: missing base-OT seeds) does not spend the id.
+func TestSignRound1FailureLeavesSessionIDFresh(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	saved := setups[1].BobBaseOT[2]
+	delete(setups[1].BobBaseOT, 2)
+	_, _, err := SignRound1(setups[1], "sid-retry", signers)
+	require.Error(t, err)
+	require.Equal(t, sessionUnused, setups[1].SessionIDs["sid-retry"])
+
+	setups[1].BobBaseOT[2] = saved
+	_, _, err = SignRound1(setups[1], "sid-retry", signers)
+	require.NoError(t, err)
+	require.Equal(t, sessionRound1Done, setups[1].SessionIDs["sid-retry"])
+}
+
+// TestSignRound2RejectsReplayedRound1State: a Round1State that was serialized
+// after round 1 and restored after round 2 completed must not be able to run
+// round 2 again (it would send a second VOLE multiply message under the same
+// OT-extension correlation), and a Round1State from a setup that never ran
+// round 1 for that id is rejected as well.
+func TestSignRound2RejectsReplayedRound1State(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	s := runRound1(t, setups, "sid-replay", signers)
+
+	snapshot := roundTrip(t, "Round1State", s.r1States[1])
+	runRound2(t, setups, s)
+
+	_, _, err := SignRound2(setups[1], snapshot, s.round1For(1))
+	var reused *SessionIDReusedError
+	require.True(t, errors.As(err, &reused), "got %v", err)
+	require.Equal(t, "SignRound2", reused.Phase)
+
+	// A different copy of the same setup never ran round 1 for this id.
+	other := fullSetup(t)
+	_, _, err = SignRound2(other[1], snapshot, s.round1For(1))
+	var inputErr *InvalidInputError
+	require.True(t, errors.As(err, &inputErr), "got %v", err)
+}
+
+// TestSignRound3IsSingleUsePerSession: fragments are released once; a second
+// round 3 with the same (or different) round 2 inputs is rejected.
+func TestSignRound3IsSingleUsePerSession(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	msg := []byte("single use round 3")
+	s := runSession(t, setups, "sid-once", signers, msg)
+
+	_, err := SignRound3(setups[1], s.r2States[1], msg, s.round2For(1))
+	var reused *SessionIDReusedError
+	require.True(t, errors.As(err, &reused), "got %v", err)
+	require.Equal(t, "SignRound3", reused.Phase)
+
+	// Skipping round 2 is rejected too: a round 1 state cannot go straight to round 3.
+	s2 := runRound1(t, setups, "sid-skip", signers)
+	fake := &Round2State{Round1State: s2.r1States[1]}
+	_, err = SignRound3(setups[1], fake, msg, map[int]*Round2Msg{})
+	var inputErr *InvalidInputError
+	require.True(t, errors.As(err, &inputErr), "got %v", err)
+}
+
+// TestSignSessionIDsSurvivePersistence: the record of used ids is part of the
+// persisted setup, so a restored setup still rejects the ids it has used.
+func TestSignSessionIDsSurvivePersistence(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	msg := []byte("persist session ids")
+	runSession(t, setups, "sid-persisted", signers, msg)
+
+	restored := make(map[int]*SignerSetup)
+	for id, s := range setups {
+		restored[id] = roundTrip(t, "SignerSetup", s)
+		require.Equal(t, sessionRound3Done, restored[id].SessionIDs["sid-persisted"])
+	}
+	_, _, err := SignRound1(restored[1], "sid-persisted", signers)
+	var reused *SessionIDReusedError
+	require.True(t, errors.As(err, &reused), "got %v", err)
+
+	r, sig := runSigning(t, restored, signers, []byte("fresh id after restore"))
+	verifyECDSA(t, restored[1].PubKey, []byte("fresh id after restore"), r, sig)
+}
+
+func TestSignRound3MissingMessage(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	message := []byte("missing round 2 message")
+
+	s := runRound1(t, setups, "test-missing-r2", signers)
+	runRound2(t, setups, s)
+
+	in := s.round2For(1)
+	delete(in, 3)
+	_, err := SignRound3(setups[1], s.r2States[1], message, in)
+	require.Error(t, err)
+	var cheat *CheatingPartyError
+	require.True(t, errors.As(err, &cheat))
+	require.Equal(t, []int{3}, cheat.PartyIDs)
 }
 
 func TestSignRound1BelowThreshold(t *testing.T) {
@@ -543,43 +727,31 @@ func TestSignNilVoleBobState(t *testing.T) {
 	t.Parallel()
 	setups := fullSetup(t)
 	signers := []int{1, 2, 3}
-	sigID := "nil-vole-test"
 
-	r1States := make(map[int]*Round1State)
-	r1Msgs := make(map[int]map[int]*Round1Msg)
-	for _, id := range signers {
-		st, msgs, err := SignRound1(setups[id], sigID, signers)
-		require.NoError(t, err)
-		r1States[id] = st
-		r1Msgs[id] = msgs
-	}
+	s := runRound1(t, setups, "nil-vole-test", signers)
+	s.r1States[1].VoleBobForRound2[2] = nil
 
-	r1States[1].VoleBobForRound2[2] = nil
-
-	in := map[int]*Round1Msg{}
-	for _, j := range signers {
-		if j != 1 {
-			in[j] = r1Msgs[j][1]
-		}
-	}
-	_, _, err := SignRound2(setups[1], r1States[1], in)
+	_, _, err := SignRound2(setups[1], s.r1States[1], s.round1For(1))
 	require.Error(t, err, "should detect nil VOLE Bob state without panic")
 	var corruptErr *CorruptStateError
 	require.True(t, errors.As(err, &corruptErr))
 	require.Contains(t, corruptErr.Detail, "missing VOLE Bob state")
 }
 
-func TestSignCounterIncrements(t *testing.T) {
+func TestSignBlacklistedPartyRejectedEverywhere(t *testing.T) {
 	t.Parallel()
 	setups := fullSetup(t)
-	require.Equal(t, uint64(0), setups[1].SignCounter)
-
 	signers := []int{1, 2, 3}
-	_, _, err := SignRound1(setups[1], "counter-test-1", signers)
-	require.NoError(t, err)
-	require.Equal(t, uint64(1), setups[1].SignCounter)
+	s := runRound1(t, setups, "blacklist-test", signers)
+	runRound2(t, setups, s)
 
-	_, _, err = SignRound1(setups[1], "counter-test-2", signers)
-	require.NoError(t, err)
-	require.Equal(t, uint64(2), setups[1].SignCounter)
+	setups[1].Blacklist[3] = true
+	var bl *BlacklistedPartyError
+
+	_, _, err := SignRound1(setups[1], "x", signers)
+	require.True(t, errors.As(err, &bl))
+	_, _, err = SignRound2(setups[1], s.r1States[1], s.round1For(1))
+	require.True(t, errors.As(err, &bl))
+	_, err = SignRound3(setups[1], s.r2States[1], []byte("m"), s.round2For(1))
+	require.True(t, errors.As(err, &bl))
 }

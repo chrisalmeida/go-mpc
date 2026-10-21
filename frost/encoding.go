@@ -11,21 +11,54 @@ import (
 // - Scalars: hex-encoded 64 characters (32 bytes little-endian)
 // - Points: hex-encoded 64 characters (32 bytes compressed Edwards)
 // - Maps with int keys: encoded as string keys (JSON doesn't support int keys)
+// - Persisted types (KeyShare, SignerState) carry a "version" field.
+
+// WireFormatVersion is the value of the "version" field in the JSON
+// encodings of KeyShare and SignerState. UnmarshalJSON rejects documents
+// whose version is missing or different, so a persisted blob written by an
+// incompatible future format can never be silently misread as this one.
+const WireFormatVersion = 1
+
+// checkWireVersion validates the "version" field of a persisted document.
+func checkWireVersion(kind string, version *int) error {
+	if version == nil {
+		return fmt.Errorf("frost: %s: missing \"version\" field (expected %d)", kind, WireFormatVersion)
+	}
+	if *version != WireFormatVersion {
+		return fmt.Errorf("frost: %s: unsupported wire format version %d (this package reads version %d)", kind, *version, WireFormatVersion)
+	}
+	return nil
+}
+
+// decodeFixedHex decodes a hex string that must encode exactly n bytes.
+func decodeFixedHex(field string, s string, n int) ([]byte, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("frost: decode %s: %w", field, err)
+	}
+	if len(b) != n {
+		return nil, fmt.Errorf("frost: decode %s: expected %d bytes, got %d", field, n, len(b))
+	}
+	return b, nil
+}
 
 // --- KeyShare ---
 
 type keyShareJSON struct {
-	ID                int                `json:"id"`
-	SecretShare       string             `json:"secret_share"`
-	PublicKey         string             `json:"public_key"`
-	VerificationShare string             `json:"verification_share"`
-	GroupCommitments  []string           `json:"group_commitments"`
-	Threshold         int                `json:"threshold"`
-	AllIDs            []int              `json:"all_ids"`
+	Version           *int     `json:"version"`
+	ID                int      `json:"id"`
+	SecretShare       string   `json:"secret_share"`
+	PublicKey         string   `json:"public_key"`
+	VerificationShare string   `json:"verification_share"`
+	GroupCommitments  []string `json:"group_commitments"`
+	Threshold         int      `json:"threshold"`
+	AllIDs            []int    `json:"all_ids"`
 }
 
 func (ks *KeyShare) MarshalJSON() ([]byte, error) {
+	version := WireFormatVersion
 	j := keyShareJSON{
+		Version:           &version,
 		ID:                ks.ID,
 		SecretShare:       hex.EncodeToString(ks.SecretShare),
 		PublicKey:         hex.EncodeToString(ks.PublicKey),
@@ -43,6 +76,9 @@ func (ks *KeyShare) MarshalJSON() ([]byte, error) {
 func (ks *KeyShare) UnmarshalJSON(data []byte) error {
 	var j keyShareJSON
 	if err := json.Unmarshal(data, &j); err != nil {
+		return err
+	}
+	if err := checkWireVersion("key share", j.Version); err != nil {
 		return err
 	}
 	var err error
@@ -74,15 +110,18 @@ func (ks *KeyShare) UnmarshalJSON(data []byte) error {
 // --- SignerState ---
 
 type signerStateJSON struct {
-	KeyShare  *KeyShare        `json:"key_share"`
-	Blacklist map[string]bool  `json:"blacklist"`
-	Epoch     int              `json:"epoch"`
+	Version   *int            `json:"version"`
+	KeyShare  *KeyShare       `json:"key_share"`
+	Blacklist map[string]bool `json:"blacklist"`
+	Epoch     int             `json:"epoch"`
 }
 
 func (ss *SignerState) MarshalJSON() ([]byte, error) {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
+	version := WireFormatVersion
 	j := signerStateJSON{
+		Version:   &version,
 		KeyShare:  ss.KeyShare,
 		Blacklist: intBoolMapToString(ss.Blacklist),
 		Epoch:     ss.Epoch,
@@ -93,6 +132,9 @@ func (ss *SignerState) MarshalJSON() ([]byte, error) {
 func (ss *SignerState) UnmarshalJSON(data []byte) error {
 	var j signerStateJSON
 	if err := json.Unmarshal(data, &j); err != nil {
+		return err
+	}
+	if err := checkWireVersion("signer state", j.Version); err != nil {
 		return err
 	}
 	ss.KeyShare = j.KeyShare
@@ -108,9 +150,12 @@ func (ss *SignerState) UnmarshalJSON(data []byte) error {
 // --- DKGRound1Output ---
 
 type dkgRound1JSON struct {
-	FeldmanCommitments  []string            `json:"feldman_commitments"`
-	PairwiseCommitments map[string]string   `json:"pairwise_commitments"`
-	PairwiseSalts       map[string]string   `json:"pairwise_salts"`
+	FeldmanCommitments  []string          `json:"feldman_commitments"`
+	PairwiseCommitments map[string]string `json:"pairwise_commitments"`
+	PairwiseSalts       map[string]string `json:"pairwise_salts"`
+	// ProofR and ProofMu are σ_i = (R_i, μ_i), the proof of knowledge of a_{i,0}.
+	ProofR  string `json:"proof_r"`
+	ProofMu string `json:"proof_mu"`
 }
 
 func (o *DKGRound1Output) MarshalJSON() ([]byte, error) {
@@ -118,6 +163,8 @@ func (o *DKGRound1Output) MarshalJSON() ([]byte, error) {
 		FeldmanCommitments:  make([]string, len(o.FeldmanCommitments)),
 		PairwiseCommitments: make(map[string]string),
 		PairwiseSalts:       make(map[string]string),
+		ProofR:              hex.EncodeToString(o.ProofR),
+		ProofMu:             hex.EncodeToString(o.ProofMu),
 	}
 	for i, c := range o.FeldmanCommitments {
 		j.FeldmanCommitments[i] = hex.EncodeToString(c)
@@ -171,6 +218,13 @@ func (o *DKGRound1Output) UnmarshalJSON(data []byte) error {
 		var arr [SaltLen]byte
 		copy(arr[:], b)
 		o.PairwiseSalts[id] = arr
+	}
+	var err error
+	if o.ProofR, err = decodeFixedHex("proof_r", j.ProofR, ElementLen); err != nil {
+		return err
+	}
+	if o.ProofMu, err = decodeFixedHex("proof_mu", j.ProofMu, ScalarLen); err != nil {
+		return err
 	}
 	return nil
 }
@@ -293,11 +347,11 @@ func (s *Signature) UnmarshalJSON(data []byte) error {
 // --- RefreshRound1Output ---
 
 type refreshRound1JSON struct {
-	FeldmanCommitments  []string            `json:"feldman_commitments"`
-	PairwiseCommitments map[string]string   `json:"pairwise_commitments"`
-	PairwiseSalts       map[string]string   `json:"pairwise_salts"`
-	SeedCommitment      string              `json:"seed_commitment"`
-	SeedSalt            string              `json:"seed_salt"`
+	FeldmanCommitments  []string          `json:"feldman_commitments"`
+	PairwiseCommitments map[string]string `json:"pairwise_commitments"`
+	PairwiseSalts       map[string]string `json:"pairwise_salts"`
+	SeedCommitment      string            `json:"seed_commitment"`
+	SeedSalt            string            `json:"seed_salt"`
 }
 
 func (o *RefreshRound1Output) MarshalJSON() ([]byte, error) {
@@ -438,4 +492,3 @@ func stringBoolMapToInt(m map[string]bool) (map[int]bool, error) {
 	}
 	return out, nil
 }
-

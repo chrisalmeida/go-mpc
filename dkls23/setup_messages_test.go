@@ -2,21 +2,11 @@ package dkls23
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
-
-func TestOTExtCorrectionsMsgRoundTrip(t *testing.T) {
-	m := &OTExtCorrectionsMsg{
-		Corrections: make([][Xi / 8]byte, LambdaC),
-	}
-	for i := range m.Corrections {
-		rand.Read(m.Corrections[i][:])
-	}
-	got := roundTrip(t, "OTExtCorrectionsMsg", m)
-	require.Equal(t, m.Corrections, got.Corrections)
-}
 
 func TestFZeroCommitMsgRoundTrip(t *testing.T) {
 	var m FZeroCommitMsg
@@ -34,29 +24,63 @@ func TestFZeroRevealMsgRoundTrip(t *testing.T) {
 	require.Equal(t, m.Salt, got.Salt)
 }
 
-func TestBaseOTSenderMsgRoundTrip(t *testing.T) {
-	_, pubs, err := BaseSenderRound1(LambdaC)
+// jsonKeys returns the top-level object keys of v's JSON encoding.
+func jsonKeys(t *testing.T, v any) map[string]json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
 	require.NoError(t, err)
-	m := &BaseOTSenderMsg{PubKeys: pubs}
-	got := roundTrip(t, "BaseOTSenderMsg", m)
-	require.Equal(t, len(m.PubKeys), len(got.PubKeys))
-	for i := range m.PubKeys {
-		require.Equal(t, m.PubKeys[i], got.PubKeys[i])
-	}
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(b, &raw))
+	return raw
 }
 
 func TestBaseOTReceiverMsgRoundTrip(t *testing.T) {
-	_, pubs, err := BaseSenderRound1(LambdaC)
+	t.Parallel()
+	state, m, err := BaseOTReceiverRound1(randomBools(t, LambdaC))
 	require.NoError(t, err)
-	choices := make([]bool, LambdaC)
-	for i := range choices {
-		b := make([]byte, 1)
-		rand.Read(b)
-		choices[i] = b[0]&1 == 1
-	}
-	responses, _, err := BaseReceiverRound1(pubs, choices)
-	require.NoError(t, err)
-	m := &BaseOTReceiverMsg{Responses: responses}
+	defer state.Zero()
+
 	got := roundTrip(t, "BaseOTReceiverMsg", m)
-	require.Equal(t, len(m.Responses), len(got.Responses))
+	require.Len(t, got.R0, LambdaC)
+	require.Len(t, got.R1, LambdaC)
+	require.Equal(t, m.R0, got.R0)
+	require.Equal(t, m.R1, got.R1)
+
+	// Pin the wire format: exactly the keys "r0" and "r1".
+	keys := jsonKeys(t, m)
+	require.Len(t, keys, 2)
+	require.Contains(t, keys, "r0")
+	require.Contains(t, keys, "r1")
+}
+
+func TestBaseOTSenderMsgRoundTrip(t *testing.T) {
+	t.Parallel()
+	sigma := randomBools(t, LambdaC)
+	state, m, err := BaseOTReceiverRound1(sigma)
+	require.NoError(t, err)
+	seeds0, seeds1, reply, err := BaseOTSenderRound2(m)
+	require.NoError(t, err)
+
+	got := roundTrip(t, "BaseOTSenderMsg", reply)
+	require.Len(t, got.M0, LambdaC)
+	require.Len(t, got.M1, LambdaC)
+	require.Equal(t, reply.M0, got.M0)
+	require.Equal(t, reply.M1, got.M1)
+
+	// Pin the wire format: exactly the keys "m0" and "m1".
+	keys := jsonKeys(t, reply)
+	require.Len(t, keys, 2)
+	require.Contains(t, keys, "m0")
+	require.Contains(t, keys, "m1")
+
+	// The decoded reply must still finalize to the sender's seeds.
+	seeds, err := BaseOTReceiverFinalize(state, got)
+	require.NoError(t, err)
+	for k := 0; k < LambdaC; k++ {
+		if sigma[k] {
+			require.Equal(t, seeds1[k], seeds[k], "k=%d", k)
+		} else {
+			require.Equal(t, seeds0[k], seeds[k], "k=%d", k)
+		}
+	}
 }

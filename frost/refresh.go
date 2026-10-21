@@ -70,7 +70,8 @@ func evalZeroConstPoly(coeffs []*edwards25519.Scalar, x int) *edwards25519.Scala
 }
 
 // refreshFeldmanVerify checks that share·B = Σ_{k=1}^{t-1} C_{i,k} · x^k
-// for a zero-constant polynomial (no constant term commitment).
+// for a zero-constant polynomial (no constant term commitment). The received
+// commitments are parsed with deserializeElement (RFC 9591 Section 6.1).
 func refreshFeldmanVerify(share *edwards25519.Scalar, x int, nonConstFeldman [][]byte) error {
 	if len(nonConstFeldman) == 0 {
 		// t = 1: the zero-constant polynomial is f(x) = 0 for all x.
@@ -87,7 +88,7 @@ func refreshFeldmanVerify(share *edwards25519.Scalar, x int, nonConstFeldman [][
 	// RHS = Σ_{k=1}^{t-1} C_{i,k} · x^k.
 	rhs := edwards25519.NewIdentityPoint()
 	for _, commitBytes := range nonConstFeldman {
-		Cik, err := edwards25519.NewIdentityPoint().SetBytes(commitBytes)
+		Cik, err := deserializeElement(commitBytes)
 		if err != nil {
 			return fmt.Errorf("frost: parse refresh Feldman commitment: %w", err)
 		}

@@ -1,6 +1,7 @@
 package dkls23
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 
@@ -314,23 +315,100 @@ func TestRefreshBadFeldman(t *testing.T) {
 	}
 }
 
-// TestRefreshVOLEInvariantHolds verifies that after refresh the VOLE
-// correlation invariant is maintained: gamma[k] == alpha_{beta[k]}[k].
-// We test this by running a successful signing session after refresh,
-// which would fail if the OT states were inconsistent.
-func TestRefreshVOLEInvariantHolds(t *testing.T) {
+// TestRefreshBaseOTSeedsStayCorrelated checks the KMOS21 OT re-randomization
+// directly: after a refresh, for every directed pair i→j Alice's seed[k]
+// still equals Bob's seed_{sigma'[k]}[k] under the new choice bits, the
+// unchosen seed is different, every seed actually changed, and a fresh
+// OT-extension batch over the refreshed seeds still verifies.
+func TestRefreshBaseOTSeedsStayCorrelated(t *testing.T) {
 	t.Parallel()
 	allIDs := []int{1, 2, 3}
 	setups := fullSetup(t)
 
-	// Multiple refresh cycles, sign after each.
+	type pair struct{ alice, bob int }
+	before := map[pair][][]byte{}
+	for _, i := range allIDs {
+		for _, j := range allIDs {
+			if i != j {
+				before[pair{i, j}] = append([][]byte(nil), setups[i].AliceBaseOT[j].Seeds...)
+			}
+		}
+	}
+
+	runRefresh(t, setups)
+
+	for _, i := range allIDs {
+		for _, j := range allIDs {
+			if i == j {
+				continue
+			}
+			alice := setups[i].AliceBaseOT[j] // i is Alice for the i→j direction
+			bob := setups[j].BobBaseOT[i]     // j is Bob for the i→j direction
+			require.Len(t, alice.Seeds, LambdaC)
+			require.Len(t, alice.Sigma, LambdaC)
+			require.Len(t, bob.Seeds0, LambdaC)
+			require.Len(t, bob.Seeds1, LambdaC)
+			changed := 0
+			for k := 0; k < LambdaC; k++ {
+				chosen, other := bob.Seeds0[k], bob.Seeds1[k]
+				if alice.Sigma[k] {
+					chosen, other = other, chosen
+				}
+				require.Equal(t, chosen, alice.Seeds[k], "pair %d→%d instance %d: Alice must hold Bob's seed_{sigma'}", i, j, k)
+				require.NotEqual(t, other, alice.Seeds[k], "pair %d→%d instance %d: Alice must not hold the other seed", i, j, k)
+				if string(before[pair{i, j}][k]) != string(alice.Seeds[k]) {
+					changed++
+				}
+			}
+			require.Equal(t, LambdaC, changed, "pair %d→%d: every seed must be re-randomized", i, j)
+
+			_, _, err := runVOLESession(alice, bob, []byte("post-refresh-batch"))
+			require.NoError(t, err, "pair %d→%d: OT extension over refreshed seeds", i, j)
+		}
+	}
+}
+
+// TestRefreshClearsSessionIDs: a refresh replaces every seed a session id
+// feeds into, so the record of used ids is reset and an id from an earlier
+// epoch is accepted again, with a valid signature as the result.
+func TestRefreshClearsSessionIDs(t *testing.T) {
+	t.Parallel()
+	allIDs := []int{1, 2, 3}
+	setups := fullSetup(t)
+	msg := []byte("same id, new epoch")
+
+	s := runSession(t, setups, "sid-epoch", allIDs, msg)
+	r, sig := s.combine(t, setups, msg)
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+	_, _, err := SignRound1(setups[1], "sid-epoch", allIDs)
+	var reused *SessionIDReusedError
+	require.True(t, errors.As(err, &reused))
+
+	runRefresh(t, setups)
+	for _, id := range allIDs {
+		require.Empty(t, setups[id].SessionIDs, "party %d", id)
+	}
+
+	s2 := runSession(t, setups, "sid-epoch", allIDs, msg)
+	r, sig = s2.combine(t, setups, msg)
+	verifyECDSA(t, setups[1].PubKey, msg, r, sig)
+	require.NotEqual(t, s.r1Msgs[2][1].OTExt.U, s2.r1Msgs[2][1].OTExt.U, "refreshed seeds give a different batch for the same id")
+}
+
+// TestRefreshSigningWorksAcrossEpochs runs several refresh cycles and signs
+// after each one, which exercises the refreshed base-OT seeds, FZero seeds and
+// shares together end to end.
+func TestRefreshSigningWorksAcrossEpochs(t *testing.T) {
+	t.Parallel()
+	allIDs := []int{1, 2, 3}
+	setups := fullSetup(t)
+
 	pubKey := setups[1].PubKey
 	for i := 0; i < 2; i++ {
 		runRefresh(t, setups)
 		msg := []byte{0xca, 0xfe, byte(i), 0x00}
 		r, s := runSigning(t, setups, allIDs, msg)
 		verifyECDSA(t, pubKey, msg, r, s)
-		t.Logf("VOLE invariant verified after refresh %d", i+1)
 	}
 }
 

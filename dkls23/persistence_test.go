@@ -4,11 +4,11 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"testing"
 
-	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -71,8 +71,8 @@ func TestMarshalUnmarshalSetup(t *testing.T) {
 		require.Equal(t, s.PubKey, got.PubKey)
 		require.Equal(t, s.Threshold, got.Threshold)
 		require.Equal(t, s.Epoch, got.Epoch)
-		require.Equal(t, len(s.VoleAlice), len(got.VoleAlice))
-		require.Equal(t, len(s.VoleBob), len(got.VoleBob))
+		require.Equal(t, len(s.AliceBaseOT), len(got.AliceBaseOT))
+		require.Equal(t, len(s.BobBaseOT), len(got.BobBaseOT))
 		require.Equal(t, len(s.FZeroSeeds), len(got.FZeroSeeds))
 	}
 }
@@ -111,6 +111,36 @@ func TestUnmarshalSetupBadJSON(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestUnmarshalSetupWrongVersion(t *testing.T) {
+	setups := fullSetup(t)
+	data, err := MarshalSetup(setups[1])
+	require.NoError(t, err)
+
+	// A missing version field must be rejected.
+	_, err = UnmarshalSetup([]byte(`{"my_id":1,"all_ids":[1],"share":"","pub_key":"","threshold":1}`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "version")
+
+	// A future version must be rejected rather than misread: rewrite only the
+	// version field of an otherwise valid document.
+	var doc map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &doc))
+	require.JSONEq(t, "1", string(doc["version"]))
+	doc["version"] = json.RawMessage("99")
+	bumped, err := json.Marshal(doc)
+	require.NoError(t, err)
+	_, err = UnmarshalSetup(bumped)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "version 99")
+
+	// The same document with the correct version still loads.
+	doc["version"] = json.RawMessage("1")
+	ok, err := json.Marshal(doc)
+	require.NoError(t, err)
+	_, err = UnmarshalSetup(ok)
+	require.NoError(t, err)
+}
+
 func TestMarshalEncryptedEncryptError(t *testing.T) {
 	setups := fullSetup(t)
 	_, err := MarshalEncrypted(setups[1], &failingEncryptor{})
@@ -139,59 +169,7 @@ func TestMarshalEncryptedFunctional(t *testing.T) {
 		restored[id] = r
 	}
 
-	// Sign with restored setups
 	msg := []byte("encrypted persistence test")
-	sigID := "enc-persist-sig"
-	signers := []int{1, 2, 3}
-
-	r1s := map[int]*Round1State{}
-	r1m := map[int]map[int]*Round1Msg{}
-	for _, id := range signers {
-		st, msgs, err := SignRound1(restored[id], sigID, signers)
-		require.NoError(t, err)
-		r1s[id] = st
-		r1m[id] = msgs
-	}
-	r2s := map[int]*Round2State{}
-	r2m := map[int]map[int]*Round2Msg{}
-	for _, id := range signers {
-		in := map[int]*Round1Msg{}
-		for _, j := range signers {
-			if j != id {
-				in[j] = r1m[j][id]
-			}
-		}
-		st, msgs, err := SignRound2(restored[id], r1s[id], in)
-		require.NoError(t, err)
-		r2s[id] = st
-		r2m[id] = msgs
-	}
-	r3f := map[int]map[int]*Round3Msg{}
-	for _, id := range signers {
-		in := map[int]*Round2Msg{}
-		for _, j := range signers {
-			if j != id {
-				in[j] = r2m[j][id]
-			}
-		}
-		frags, err := SignRound3(restored[id], r2s[id], msg, in)
-		require.NoError(t, err)
-		r3f[id] = frags
-	}
-	rx := computeRxFromStates(signers, r2s)
-	myFrag := r3f[1][1]
-	allFrags := map[int]*Round3Msg{}
-	for _, j := range signers {
-		if j != 1 {
-			allFrags[j] = r3f[j][1]
-		}
-	}
-	var myW, myU btcec.ModNScalar
-	myW.SetByteSlice(myFrag.W_i)
-	myU.SetByteSlice(myFrag.U_i)
-	r, s, err := SignCombine(restored[1], &rx, &myW, &myU, allFrags, msg)
-	require.NoError(t, err)
-	require.NotEmpty(t, r)
-	require.NotEmpty(t, s)
-	t.Logf("Sign after encrypted persistence succeeded: r=%x", r[:4])
+	r, s := runSigning(t, restored, []int{1, 2, 3}, msg)
+	verifyECDSA(t, restored[1].PubKey, msg, r, s)
 }

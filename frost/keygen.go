@@ -12,11 +12,23 @@ import (
 
 // --- Feldman VSS Distributed Key Generation ---
 //
-// Each party Pi samples a degree-(t-1) polynomial pi(x) over the Ed25519
+// Implements the FROST KeyGen protocol of the FROST paper (Komlo-Goldberg,
+// ePrint 2020/852, Figure 1), a Pedersen DKG hardened against rogue-key
+// attacks by a Schnorr proof of knowledge of each party's constant term.
+// RFC 9591 does not specify a DKG (Section 5: "This document does not
+// specify how this information, including the signing key shares, are
+// configured and distributed to participants").
+//
+// Each party Pi samples a degree-(t-1) polynomial fi(x) over the Ed25519
 // scalar field and:
-//   - Broadcasts Feldman commitments A_{i,k} = a_{i,k}·B for k=0..t-1
+//   - Proves knowledge of a_{i,0}: σ_i = (R_i, μ_i) with k ← Z_q, R_i = k·B,
+//     c_i = H(i, Φ, φ_{i,0}, R_i), μ_i = k + a_{i,0}·c_i (Round 1 step 2)
+//   - Broadcasts Feldman commitments φ_{i,k} = a_{i,k}·B for k=0..t-1
+//     together with σ_i (Round 1 steps 3-4)
 //   - Commits (via hash commitment) to each other party's share
-//   - Verifies incoming shares against Feldman commitments
+//   - Verifies every other party's σ_ℓ before sending any share
+//     (Round 1 step 5: R_ℓ == μ_ℓ·B − c_ℓ·φ_{ℓ,0}, abort on failure)
+//   - Verifies incoming shares against Feldman commitments (Round 2 step 2)
 //
 // The DKG produces shares compatible with FROST signing (RFC 9591).
 
@@ -28,6 +40,24 @@ type DKGPartyConfig struct {
 	AllIDs []int
 	// Threshold t: the reconstruction threshold (minimum signers needed).
 	Threshold int
+	// Context is the context string Φ bound into each party's proof of
+	// knowledge (FROST paper Figure 1, Round 1 step 2: "Φ being a context
+	// string to prevent replay attacks"). It MUST be non-empty: an empty Φ
+	// offers no replay protection, so DKGRound1, DKGRound2 and DKGFinalize
+	// reject it with InvalidInputError. All parties in a DKG session MUST use
+	// the same value, and it SHOULD be unique per session (for example an
+	// application identifier plus a fresh session identifier) so that a proof
+	// captured in one session cannot be replayed in another. A proof made under
+	// a different Context fails verification.
+	Context []byte
+}
+
+// validateContext rejects an empty DKG context string.
+func validateContext(config DKGPartyConfig, phase string) error {
+	if len(config.Context) == 0 {
+		return &InvalidInputError{Phase: phase, Detail: "DKG context must be non-empty (FROST paper Figure 1: Φ prevents replay of proofs of knowledge)"}
+	}
+	return nil
 }
 
 // KeyShare holds a single participant's secret share and the group public key.
@@ -49,7 +79,9 @@ type KeyShare struct {
 	AllIDs []int
 }
 
-// DKGRound1Output is what Pi broadcasts after DKG round 1.
+// DKGRound1Output is what Pi broadcasts after DKG round 1: the Feldman
+// commitment vector C_i and the proof of knowledge σ_i = (R_i, μ_i)
+// (FROST paper Figure 1, Round 1 step 4).
 type DKGRound1Output struct {
 	// FeldmanCommitments are the t compressed Edwards points A_{i,0}...A_{i,t-1} (32 bytes each).
 	FeldmanCommitments [][]byte
@@ -57,6 +89,12 @@ type DKGRound1Output struct {
 	PairwiseCommitments map[int][32]byte
 	// PairwiseSalts[j] is the salt used for the commitment to Pj's share.
 	PairwiseSalts map[int][SaltLen]byte
+	// ProofR is R_i = k·B, the commitment of the Schnorr proof of knowledge
+	// of a_{i,0} (32-byte compressed Edwards point).
+	ProofR []byte
+	// ProofMu is μ_i = k + a_{i,0}·c_i, the response of the proof of knowledge
+	// (32-byte little-endian scalar).
+	ProofMu []byte
 }
 
 // DKGRound2Output contains the decommitted shares Pi sends after receiving all round 1 messages.
@@ -160,10 +198,98 @@ func lagrangeCoeff(myID int, allIDs []int) *edwards25519.Scalar {
 	return edwards25519.NewScalar().Multiply(num, denInv)
 }
 
-// DKGRound1 executes the first round of the Feldman VSS DKG for party config.MyID.
-// Pi samples a degree-(t-1) polynomial, broadcasts Feldman commitments,
-// and commits (via hash commitment) to each other party's share.
-// Returns the round 1 output and the polynomial coefficients (needed for round 2).
+// dkgProveKnowledge computes σ_i = (R_i, μ_i), the Schnorr proof of knowledge
+// of the constant term a_{i,0} (FROST paper Figure 1, Round 1 step 2):
+//
+//	R_i = k·B,  c_i = H(i, Φ, φ_{i,0}, R_i),  μ_i = k + a_{i,0}·c_i
+//
+// with H instantiated by hashDKGProof and Φ = context. k is the proof nonce
+// sampled by the caller; it is zeroized before returning because, exactly like
+// a signing nonce, k together with μ_i reveals a_{i,0}. Returns the 32-byte
+// encodings of R_i and μ_i.
+func dkgProveKnowledge(id int, context []byte, a0, k *edwards25519.Scalar) (proofR, proofMu []byte) {
+	proofR = edwards25519.NewGeneratorPoint().ScalarBaseMult(k).Bytes()
+	phi0 := edwards25519.NewGeneratorPoint().ScalarBaseMult(a0).Bytes()
+	c := hashDKGProof(id, context, phi0, proofR)
+	// μ = a0·c + k
+	mu := edwards25519.NewScalar().MultiplyAdd(a0, c, k)
+	proofMu = mu.Bytes()
+	k.Set(edwards25519.NewScalar())
+	mu.Set(edwards25519.NewScalar()) // μ is public, but it was derived from k; clear it too.
+	return proofR, proofMu
+}
+
+// dkgVerifyKnowledge verifies party id's proof of knowledge σ = (R, μ) of the
+// discrete log of its constant-term commitment φ_0 = r1.FeldmanCommitments[0]
+// (FROST paper Figure 1, Round 1 step 5):
+//
+//	c = H(id, Φ, φ_0, R),  accept iff R == μ·B − c·φ_0
+//
+// φ_0 and R are parsed with deserializeElement (RFC 9591 Section 6.1) and μ
+// must be a canonical scalar; any parse failure is a verification failure.
+func dkgVerifyKnowledge(id int, context []byte, r1 *DKGRound1Output) error {
+	if len(r1.FeldmanCommitments) == 0 {
+		return fmt.Errorf("frost: party %d sent no constant-term commitment", id)
+	}
+	phi0Bytes := r1.FeldmanCommitments[0]
+	phi0, err := deserializeElement(phi0Bytes)
+	if err != nil {
+		return fmt.Errorf("frost: party %d constant-term commitment: %w", id, err)
+	}
+	R, err := deserializeElement(r1.ProofR)
+	if err != nil {
+		return fmt.Errorf("frost: party %d proof commitment R: %w", id, err)
+	}
+	mu, err := edwards25519.NewScalar().SetCanonicalBytes(r1.ProofMu)
+	if err != nil {
+		return fmt.Errorf("frost: party %d proof response μ: %w", id, err)
+	}
+	c := hashDKGProof(id, context, phi0Bytes, r1.ProofR)
+
+	// expected = μ·B − c·φ_0
+	expected := edwards25519.NewGeneratorPoint().ScalarBaseMult(mu)
+	cPhi0 := edwards25519.NewIdentityPoint().ScalarMult(c, phi0)
+	expected.Subtract(expected, cPhi0)
+	if expected.Equal(R) != 1 {
+		return fmt.Errorf("frost: party %d proof of knowledge of a_0 does not verify", id)
+	}
+	return nil
+}
+
+// verifyRound1Proofs checks the round 1 message of every party other than
+// config.MyID: it must be present, carry exactly t Feldman commitments that
+// all pass deserializeElement, and its proof of knowledge must verify under
+// config.Context. Returns the IDs of all parties failing any check, in
+// config.AllIDs order.
+func verifyRound1Proofs(config DKGPartyConfig, allRound1 map[int]*DKGRound1Output) []int {
+	var bad []int
+	for _, j := range config.AllIDs {
+		if j == config.MyID {
+			continue
+		}
+		r1 := allRound1[j]
+		if r1 == nil || len(r1.FeldmanCommitments) != config.Threshold {
+			bad = append(bad, j)
+			continue
+		}
+		if _, err := parseFeldmanCommitments(r1.FeldmanCommitments); err != nil {
+			bad = append(bad, j)
+			continue
+		}
+		if err := dkgVerifyKnowledge(j, config.Context, r1); err != nil {
+			bad = append(bad, j)
+		}
+	}
+	return bad
+}
+
+// DKGRound1 executes the first round of the DKG for party config.MyID
+// (FROST paper Figure 1, Round 1 steps 1-4). Pi samples a degree-(t-1)
+// polynomial, proves knowledge of its constant term a_{i,0} under
+// config.Context, computes the Feldman commitments, and commits (via hash
+// commitment) to each other party's share. The returned DKGRound1Output is
+// broadcast to all parties; the polynomial coefficients are secret and are
+// needed by DKGRound2 and DKGFinalize.
 func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []*edwards25519.Scalar, error) {
 	if err := validatePartyIDs(config.AllIDs, "DKGRound1"); err != nil {
 		return nil, nil, err
@@ -184,6 +310,9 @@ func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []*edwards25519.Scalar,
 	if !found {
 		return nil, nil, &InvalidInputError{Phase: "DKGRound1", Detail: fmt.Sprintf("myID %d not in AllIDs", config.MyID)}
 	}
+	if err := validateContext(config, "DKGRound1"); err != nil {
+		return nil, nil, err
+	}
 	t := config.Threshold
 
 	// Sample polynomial coefficients a_{i,0}, ..., a_{i,t-1}.
@@ -196,7 +325,15 @@ func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []*edwards25519.Scalar,
 		coeffs[k] = c
 	}
 
-	// Compute Feldman commitments A_{i,k} = a_{i,k} * B.
+	// Round 1 step 2: proof of knowledge of a_{i,0}. The nonce k is zeroized
+	// inside dkgProveKnowledge.
+	k, err := sampleScalar()
+	if err != nil {
+		return nil, nil, fmt.Errorf("frost DKGRound1: sample proof nonce: %w", err)
+	}
+	proofR, proofMu := dkgProveKnowledge(config.MyID, config.Context, coeffs[0], k)
+
+	// Round 1 step 3: Feldman commitments φ_{i,k} = a_{i,k} * B.
 	feldman := make([][]byte, t)
 	for k := 0; k < t; k++ {
 		pt := edwards25519.NewGeneratorPoint().ScalarBaseMult(coeffs[k])
@@ -225,14 +362,37 @@ func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []*edwards25519.Scalar,
 		FeldmanCommitments:  feldman,
 		PairwiseCommitments: pairwiseComs,
 		PairwiseSalts:       pairwiseSalts,
+		ProofR:              proofR,
+		ProofMu:             proofMu,
 	}
 	return out, coeffs, nil
 }
 
-// DKGRound2 decommits pairwise shares after receiving round 1 messages from all parties.
-// myCoeffs are the polynomial coefficients sampled in round 1.
+// DKGRound2 verifies every other party's round 1 proof of knowledge and, only
+// if all of them verify, decommits the pairwise shares (FROST paper Figure 1,
+// Round 1 step 5 and Round 2 step 1). myCoeffs are the polynomial coefficients
+// returned by DKGRound1; allRound1 maps party ID to the DKGRound1Output that
+// party broadcast (this party's own entry is not required and is ignored).
+//
+// A missing or malformed round 1 message, or a proof that fails to verify
+// under config.Context, aborts with a CheatingPartyError naming every
+// offending party. No share is released in that case: this is what prevents
+// the rogue-key attack, in which a party publishes a constant-term commitment
+// whose discrete log it does not know (for example Y − Σ_{ℓ≠i} φ_{ℓ,0} for a
+// Y of its choosing) and would otherwise still receive honest shares.
+//
 // Returns the decommitments (plaintext shares) to send to each other party.
-func DKGRound2(config DKGPartyConfig, myCoeffs []*edwards25519.Scalar) (*DKGRound2Output, error) {
+func DKGRound2(config DKGPartyConfig, myCoeffs []*edwards25519.Scalar, allRound1 map[int]*DKGRound1Output) (*DKGRound2Output, error) {
+	if config.Threshold <= 0 || len(myCoeffs) != config.Threshold {
+		return nil, &InvalidInputError{Phase: "DKGRound2", Detail: fmt.Sprintf("expected %d polynomial coefficients, got %d", config.Threshold, len(myCoeffs))}
+	}
+	if err := validateContext(config, "DKGRound2"); err != nil {
+		return nil, err
+	}
+	if bad := verifyRound1Proofs(config, allRound1); len(bad) > 0 {
+		return nil, &CheatingPartyError{PartyIDs: bad, Phase: "DKGRound2", Detail: "round 1 proof of knowledge missing or invalid"}
+	}
+
 	secretShares := make(map[int][]byte)
 	for _, j := range config.AllIDs {
 		if j == config.MyID {
@@ -246,20 +406,30 @@ func DKGRound2(config DKGPartyConfig, myCoeffs []*edwards25519.Scalar) (*DKGRoun
 	return &DKGRound2Output{SecretShares: secretShares}, nil
 }
 
+// parseFeldmanCommitments deserializes a received Feldman commitment vector
+// with deserializeElement (RFC 9591 Section 6.1), rejecting non-canonical
+// encodings, the identity, and points outside the prime-order subgroup.
+func parseFeldmanCommitments(commitments [][]byte) ([]*edwards25519.Point, error) {
+	points := make([]*edwards25519.Point, len(commitments))
+	for k, c := range commitments {
+		pt, err := deserializeElement(c)
+		if err != nil {
+			return nil, fmt.Errorf("frost: parse Feldman commitment [%d]: %w", k, err)
+		}
+		points[k] = pt
+	}
+	return points, nil
+}
+
 // feldmanVerify checks that share·B == sum_{k=0}^{t-1} A_{i,k} * x^k.
 // This is the standard Feldman VSS verification equation.
-func feldmanVerify(share *edwards25519.Scalar, x int, feldmanCommitments [][]byte) error {
-	t := len(feldmanCommitments)
+func feldmanVerify(share *edwards25519.Scalar, x int, feldmanCommitments []*edwards25519.Point) error {
 	xScalar := scalarFromInt(x)
 	xPow := scalarFromUint64(1)
 
 	// Compute RHS = sum_{k=0}^{t-1} A_{i,k} * x^k.
 	rhs := edwards25519.NewIdentityPoint()
-	for k := 0; k < t; k++ {
-		Aik, err := edwards25519.NewIdentityPoint().SetBytes(feldmanCommitments[k])
-		if err != nil {
-			return fmt.Errorf("frost: parse Feldman commitment [%d]: %w", k, err)
-		}
+	for _, Aik := range feldmanCommitments {
 		scaled := edwards25519.NewIdentityPoint().ScalarMult(xPow, Aik)
 		rhs.Add(rhs, scaled)
 		xPow = edwards25519.NewScalar().Multiply(xPow, xScalar)
@@ -274,27 +444,46 @@ func feldmanVerify(share *edwards25519.Scalar, x int, feldmanCommitments [][]byt
 	return nil
 }
 
-// DKGFinalize verifies all received shares and computes the final key share.
-// For each sender j:
-//  1. Verifies hash commitment: Open(pi_j(myID), com_{j,myID}, salt_{j,myID})
-//  2. Verifies Feldman check: pi_j(myID)·B == sum_k A_{j,k}·myID^k
+// DKGFinalize verifies all received round 1 and round 2 messages and computes
+// the final key share (FROST paper Figure 1, Round 2 steps 2-4). For each
+// other party j it:
+//  1. Re-verifies the proof of knowledge σ_j of a_{j,0} under config.Context
+//     (Round 1 step 5), so a party that skipped DKGRound2's check still aborts.
+//  2. Verifies the hash commitment: Open(pi_j(myID), com_{j,myID}, salt_{j,myID}).
+//  3. Verifies the Feldman check: pi_j(myID)·B == sum_k A_{j,k}·myID^k.
 //
-// Returns the final KeyShare or error (listing bad senders).
+// This party's own contribution is taken from myCoeffs, so allRound1 need not
+// contain its own entry. Returns the final KeyShare, or a CheatingPartyError
+// listing every party whose messages failed verification.
 func DKGFinalize(
 	config DKGPartyConfig,
 	myCoeffs []*edwards25519.Scalar,
 	allRound1 map[int]*DKGRound1Output,
 	allRound2 map[int]*DKGRound2Output,
 ) (*KeyShare, error) {
-	var badSenders []int
+	if config.Threshold <= 0 || len(myCoeffs) != config.Threshold {
+		return nil, &InvalidInputError{Phase: "DKGFinalize", Detail: fmt.Sprintf("expected %d polynomial coefficients, got %d", config.Threshold, len(myCoeffs))}
+	}
+	if err := validateContext(config, "DKGFinalize"); err != nil {
+		return nil, err
+	}
 
+	var badSenders []int
 	finalShare := edwards25519.NewScalar()
+	// feldmanPoints[j] is party j's verified commitment vector φ_{j,0..t-1}.
+	feldmanPoints := make(map[int][]*edwards25519.Point, len(config.AllIDs))
 
 	for _, j := range config.AllIDs {
 		if j == config.MyID {
-			// My own share: evaluate my polynomial at myID.
+			// My own share: evaluate my polynomial at myID; my own commitments
+			// are recomputed from my coefficients.
 			myShare := evalPoly(myCoeffs, config.MyID)
 			finalShare.Add(finalShare, myShare)
+			mine := make([]*edwards25519.Point, len(myCoeffs))
+			for k, c := range myCoeffs {
+				mine[k] = edwards25519.NewGeneratorPoint().ScalarBaseMult(c)
+			}
+			feldmanPoints[j] = mine
 			continue
 		}
 
@@ -311,6 +500,17 @@ func DKGFinalize(
 			continue
 		}
 
+		// Step 1: re-verify the proof of knowledge of a_{j,0}.
+		if err := dkgVerifyKnowledge(j, config.Context, r1j); err != nil {
+			badSenders = append(badSenders, j)
+			continue
+		}
+		points, err := parseFeldmanCommitments(r1j.FeldmanCommitments)
+		if err != nil {
+			badSenders = append(badSenders, j)
+			continue
+		}
+
 		// Get the share pj(myID) sent by party j.
 		shareBytes := r2j.SecretShares[config.MyID]
 		if len(shareBytes) != ScalarLen {
@@ -323,7 +523,7 @@ func DKGFinalize(
 			continue
 		}
 
-		// Verify hash commitment.
+		// Step 2: verify hash commitment.
 		com, ok1 := r1j.PairwiseCommitments[config.MyID]
 		salt, ok2 := r1j.PairwiseSalts[config.MyID]
 		if !ok1 || !ok2 {
@@ -335,17 +535,18 @@ func DKGFinalize(
 			continue
 		}
 
-		// Verify Feldman check: pj(myID)·B == sum_k A_{j,k}·myID^k.
-		if err := feldmanVerify(shareVal, config.MyID, r1j.FeldmanCommitments); err != nil {
+		// Step 3: verify Feldman check: pj(myID)·B == sum_k A_{j,k}·myID^k.
+		if err := feldmanVerify(shareVal, config.MyID, points); err != nil {
 			badSenders = append(badSenders, j)
 			continue
 		}
 
 		finalShare.Add(finalShare, shareVal)
+		feldmanPoints[j] = points
 	}
 
 	if len(badSenders) > 0 {
-		return nil, &CheatingPartyError{PartyIDs: badSenders, Phase: "DKGFinalize", Detail: "share or Feldman verification failed"}
+		return nil, &CheatingPartyError{PartyIDs: badSenders, Phase: "DKGFinalize", Detail: "proof of knowledge, share, or Feldman verification failed"}
 	}
 
 	// Compute aggregated Feldman commitments: A_k = sum_j A_{j,k} for each coefficient index.
@@ -354,11 +555,7 @@ func DKGFinalize(
 	for k := 0; k < t; k++ {
 		sumPt := edwards25519.NewIdentityPoint()
 		for _, j := range config.AllIDs {
-			Ajk, err := edwards25519.NewIdentityPoint().SetBytes(allRound1[j].FeldmanCommitments[k])
-			if err != nil {
-				return nil, fmt.Errorf("frost DKGFinalize: parse A_{%d,%d}: %w", j, k, err)
-			}
-			sumPt.Add(sumPt, Ajk)
+			sumPt.Add(sumPt, feldmanPoints[j][k])
 		}
 		groupCommitments[k] = sumPt.Bytes()
 	}

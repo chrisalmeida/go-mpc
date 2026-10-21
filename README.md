@@ -4,118 +4,162 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/chrisalmeida/go-mpc.svg)](https://pkg.go.dev/github.com/chrisalmeida/go-mpc)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A Go library for **multi-party computation (MPC)** threshold signing protocols. Implements **DKLS23 threshold ECDSA** over secp256k1 and **FROST threshold Schnorr** over Ed25519. Build MPC wallets, distributed custody systems, and threshold signing infrastructure for Bitcoin, Ethereum, Solana, and other blockchains.
+A Go library for **multi-party computation (MPC)** threshold signing. It implements **DKLS23 threshold ECDSA** over secp256k1 and **FROST threshold Schnorr** over Ed25519, following the published specifications step by step. Use it to build MPC wallets, distributed custody systems, and threshold signing infrastructure for Bitcoin, Ethereum, Solana, and other chains.
+
+The library implements the cryptography only. You supply the transport between parties: each round returns the messages to send and takes the messages received.
 
 ## Protocols
 
-| Protocol | Curve | Signature | Rounds | Status |
+| Protocol | Curve | Signature | Signing rounds | Specification |
 |---|---|---|---|---|
-| **[DKLS23](dkls23/)** | secp256k1 | ECDSA | 3 | Available |
-| **[FROST](frost/)** | Ed25519 | Schnorr (EdDSA) | 2 | Available |
+| **[DKLS23](dkls23/)** | secp256k1 | ECDSA | 3 | [ePrint 2023/765](https://eprint.iacr.org/2023/765) (IEEE S&P 2024) |
+| **[FROST](frost/)** | Ed25519 | Schnorr (EdDSA) | 2 | [RFC 9591](https://www.rfc-editor.org/rfc/rfc9591.html), FROST(Ed25519, SHA-512) |
 
-### DKLS23 — Threshold ECDSA over secp256k1
+Both protocols share the same shape: a distributed key generation with no trusted dealer, flexible t-of-n thresholds, proactive key share refresh that keeps the public key fixed, identification and blacklisting of misbehaving parties, and encrypted persistence of key material through a pluggable encryptor.
 
-Implementation of the [DKLS23 protocol](https://eprint.iacr.org/2023/765) (Doerner, Kondi, Lee, shelat — IEEE S&P 2024). Three signing rounds, no trusted dealer, constant-time cryptographic operations.
+## Requirements
 
-**Features:**
-- **Distributed Key Generation (DKG)** — Feldman VSS with no trusted dealer
-- **3-Round Threshold Signing** — the most round-efficient threshold ECDSA available
-- **Flexible t-of-n** — 2-of-3, 3-of-5, or any threshold configuration
-- **Key Share Refresh** — proactive share rotation without changing the public key (KMOS21)
-- **Cheating Detection** — cryptographic verification with party blacklisting
-- **Constant-Time Crypto** — branchless scalar arithmetic, branchless VOLE operations, Fermat's little theorem inversion
-- **Encrypted Persistence** — pluggable encryption for key share storage
-
-**Quick start:**
+- Go 1.26 or later (`go.mod` pins the toolchain used by CI).
+- Dependencies are kept to what the cryptography needs: `btcec` (secp256k1), `filippo.io/edwards25519` (Ed25519), and `golang.org/x/crypto` (SHAKE-256).
 
 ```bash
 go get github.com/chrisalmeida/go-mpc
 ```
 
+## DKLS23 — Threshold ECDSA over secp256k1
+
+Implementation of "Threshold ECDSA in Three Rounds" (Doerner, Kondi, Lee, shelat). Three signing rounds, no trusted dealer, constant-time operations on secret values.
+
+**How it is put together**
+
+- **Key generation** — commit-then-reveal Feldman VSS (Protocol 7.1). Parties commit to their Feldman commitments and shares before anything is revealed, so a party cannot choose its polynomial after seeing the others'.
+- **One-time pairwise setup** — the λc base OTs of the Masny-Rindal endemic OT (§8.1), plus an FZero seed, per pair of parties. These seeds are the only pairwise material that is stored.
+- **Per-session OT extension and VOLE** — every signing session runs a fresh KOS15 OT-extension batch with the one-message Fiat-Shamir consistency check of §5.1, and derives a fresh random VOLE (Protocol 5.2) from it. Nothing produced inside a session is stored or reused.
+- **Signing** — Protocol 3.6: commit to the nonce share, multiply through the VOLE, verify the consistency checks, combine, and verify the final ECDSA signature before releasing it.
+- **Refresh** — KMOS21 proactive refresh re-randomizes the Shamir shares, the base-OT seeds, and the FZero seeds without changing the public key.
+- **Cheating detection** — a party whose OT-extension batch, VOLE proof, decommitment, or check values fail verification is identified and excluded from all future sessions.
+
+**Quick start**
+
 ```go
 import "github.com/chrisalmeida/go-mpc/dkls23"
 
-// 1. Distributed Key Generation (each party runs independently)
-config := dkls23.DKGPartyConfig{MyID: 1, AllIDs: []int{1, 2, 3}, Threshold: 2}
-round1Out, coeffs, _ := dkls23.DKGRound1(config)
+// 1. Key generation (each party runs its own side; messages go over your transport).
+cfg := dkls23.DKGPartyConfig{MyID: 1, AllIDs: []int{1, 2, 3}, Threshold: 2}
+r1, priv, err := dkls23.DKGRound1(cfg)          // broadcast r1 (commitments only)
+r2, err := dkls23.DKGRound2(cfg, priv, peersR1)  // after all peers' r1 arrived; send r2
+share, pubKey, err := dkls23.DKGFinalize(cfg, priv, allR1, allR2)
+priv.Zero()
 
-// 2. Exchange round 1 messages, run round 2, finalize → get share + public key
-// 3. Run pairwise VOLE + FZero setup (one-time per party pair)
-// 4. Sign: SignRound1 → SignRound2 → SignRound3 → SignCombine → standard ECDSA (r, s)
+// 2. One-time pairwise setup with every other party (both directions + FZero).
+//    As base-OT receiver (you are Alice for the i→j direction):
+state, msg, err := dkls23.BaseOTReceiverRound1(sigma)   // send msg
+seeds, err := dkls23.BaseOTReceiverFinalize(state, reply)
+//    As base-OT sender (you are Bob for the j→i direction):
+seeds0, seeds1, reply, err := dkls23.BaseOTSenderRound2(msg)
+//    Store the results in SignerSetup.AliceBaseOT / SignerSetup.BobBaseOT,
+//    and the FZero seed (FZeroSetupRound1 / FZeroSetupFinalize) in FZeroSeeds.
+
+// 3. Signing: each session uses a fresh session id.
+st1, out1, err := dkls23.SignRound1(setup, sigID, signers)          // out1[j] → party j
+st2, out2, err := dkls23.SignRound2(setup, st1, inbound1)           // out2[j] → party j
+frags, err := dkls23.SignRound3(setup, st2, message, inbound2)      // frags[j] → party j
+rx, err := dkls23.ComputeRx(noncePoints)
+r, s, err := dkls23.SignCombine(setup, &rx, &myW, &myU, inboundFrags, message)
 ```
 
-See [example/dkls23/](example/dkls23/) for a complete runnable 3-of-3 flow — DKG, pairwise setup, signing, verification, and key refresh:
+The [example/dkls23](example/dkls23/) program runs the whole flow for three in-process parties, including persistence and refresh:
 
 ```bash
 cd example/dkls23 && go run .
 ```
 
-### FROST — Threshold Schnorr over Ed25519
+## FROST — Threshold Schnorr over Ed25519
 
-Implementation of [RFC 9591](https://www.rfc-editor.org/rfc/rfc9591.html) (FROST: Flexible Round-Optimized Schnorr Threshold Signatures) using the FROST(Ed25519, SHA-512) ciphersuite. Two signing rounds, no trusted dealer, signatures compatible with standard Ed25519 verification (RFC 8032).
+Implementation of RFC 9591 with the FROST(Ed25519, SHA-512) ciphersuite. Two signing rounds, no trusted dealer, and signatures that verify with `crypto/ed25519`.
 
-**Features:**
-- **Distributed Key Generation (DKG)** — Feldman VSS with no trusted dealer (2 rounds)
-- **2-Round Threshold Signing** — Schnorr's linearity means no OT or VOLE needed
-- **Flexible t-of-n** — 2-of-3, 3-of-5, or any threshold configuration
-- **RFC 8032 Compatible** — FROST signatures verify with `crypto/ed25519.Verify`
-- **Identifiable Abort** — individual signature shares are verified, misbehaving signers are identified
-- **Key Share Refresh** — proactive share rotation without changing the public key
-- **Hedged Nonce Generation** — RFC 9591 `nonce_generate` mixes CSPRNG with secret key
-- **Cofactored Verification** — `[8]zB == [8](R + [c]PK)` per RFC 9591 Section 6.5
-- **Encrypted Persistence** — pluggable encryption for key share storage
+**How it is put together**
 
-**Quick start:**
+- **Key generation** — the FROST paper's KeyGen (Figure 1): Feldman VSS with a Schnorr proof of knowledge of each party's constant term, bound to a caller-supplied context string and verified before any share is sent. RFC 9591 does not specify a DKG, so this is the paper's construction.
+- **Signing and aggregation** — RFC 9591 §5: hedged nonce generation, binding factors, group commitment, signature shares, and share verification for identifiable abort. The Appendix E.1 test vectors are reproduced exactly by the test suite.
+- **Element decoding** — every received point goes through the RFC 9591 §6.1 `DeserializeElement` rules: canonical encoding, not the identity, in the prime-order subgroup.
+- **Verification** — the cofactored equation of RFC 9591 §6.1 on top of RFC 8032 decoding; honestly produced signatures are also accepted by `crypto/ed25519.Verify`.
+- **Refresh** — zero-constant Feldman polynomials re-randomize the shares and verification shares without changing the public key.
+
+**Quick start**
 
 ```go
 import "github.com/chrisalmeida/go-mpc/frost"
 
-// 1. Distributed Key Generation (each party runs independently)
-config := frost.DKGPartyConfig{MyID: 1, AllIDs: []int{1, 2, 3}, Threshold: 2}
-round1Out, coeffs, _ := frost.DKGRound1(config)
+// 1. Key generation. Context binds the proofs of knowledge to this DKG session.
+cfg := frost.DKGPartyConfig{MyID: 1, AllIDs: []int{1, 2, 3}, Threshold: 2, Context: sessionContext}
+r1, coeffs, err := frost.DKGRound1(cfg)             // broadcast r1
+r2, err := frost.DKGRound2(cfg, coeffs, allR1)       // verifies every proof first; send r2
+keyShare, err := frost.DKGFinalize(cfg, coeffs, allR1, allR2)
 
-// 2. Exchange round 1 messages, run round 2, finalize → get KeyShare + public key
-// 3. Sign: SignRound1 → SignRound2 → Aggregate → standard Ed25519 signature (R, z)
-// 4. Verify: frost.Verify(pk, msg, sig) or crypto/ed25519.Verify(pk, msg, sig.Bytes())
+// 2. Signing.
+signer := frost.NewSignerState(keyShare)
+st, commitment, err := frost.SignRound1(signer, signers)             // broadcast commitment
+share, err := frost.SignRound2(signer, st, &frost.Round2Input{Message: msg, AllCommitments: allCommitments})
+sig, err := frost.Aggregate(allCommitments, allShares, msg, keyShare.PublicKey, verificationShares, signers)
+
+// 3. Verify.
+ok := frost.Verify(keyShare.PublicKey, msg, sig)   // or ed25519.Verify(pk, msg, sig.Bytes())
 ```
 
-See [example/frost/](example/frost/) for a runnable 2-of-3 flow — DKG, key refresh, signing with all subsets, and verification:
+The [example/frost](example/frost/) program runs a 2-of-3 flow with every signer subset, persistence, and refresh:
 
 ```bash
 cd example/frost && go run .
 ```
 
-## Use Cases
+## What the library does not do
 
-- **MPC wallets** — threshold-sign Bitcoin (ECDSA), Ethereum (ECDSA), and Solana (Ed25519) transactions without exposing private keys
-- **Institutional custody** — distribute signing authority across servers, HSMs, or organizations
-- **Cross-chain bridges** — secure bridge operators with threshold key management
-- **Smart contract governance** — multi-party approval for on-chain operations
-- **Validator key management** — protect Ed25519 validator keys for proof-of-stake networks
+- **Transport, authentication, and broadcast.** Both protocols assume authenticated point-to-point channels and, for identifiable abort, a coordinator or broadcast that does not equivocate. See [SECURITY.md](SECURITY.md).
+- **Session management.** Callers generate the session ids. DKLS23 rejects a session id that the setup has already used in the current epoch (`SessionIDReusedError`) and runs each round of a session exactly once, but two copies of a setup restored from the same snapshot cannot see each other's records, so ids must still be unique in practice. FROST DKGs need a fresh context per run. The example programs show one way to do both.
+- **Resharing.** Refresh keeps the same parties and threshold. Adding or removing parties, or changing t or n, is not supported.
+- **Key derivation.** There is no BIP32-style derivation of child keys.
+
+## Upgrading from v0.x
+
+This major version changes the protocol structure, the APIs, and the persisted formats. It is not wire- or storage-compatible with v0.x.
+
+- **Stored key material must be regenerated.** `SignerSetup` (DKLS23) and `KeyShare` / `SignerState` (FROST) now carry a wire-format version and reject blobs without it. Run a fresh key generation and setup; the demos do this when their `shares/` directory is removed.
+- **DKLS23 key generation** is commit-then-reveal. `DKGRound1` returns a `*DKGPrivateState` instead of raw coefficients, `DKGRound2` requires every other party's round 1 output, and the Feldman commitments are released in round 2.
+- **DKLS23 pairwise setup** stores only base-OT seeds (`SignerSetup.AliceBaseOT`, `SignerSetup.BobBaseOT`). The base OT is Masny-Rindal and the receiver speaks first: `BaseOTReceiverRound1` → `BaseOTSenderRound2` → `BaseOTReceiverFinalize`. The former VOLE setup functions, `SignSetupPairwise`, `SignCounter`, and the persisted VOLE state are gone.
+- **DKLS23 round 1 messages** carry the session's OT-extension batch, so they are larger than before and specific to each counterparty.
+- **FROST key generation** adds `DKGPartyConfig.Context`, which must be non-empty and identical across parties, and the proof fields on `DKGRound1Output`; `DKGRound2` now takes all parties' round 1 outputs and verifies the proofs.
+- **FROST input validation is stricter.** Non-canonical point encodings, the identity, and small-order or mixed-order points are rejected wherever an element is received.
+
+The reasons for these changes are documented in the 2026-10-16 follow-up section of [AUDIT.md](AUDIT.md), including a confirmed key-recovery flaw in the v0.x DKLS23 implementation.
 
 ## Project Structure
 
 ```
 dkls23/              Threshold ECDSA (secp256k1)
-  dkg.go             Distributed key generation (Feldman VSS)
-  sign.go            3-round threshold signing
-  refresh.go         Proactive key share refresh (KMOS21)
-  vole.go            Vector OLE
-  ot.go              Masny-Rindal base oblivious transfer
-  ot_extension.go    IKNP OT extension
+  dkg.go             Commit-then-reveal distributed key generation (Protocol 7.1)
+  sign.go            3-round threshold signing with per-session VOLE (Protocol 3.6)
+  refresh.go         Proactive refresh of shares, base-OT seeds, FZero seeds (KMOS21)
+  vole.go            Random vector OLE (Protocol 5.2)
+  ot.go              Masny-Rindal endemic base OT (one-time setup)
+  ot_extension.go    KOS15 OT extension with Fiat-Shamir consistency check
+  gf128.go           Constant-time GF(2^128) arithmetic for the consistency check
   commitment.go      FCom / FZero primitives
+  setup_messages.go  Wire types for the one-time pairwise setup
+  encoding.go        Versioned JSON wire format
   persistence.go     Encrypted key share serialization
+  errors.go          Typed error categories
   params.go          Security parameters and constants
 frost/               Threshold Schnorr / Ed25519 (RFC 9591)
-  keygen.go          Distributed key generation (Feldman VSS)
+  keygen.go          Distributed key generation with proofs of knowledge
   sign.go            2-round threshold signing + aggregation
   refresh.go         Proactive key share refresh
   verify.go          Cofactored Ed25519 verification
-  hash.go            H1-H5 domain-separated hash functions
-  encoding.go        Wire format JSON marshaling
+  hash.go            H1-H5 and the DKG proof hash
+  encoding.go        Versioned JSON wire format
   persistence.go     Encrypted key share serialization
   errors.go          Typed error categories
-  params.go          Ciphersuite constants
+  params.go          Ciphersuite constants and element decoding
 example/
   shared/            AES-256-GCM encryptor (shared by both demos)
   dkls23/            Complete 3-of-3 DKLS23 demo
@@ -126,31 +170,35 @@ example/
 
 ```bash
 make test          # run all tests
-make test-race     # run with race detector (what CI runs)
-make bench         # benchmarks
-make lint          # go vet + staticcheck
-make ci            # full CI pipeline locally
+make test-race     # run with the race detector
+make lint          # gofmt, go vet, staticcheck
+make fuzz          # run every fuzz target briefly
+make vuln          # govulncheck
+make examples      # build and run both demos
+make ci            # everything CI runs
 ```
 
 ## Security
 
-All secret scalar operations are constant-time across both packages. No `math/big` arithmetic on secret data. dkls23 uses branchless VOLE Beta selection; frost uses `filippo.io/edwards25519` constant-time scalar arithmetic. Both use Fermat's little theorem for modular inversion.
+Secret scalar arithmetic is constant-time in both packages, with no `math/big` operations on secret data. DKLS23 handles its OT choice bits and VOLE selections with masks rather than branches; FROST relies on `filippo.io/edwards25519` constant-time arithmetic. Both use Fermat's little theorem for modular inversion.
 
-Both packages have been audited by Claude Code (Anthropic Claude Opus 4.6) — covering source review, protocol equation-by-equation verification against the DKLS23 paper and RFC 9591, compiler output disassembly, escape analysis, fuzz testing, and dependency vulnerability scanning. 14 total findings across both packages were identified and resolved. See [AUDIT.md](AUDIT.md) for the full report.
+Both packages were reviewed by an automated audit, and a 2026-10-16 follow-up review found that the first audit had missed a critical key-recovery flaw in dkls23 along with several deviations from the cited specifications. All findings from both reviews are resolved; [AUDIT.md](AUDIT.md) has the full report, including the proof of concept that confirmed the critical finding.
 
-See [SECURITY.md](SECURITY.md) for the threat model, constant-time guarantees, known limitations, and responsible disclosure process.
-
-An independent third-party audit by a firm specializing in MPC protocols is recommended before production deployment with real assets.
+[SECURITY.md](SECURITY.md) describes the threat model, constant-time guarantees, known limitations, and the responsible disclosure process. An independent third-party audit by a firm specializing in MPC protocols is recommended before production deployment with real assets.
 
 ## Authors
 
-Co-authored by [Chris Almeida](https://github.com/chrisalmeida) and [Claude Code](https://claude.ai/code) (Anthropic Claude Opus 4.6).
+Co-authored by [Chris Almeida](https://github.com/chrisalmeida) and [Claude Code](https://claude.ai/code) (Anthropic Claude Fable 5.1).
 
 ## References
 
 - Doerner, Kondi, Lee, shelat. "Threshold ECDSA in Three Rounds." IEEE S&P 2024. [ePrint 2023/765](https://eprint.iacr.org/2023/765)
 - Kondi, Magri, Orlandi, Shlomovits. "Refresh When You Wake Up." IEEE S&P 2021. [ePrint 2019/1328](https://eprint.iacr.org/2019/1328)
+- Keller, Orsini, Scholl. "Actively Secure OT Extension with Optimal Overhead." CRYPTO 2015. [ePrint 2015/546](https://eprint.iacr.org/2015/546)
+- Masny, Rindal. "Endemic Oblivious Transfer." CCS 2019. [ePrint 2019/706](https://eprint.iacr.org/2019/706)
 - Connolly, Komlo, Goldberg, Wood. "Two-Round Threshold Schnorr Signatures with FROST." IETF RFC 9591, June 2024. [RFC 9591](https://www.rfc-editor.org/rfc/rfc9591.html)
+- Komlo, Goldberg. "FROST: Flexible Round-Optimized Schnorr Threshold Signatures." SAC 2020. [ePrint 2020/852](https://eprint.iacr.org/2020/852)
+- Josefsson, Liusvaara. "Edwards-Curve Digital Signature Algorithm (EdDSA)." IETF RFC 8032, January 2017. [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032.html)
 
 ## Contributing
 

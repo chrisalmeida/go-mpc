@@ -20,25 +20,49 @@ func TestEncodingDKGRound1Output(t *testing.T) {
 	require.NoError(t, err)
 
 	got := roundTrip(t, "DKGRound1Output", out)
-	require.Len(t, got.FeldmanCommitments, 3)
+	require.Equal(t, out.FeldmanCommitment, got.FeldmanCommitment)
 	require.Len(t, got.PairwiseCommitments, 2)
-	require.Len(t, got.PairwiseSalts, 2)
 	for _, id := range []int{2, 3} {
 		require.Equal(t, out.PairwiseCommitments[id], got.PairwiseCommitments[id])
-		require.Equal(t, out.PairwiseSalts[id], got.PairwiseSalts[id])
 	}
 }
 
 func TestEncodingDKGRound2Output(t *testing.T) {
-	allIDs := []int{1, 2, 3}
-	cfg := DKGPartyConfig{MyID: 1, AllIDs: allIDs, Threshold: 3}
-	_, coeffs, err := DKGRound1(cfg)
+	allIDs := []int{1, 2}
+	cfg1 := DKGPartyConfig{MyID: 1, AllIDs: allIDs, Threshold: 2}
+	cfg2 := DKGPartyConfig{MyID: 2, AllIDs: allIDs, Threshold: 2}
+	_, priv1, err := DKGRound1(cfg1)
 	require.NoError(t, err)
-	r2, err := DKGRound2(cfg, coeffs, nil)
+	r1of2, _, err := DKGRound1(cfg2)
+	require.NoError(t, err)
+	r2, err := DKGRound2(cfg1, priv1, map[int]*DKGRound1Output{2: r1of2})
 	require.NoError(t, err)
 
 	got := roundTrip(t, "DKGRound2Output", r2)
-	require.Len(t, got.SecretShares, 2)
+	require.Len(t, got.SecretShares, 1)
+	require.Len(t, got.PairwiseSalts, 1)
+	require.Equal(t, r2.FeldmanCommitments, got.FeldmanCommitments)
+	require.Equal(t, r2.FeldmanSalt, got.FeldmanSalt)
+	require.Equal(t, r2.SecretShares[2], got.SecretShares[2])
+	require.Equal(t, r2.PairwiseSalts[2], got.PairwiseSalts[2])
+}
+
+// =====================================================================
+// Base-OT seed types
+// =====================================================================
+
+func TestEncodingBaseOTSeeds(t *testing.T) {
+	t.Parallel()
+	alice, bob, err := runBaseOT()
+	require.NoError(t, err)
+
+	gotA := roundTrip(t, "BaseOTReceiverSeeds", alice)
+	require.Equal(t, alice.Seeds, gotA.Seeds)
+	require.Equal(t, alice.Sigma, gotA.Sigma)
+
+	gotB := roundTrip(t, "BaseOTSenderSeeds", bob)
+	require.Equal(t, bob.Seeds0, gotB.Seeds0)
+	require.Equal(t, bob.Seeds1, gotB.Seeds1)
 }
 
 // =====================================================================
@@ -88,10 +112,28 @@ func TestEncodingVOLEMultiplyMsg(t *testing.T) {
 // =====================================================================
 
 func TestEncodingRound1Msg(t *testing.T) {
-	var m Round1Msg
+	t.Parallel()
+	_, bob, err := runBaseOT()
+	require.NoError(t, err)
+	beta, err := sampleBeta()
+	require.NoError(t, err)
+	ote, _, err := OTExtReceive(bob.Seeds0, bob.Seeds1, beta, []byte("round1-msg-test"))
+	require.NoError(t, err)
+
+	m := Round1Msg{OTExt: ote}
 	rand.Read(m.Commitment[:])
 	got := roundTrip(t, "Round1Msg", &m)
 	require.Equal(t, m.Commitment, got.Commitment)
+	require.NotNil(t, got.OTExt)
+	require.Equal(t, m.OTExt.U, got.OTExt.U)
+	require.Equal(t, m.OTExt.XBar, got.OTExt.XBar)
+	require.Equal(t, m.OTExt.TBar, got.OTExt.TBar)
+
+	// Without an OT-extension payload.
+	m2 := Round1Msg{}
+	rand.Read(m2.Commitment[:])
+	got2 := roundTrip(t, "Round1Msg-no-ote", &m2)
+	require.Nil(t, got2.OTExt)
 }
 
 func TestEncodingRound3Msg(t *testing.T) {
@@ -122,6 +164,7 @@ func TestEncodingSigningRoundTrip(t *testing.T) {
 		require.Equal(t, st.Com, got.Com, "party %d Com", id)
 		require.Equal(t, st.Salt, got.Salt, "party %d Salt", id)
 		require.True(t, st.ZetaI.Equals(&got.ZetaI), "party %d ZetaI", id)
+		require.Equal(t, len(st.VoleBobForRound2), len(got.VoleBobForRound2), "party %d VoleBobForRound2", id)
 	}
 
 	// Round1Msg
@@ -129,6 +172,7 @@ func TestEncodingSigningRoundTrip(t *testing.T) {
 		for peer, m := range msgs {
 			got := roundTrip(t, "Round1Msg", m)
 			require.Equal(t, m.Commitment, got.Commitment, "party %d->%d", id, peer)
+			require.Equal(t, m.OTExt.U, got.OTExt.U, "party %d->%d OTExt", id, peer)
 		}
 	}
 
@@ -216,10 +260,32 @@ func TestEncodingSignerSetup(t *testing.T) {
 		require.Equal(t, s.PubKey, got.PubKey, "party %d PubKey", id)
 		require.Equal(t, s.Threshold, got.Threshold, "party %d Threshold", id)
 		require.Equal(t, s.Epoch, got.Epoch, "party %d Epoch", id)
-		require.Equal(t, len(s.VoleAlice), len(got.VoleAlice), "party %d VoleAlice", id)
-		require.Equal(t, len(s.VoleBob), len(got.VoleBob), "party %d VoleBob", id)
+		require.Equal(t, len(s.AliceBaseOT), len(got.AliceBaseOT), "party %d AliceBaseOT", id)
+		require.Equal(t, len(s.BobBaseOT), len(got.BobBaseOT), "party %d BobBaseOT", id)
+		for j, a := range s.AliceBaseOT {
+			require.Equal(t, a.Seeds, got.AliceBaseOT[j].Seeds)
+			require.Equal(t, a.Sigma, got.AliceBaseOT[j].Sigma)
+		}
+		for j, b := range s.BobBaseOT {
+			require.Equal(t, b.Seeds0, got.BobBaseOT[j].Seeds0)
+			require.Equal(t, b.Seeds1, got.BobBaseOT[j].Seeds1)
+		}
 		require.Equal(t, len(s.FZeroSeeds), len(got.FZeroSeeds), "party %d FZeroSeeds", id)
 	}
+}
+
+func TestEncodingSignerSetupVersion(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	b, err := json.Marshal(setups[1])
+	require.NoError(t, err)
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(b, &raw))
+	require.JSONEq(t, "1", string(raw["version"]))
+	_, hasVoleAlice := raw["vole_alice"]
+	require.False(t, hasVoleAlice, "no VOLE correlation may be persisted")
+	_, hasVoleBob := raw["vole_bob"]
+	require.False(t, hasVoleBob, "no VOLE correlation may be persisted")
 }
 
 func TestEncodingSignerSetupWithBlacklist(t *testing.T) {
@@ -227,11 +293,19 @@ func TestEncodingSignerSetupWithBlacklist(t *testing.T) {
 	setups := fullSetup(t)
 	setups[1].Blacklist[2] = true
 	setups[1].Epoch = 5
+	setups[1].SessionIDs = map[string]int{"a": sessionRound1Done, "b": sessionRound3Done}
 
 	got := roundTrip(t, "SignerSetup+blacklist", setups[1])
 	require.True(t, got.Blacklist[2])
 	require.False(t, got.Blacklist[3])
 	require.Equal(t, 5, got.Epoch)
+	require.Equal(t, setups[1].SessionIDs, got.SessionIDs)
+
+	// A setup without the field decodes with an empty, non-nil map.
+	setups[1].SessionIDs = nil
+	got = roundTrip(t, "SignerSetup+nil-sessions", setups[1])
+	require.NotNil(t, got.SessionIDs)
+	require.Empty(t, got.SessionIDs)
 }
 
 func TestEncodingSignerSetupFunctional(t *testing.T) {
@@ -248,62 +322,10 @@ func TestEncodingSignerSetupFunctional(t *testing.T) {
 		restored[id] = &r
 	}
 
-	// Sign with restored setups — proves the VOLE state survived round-trip
+	// Sign with restored setups — proves the base-OT state survived round-trip
 	msg := []byte("sign after deserialize")
-	sigID := "restored-sig"
-	signers := []int{1, 2, 3}
-
-	r1s := map[int]*Round1State{}
-	r1m := map[int]map[int]*Round1Msg{}
-	for _, id := range signers {
-		st, msgs, err := SignRound1(restored[id], sigID, signers)
-		require.NoError(t, err)
-		r1s[id] = st
-		r1m[id] = msgs
-	}
-	r2s := map[int]*Round2State{}
-	r2m := map[int]map[int]*Round2Msg{}
-	for _, id := range signers {
-		in := map[int]*Round1Msg{}
-		for _, j := range signers {
-			if j != id {
-				in[j] = r1m[j][id]
-			}
-		}
-		st, msgs, err := SignRound2(restored[id], r1s[id], in)
-		require.NoError(t, err)
-		r2s[id] = st
-		r2m[id] = msgs
-	}
-	r3f := map[int]map[int]*Round3Msg{}
-	for _, id := range signers {
-		in := map[int]*Round2Msg{}
-		for _, j := range signers {
-			if j != id {
-				in[j] = r2m[j][id]
-			}
-		}
-		frags, err := SignRound3(restored[id], r2s[id], msg, in)
-		require.NoError(t, err)
-		r3f[id] = frags
-	}
-
-	rxVal := computeRxFromStates(signers, r2s)
-	myFrag := r3f[1][1]
-	var myW, myU btcec.ModNScalar
-	myW.SetByteSlice(myFrag.W_i)
-	myU.SetByteSlice(myFrag.U_i)
-	allFrags := map[int]*Round3Msg{}
-	for _, j := range signers {
-		if j != 1 {
-			allFrags[j] = r3f[j][1]
-		}
-	}
-	r, s, err := SignCombine(restored[1], &rxVal, &myW, &myU, allFrags, msg)
-	require.NoError(t, err)
-	require.NotEmpty(t, r)
-	require.NotEmpty(t, s)
-	t.Logf("Signing with deserialized setups succeeded: r=%x s=%x", r[:4], s[:4])
+	r, s := runSigning(t, restored, []int{1, 2, 3}, msg)
+	verifyECDSA(t, restored[1].PubKey, msg, r, s)
 }
 
 // =====================================================================
@@ -348,6 +370,33 @@ func TestBoolArrayRoundTrip(t *testing.T) {
 	decoded, err := decodeBoolArray(encoded)
 	require.NoError(t, err)
 	require.Equal(t, orig, decoded)
+}
+
+func TestBoolSliceRoundTrip(t *testing.T) {
+	orig := randomBools(t, LambdaC)
+	encoded := encodeBoolSlice(orig)
+	decoded, err := decodeBoolSlice(encoded, LambdaC)
+	require.NoError(t, err)
+	require.Equal(t, orig, decoded)
+
+	_, err = decodeBoolSlice(encoded, LambdaC+8)
+	require.Error(t, err)
+	_, err = decodeBoolSlice("!!!bad!!!", LambdaC)
+	require.Error(t, err)
+}
+
+func TestDecodeSeedSliceErrors(t *testing.T) {
+	_, err := decodeSeedSlice([]string{"00"})
+	require.Error(t, err, "wrong count")
+	short := make([]string, LambdaC)
+	for i := range short {
+		short[i] = "00"
+	}
+	_, err = decodeSeedSlice(short)
+	require.Error(t, err, "wrong seed length")
+	short[0] = "zz"
+	_, err = decodeSeedSlice(short)
+	require.Error(t, err, "bad hex")
 }
 
 func TestIntMapKeysRoundTrip(t *testing.T) {

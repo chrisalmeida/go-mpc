@@ -102,12 +102,17 @@ func generateAndSave(enc *shared.AESEncryptor) ([]*node.Node, []byte) {
 
 	fmt.Println("Phase 1: Key Generation (2-round Feldman VSS DKG)")
 
+	// The DKG context Φ is bound into every party's proof of knowledge of its
+	// secret constant term; all parties must agree on it and it should be
+	// unique per DKG session so round 1 messages cannot be replayed.
+	dkgContext := []byte("go-mpc frost example DKG " + node.SessionID())
+
 	nodes := make([]*node.Node, len(allIDs))
 	for i, id := range allIDs {
-		nodes[i] = node.New(id, allIDs, threshold)
+		nodes[i] = node.New(id, allIDs, threshold, dkgContext)
 	}
 
-	// Round 1: broadcast Feldman commitments.
+	// Round 1: broadcast Feldman commitments and proofs of knowledge.
 	allRound1 := make(map[int]*frost.DKGRound1Output)
 	for _, n := range nodes {
 		out, err := n.DKGRound1()
@@ -118,10 +123,10 @@ func generateAndSave(enc *shared.AESEncryptor) ([]*node.Node, []byte) {
 		fmt.Printf("  node %d: round 1 complete\n", n.ID)
 	}
 
-	// Round 2: decommit shares.
+	// Round 2: verify every other party's proof of knowledge, then decommit shares.
 	allRound2 := make(map[int]*frost.DKGRound2Output)
 	for _, n := range nodes {
-		out, err := n.DKGRound2()
+		out, err := n.DKGRound2(allRound1)
 		if err != nil {
 			log.Fatalf("DKG round 2 node %d: %v", n.ID, err)
 		}

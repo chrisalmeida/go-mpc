@@ -18,19 +18,25 @@ type Node struct {
 	Threshold int
 	State     *frost.SignerState
 
-	dkgConfig    frost.DKGPartyConfig
-	dkgCoeffs    []*edwards25519.Scalar
+	dkgConfig     frost.DKGPartyConfig
+	dkgCoeffs     []*edwards25519.Scalar
 	refreshCoeffs []*edwards25519.Scalar
 	refreshSeed   [16]byte
 }
 
 // New creates a Node for the given party ID.
-func New(id int, allIDs []int, threshold int) *Node {
+//
+// dkgContext is the DKG context string Φ bound into this party's proof of
+// knowledge of its secret polynomial constant term (FROST paper, Figure 1).
+// Every party in the same DKG session must use the same value, and it should
+// be unique per session (for example an application name plus SessionID()) so
+// that round 1 messages from one DKG cannot be replayed into another.
+func New(id int, allIDs []int, threshold int, dkgContext []byte) *Node {
 	return &Node{
 		ID:        id,
 		AllIDs:    allIDs,
 		Threshold: threshold,
-		dkgConfig: frost.DKGPartyConfig{MyID: id, AllIDs: allIDs, Threshold: threshold},
+		dkgConfig: frost.DKGPartyConfig{MyID: id, AllIDs: allIDs, Threshold: threshold, Context: dkgContext},
 	}
 }
 
@@ -54,8 +60,11 @@ func (n *Node) DKGRound1() (*frost.DKGRound1Output, error) {
 	return out, nil
 }
 
-func (n *Node) DKGRound2() (*frost.DKGRound2Output, error) {
-	out, err := frost.DKGRound2(n.dkgConfig, n.dkgCoeffs)
+// DKGRound2 verifies every other party's round 1 proof of knowledge and, only
+// if all verify, returns the shares to send to each other party. A failure
+// names the offending parties and releases nothing.
+func (n *Node) DKGRound2(allRound1 map[int]*frost.DKGRound1Output) (*frost.DKGRound2Output, error) {
+	out, err := frost.DKGRound2(n.dkgConfig, n.dkgCoeffs, allRound1)
 	if err != nil {
 		return nil, fmt.Errorf("node %d DKGRound2: %w", n.ID, err)
 	}

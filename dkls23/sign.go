@@ -1,11 +1,11 @@
 package dkls23
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
@@ -13,8 +13,19 @@ import (
 
 // --- πECDSA: 3-round threshold signing protocol (DKLS23 Protocol 3.6) ---
 //
-// The signing protocol uses VOLE for distributed multiplication,
+// The signing protocol uses FRVOLE for distributed multiplication (realized by
+// Protocol 5.2 on top of a fresh OT-extension batch per session, see below),
 // FZero for zero-sharing of key shares, and FCom for commitment to nonce points.
+//
+// Session structure (paper Protocol 3.6):
+//   - Setup (once): FRelaxedKeyGen, the λc base OTs per directed pair (the
+//     one-time setup of the OT extension, §8.1-8.2), and the FZero seeds.
+//   - Round 1 (step 6): commit to R_i; send (sample, sid) to FRVOLE for every
+//     counterparty. In the realization this is Bob's fresh OT-extension batch
+//     (Functionality 5.1 requires a fresh sid per batch), carried in Round1Msg.
+//   - Round 2 (step 7): Alice consumes the batch, runs the VOLE multiply and
+//     sends the decommitment and check values.
+//   - Round 3 (step 8): verification checks and signature fragments.
 //
 // Correctness argument:
 //   sum_i u_i = sum_i r_i * eff_phi_i + sum_{i,j} (c^u_{i,j} + d^u_{i,j})
@@ -22,12 +33,39 @@ import (
 //   sum_i w_i = hash * phi + rx * sk * phi
 //   s = sum(w) / sum(u) = (hash + rx*sk) / R_scalar = standard ECDSA s.
 
-// SignerSetup holds per-signer persistent state initialized once during VOLE setup.
+// BaseOTSenderSeeds is the one-time base-OT output held by the party that acts
+// as base-OT sender for a directed VOLE pair. In the IKNP/KOS role mapping the
+// base-OT sender is the OT-extension receiver, i.e. VOLE Bob.
+type BaseOTSenderSeeds struct {
+	// Seeds0[k] is K^0_k for k ∈ [LambdaC] (32 bytes each).
+	Seeds0 [][]byte
+	// Seeds1[k] is K^1_k for k ∈ [LambdaC] (32 bytes each).
+	Seeds1 [][]byte
+}
+
+// BaseOTReceiverSeeds is the one-time base-OT output held by the party that
+// acts as base-OT receiver for a directed VOLE pair. The base-OT receiver is
+// the OT-extension sender, i.e. VOLE Alice.
+type BaseOTReceiverSeeds struct {
+	// Seeds[k] is K^{Sigma[k]}_k for k ∈ [LambdaC] (32 bytes each).
+	Seeds [][]byte
+	// Sigma are the LambdaC base-OT choice bits (the OT-extension sender's Δ).
+	Sigma []bool
+}
+
+// SignerSetup holds per-signer persistent state initialized once during setup.
 // It is reused across multiple signing sessions.
 //
-// SignerSetup is safe for concurrent use: read-only operations (signing) acquire
-// a read lock, while mutating operations (refresh, blacklisting) acquire a write lock.
-// A SignerSetup must not be copied after first use.
+// Only the base-OT seeds are persistent (DKLS23 §8.2: "setup for endemic OT
+// extension is performed once per pair of parties"). The OT-extension batch
+// and the VOLE correlation derived from it are regenerated inside every
+// signing session; they must never be stored and reused.
+//
+// SignerSetup is safe for concurrent use. Every signing round takes the write
+// lock for its duration, because each round records the session's progress
+// (see SessionIDs) and may blacklist a party; concurrent sessions therefore
+// execute their rounds one at a time within one SignerSetup. Refresh takes
+// the write lock as well. A SignerSetup must not be copied after first use.
 type SignerSetup struct {
 	// mu protects all mutable fields below. Unexported so it is excluded from
 	// JSON serialization and cannot be misused by callers.
@@ -42,65 +80,67 @@ type SignerSetup struct {
 	PubKey []byte
 	// Threshold is the signing threshold t.
 	Threshold int
-	// VoleAlice[j] is the VOLE state where I am Alice and j is Bob (i→j direction).
-	VoleAlice map[int]*VOLEAliceState
-	// VoleBob[j] is the VOLE state where j is Alice and I am Bob (j→i direction).
-	VoleBob map[int]*VOLEBobState
+	// AliceBaseOT[j] holds the base-OT receiver seeds for the directed VOLE
+	// i→j in which this party is Alice (OT-extension sender) and j is Bob.
+	AliceBaseOT map[int]*BaseOTReceiverSeeds
+	// BobBaseOT[j] holds the base-OT sender seeds for the directed VOLE j→i
+	// in which j is Alice and this party is Bob (OT-extension receiver).
+	BobBaseOT map[int]*BaseOTSenderSeeds
 	// FZeroSeeds[j] is the shared FZero seed between this party and party j.
 	FZeroSeeds map[int][16]byte
-	// Blacklist records parties detected cheating; they are excluded from future sessions.
+	// Blacklist records parties detected cheating; they are excluded from future sessions
+	// (paper Protocol 3.6 step 8: "does not participate in any future signature
+	// signing sessions involving Pj").
 	Blacklist map[int]bool
 	// Epoch is the proactive refresh epoch counter, starting at 0 and incremented on each RefreshFinalize.
 	Epoch int
-	// SignCounter is a monotonic counter incremented on each SignRound1 call.
-	// It guards against VOLE correlation reuse after state snapshot rollback:
-	// if a restored SignerSetup has a lower counter than expected, the VOLE
-	// state may have already been consumed by a prior signing session.
-	SignCounter uint64
+	// SessionIDs records, for every signing session id used with this setup in
+	// the current epoch, the last signing round completed for it (1, 2 or 3).
+	// It enforces DKLS23 Protocol 3.6 step 4 ("sigid is not fresh" requests
+	// are ignored): SignRound1 rejects an id that was already used, SignRound2
+	// requires round 1 and rejects a second round 2, SignRound3 requires round
+	// 2 and rejects a second round 3. A session id reuse would reproduce the
+	// session's OT-extension batch, so the map is part of the persisted state.
+	// RefreshFinalize clears it: the refreshed base-OT and FZero seeds re-key
+	// every quantity that depends on the session id, so ids from earlier
+	// epochs cannot collide with the new seeds. Between refreshes it grows by
+	// one entry per session.
+	SessionIDs map[string]int
 }
 
-// SignSetupPairwise assembles a VOLE Alice/Bob state pair from already-exchanged OTE material.
-// The caller is responsible for running the base OT and OTE correction exchange before calling this.
-//
-// Parameters:
-//   - bobSeeds0: Bob (my side) base OT sender seeds K^0_k for k∈[LambdaC].
-//   - aliceSeeds: Alice (my side) base OT receiver seeds K^{sigma_k}_k.
-//   - mySigma: Alice's base OT choice bits (sigma).
-//   - theirCorrections: corrections sent by the other party's Bob for the i→j direction.
-//   - myCorrections: corrections I sent as Bob for the j→i direction.
-//   - myBeta: my OTE receiver input beta for the j→i direction.
-func SignSetupPairwise(
-	myID, theirID int,
-	bobSeeds0 [][]byte,
-	aliceSeeds [][]byte,
-	mySigma []bool,
-	theirCorrections [][Xi / 8]byte,
-	myCorrections [][Xi / 8]byte,
-	myBeta [Xi]bool,
-) (alice *VOLEAliceState, bob *VOLEBobState, err error) {
-	// Alice direction: I am Alice (OTE sender), other party is Bob.
-	alpha0, alpha1, err := OTExtSenderExpand(aliceSeeds, mySigma, theirCorrections)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignSetupPairwise [alice]: %w", err)
-	}
-	alice, err = VOLEAliceSetup(alpha0, alpha1)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignSetupPairwise [alice setup]: %w", err)
-	}
+// Signing-session stages recorded in SignerSetup.SessionIDs.
+const (
+	sessionUnused     = 0
+	sessionRound1Done = 1
+	sessionRound2Done = 2
+	sessionRound3Done = 3
+)
 
-	// Bob direction: I am Bob (OTE receiver), other party is Alice.
-	gamma, err := OTExtReceiverExpand(bobSeeds0, myBeta, myCorrections)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignSetupPairwise [bob]: %w", err)
+// requireSessionStage checks that sigID has completed exactly the round `want`
+// on this setup. The caller must hold setup.mu.
+func (setup *SignerSetup) requireSessionStage(sigID string, want int, phase string) error {
+	got := setup.SessionIDs[sigID]
+	switch {
+	case got == want:
+		return nil
+	case got > want:
+		return &SessionIDReusedError{SigID: sigID, Phase: phase, Detail: fmt.Sprintf("round %d already completed for this session", got)}
+	default:
+		return &InvalidInputError{Phase: phase, Detail: fmt.Sprintf("session id %q has not completed round %d on this SignerSetup", sigID, want)}
 	}
-	bob, err = VOLEBobSample(gamma, myBeta)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignSetupPairwise [bob sample]: %w", err)
-	}
-	return
 }
 
-// voleSIDForPair constructs a deterministic VOLE session ID from signing session ID and party pair.
+// markSessionStage records that sigID completed `stage`. The caller must hold setup.mu.
+func (setup *SignerSetup) markSessionStage(sigID string, stage int) {
+	if setup.SessionIDs == nil {
+		setup.SessionIDs = make(map[string]int)
+	}
+	setup.SessionIDs[sigID] = stage
+}
+
+// voleSIDForPair constructs the session ID of the FRVOLE instance between
+// Alice and Bob for one signing session (paper: Pj‖Pi‖sid‖sigid). The same
+// ID is used for the FEOTE batch inside that instance.
 func voleSIDForPair(sigID string, aliceID, bobID int) string {
 	return fmt.Sprintf("%s:vole:%d->%d", sigID, aliceID, bobID)
 }
@@ -123,15 +163,20 @@ type Round1State struct {
 	Salt [SaltLen]byte
 	// ZetaI is Pi's FZero zero-sharing value for this session.
 	ZetaI btcec.ModNScalar
-	// VoleBobForRound2 holds Pi's VOLE Bob state per counterparty j (Pi is Bob, j is Alice).
+	// VoleBobForRound2 holds Pi's fresh VOLE Bob state per counterparty j
+	// (Pi is Bob, j is Alice), sampled in round 1 for this session only.
 	// Used in round 3 to run VOLEBobReceive against j's VOLE multiply message.
 	VoleBobForRound2 map[int]*VOLEBobState
 }
 
-// Round1Msg is Pi's round 1 broadcast/send to each counterparty.
+// Round1Msg is Pi's round 1 message to counterparty Pj.
 type Round1Msg struct {
-	// Commitment is FCom commitment to R_i*G; sent to all counterparties.
+	// Commitment is FCom commitment to R_i*G; the same value is sent to all counterparties.
 	Commitment [32]byte
+	// OTExt is Pi's fresh OT-extension receiver message for the directed VOLE
+	// j→i (Pj is Alice, Pi is Bob). It realizes (sample, Pj‖Pi‖sid‖sigid) to
+	// FRVOLE in paper step 6 and is specific to Pj.
+	OTExt *OTExtReceiverMsg
 }
 
 // checkBlacklist returns a BlacklistedPartyError if any of the given party IDs
@@ -149,13 +194,31 @@ func checkBlacklist(setup *SignerSetup, partyIDs []int, phase string) error {
 	return nil
 }
 
-// SignRound1 executes round 1 of the threshold signing protocol (paper §3.6, step 1).
+// sampleBeta samples Bob's uniform OT choice bits β ← {0,1}^ξ (paper Protocol 5.2 step 1).
+func sampleBeta() ([Xi]bool, error) {
+	var beta [Xi]bool
+	buf := make([]byte, (Xi+7)/8)
+	if _, err := rand.Read(buf); err != nil {
+		return beta, err
+	}
+	for j := 0; j < Xi; j++ {
+		beta[j] = (buf[j/8]>>(uint(j)%8))&1 == 1
+	}
+	for i := range buf {
+		buf[i] = 0
+	}
+	return beta, nil
+}
+
+// SignRound1 executes round 1 of the threshold signing protocol (paper §3.6, steps 5-6).
 // Pi samples r_i, phi_i, computes R_i = r_i*G and commits to it.
-// Pi also computes its FZero zero-sharing value zeta_i.
-// The pre-shared VoleBob states are used as-is (they were set up during pairing setup).
+// Pi also computes its FZero zero-sharing value zeta_i and, for every
+// counterparty j, samples a fresh FRVOLE instance in which Pi is Bob: a fresh
+// OT-extension batch (Functionality 5.1, fresh sid) whose receiver message is
+// carried in Round1Msg.OTExt.
 func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, map[int]*Round1Msg, error) {
-	setup.mu.RLock()
-	defer setup.mu.RUnlock()
+	setup.mu.Lock()
+	defer setup.mu.Unlock()
 	if err := validatePartyIDs(signers, "SignRound1"); err != nil {
 		return nil, nil, err
 	}
@@ -175,8 +238,13 @@ func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 	if !myIDFound {
 		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: "myID not in signers list"}
 	}
-	// Increment monotonic sign counter (atomic, safe under RLock).
-	atomic.AddUint64(&setup.SignCounter, 1)
+	// Paper step 4: ignore the request unless sigid is fresh.
+	if sigID == "" {
+		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: "session id must be non-empty"}
+	}
+	if err := setup.requireSessionStage(sigID, sessionUnused, "SignRound1"); err != nil {
+		return nil, nil, err
+	}
 
 	// Sample nonce and inversion mask.
 	r_i, err := sampleScalar()
@@ -212,22 +280,33 @@ func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 	}
 	zetaI := FZeroSample(signerSeeds, setup.MyID, []byte(sigID))
 
-	// Collect VOLE Bob states for each counterparty.
+	// FRVOLE sampling phase (paper Protocol 5.2 step 1) for each counterparty j
+	// with Pi as Bob: fresh β, fresh OT-extension batch keyed by this session.
 	bobStates := make(map[int]*VOLEBobState)
-	for _, j := range signers {
-		if j == setup.MyID {
-			continue
-		}
-		bobStates[j] = setup.VoleBob[j]
-	}
-
-	// Build outgoing round 1 messages (FCom commitment broadcast).
 	outMsgs := make(map[int]*Round1Msg)
 	for _, j := range signers {
 		if j == setup.MyID {
 			continue
 		}
-		outMsgs[j] = &Round1Msg{Commitment: com}
+		base := setup.BobBaseOT[j]
+		if base == nil {
+			return nil, nil, &CorruptStateError{Phase: "SignRound1", Detail: fmt.Sprintf("missing base-OT sender seeds for party %d", j)}
+		}
+		beta, err := sampleBeta()
+		if err != nil {
+			return nil, nil, fmt.Errorf("dkls23 SignRound1: sample beta for %d: %w", j, err)
+		}
+		sid := voleSIDForPair(sigID, j, setup.MyID)
+		oteMsg, gamma, err := OTExtReceive(base.Seeds0, base.Seeds1, beta, []byte(sid))
+		if err != nil {
+			return nil, nil, fmt.Errorf("dkls23 SignRound1: OT extension for %d: %w", j, err)
+		}
+		bobState, err := VOLEBobSample(gamma, beta)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dkls23 SignRound1: VOLE sample for %d: %w", j, err)
+		}
+		bobStates[j] = bobState
+		outMsgs[j] = &Round1Msg{Commitment: com, OTExt: oteMsg}
 	}
 
 	state := &Round1State{
@@ -241,6 +320,9 @@ func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 		ZetaI:            zetaI,
 		VoleBobForRound2: bobStates,
 	}
+	// The session's OT-extension batches are about to leave this process:
+	// from here on the id is spent.
+	setup.markSessionStage(sigID, sessionRound1Done)
 	return state, outMsgs, nil
 }
 
@@ -276,13 +358,24 @@ type Round2Msg struct {
 	PKi []byte
 }
 
-// SignRound2 executes round 2 of the threshold signing protocol (paper §3.6, step 2).
-// Pi decommits R_i, runs VOLE multiply with each counterparty (Pi as Alice),
-// and sends gamma, psi, and pki for round 3 verification.
+// SignRound2 executes round 2 of the threshold signing protocol (paper §3.6, step 7).
+// For every counterparty j, Pi (as Alice) consumes j's fresh OT-extension batch
+// from round 1, verifies its consistency check, derives the session's VOLE
+// correlation (Protocol 5.2 step 2), and runs the VOLE multiply (step 3).
+// Pi then decommits R_i and sends gamma, psi, and pki for round 3 verification.
+//
+// If the OT-extension consistency check fails for party j, the shared FRVOLE
+// instance with Pj has aborted: j is blacklisted and a CheatingPartyError is
+// returned (paper step 8).
 func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round1Msg) (*Round2State, map[int]*Round2Msg, error) {
-	setup.mu.RLock()
-	defer setup.mu.RUnlock()
+	setup.mu.Lock()
+	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, state.Signers, "SignRound2"); err != nil {
+		return nil, nil, err
+	}
+	// Round 2 consumes the counterparties' batches and sends this party's VOLE
+	// multiply messages; it may run exactly once per session on this setup.
+	if err := setup.requireSessionStage(state.SigID, sessionRound1Done, "SignRound2"); err != nil {
 		return nil, nil, err
 	}
 
@@ -303,18 +396,37 @@ func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 	c_v := make(map[int]btcec.ModNScalar)
 	outMsgs := make(map[int]*Round2Msg)
 	round1Commits := make(map[int][32]byte)
+	var badParties []int
 
 	for _, j := range state.Signers {
 		if j == setup.MyID {
 			continue
 		}
+		r1j := allRound1[j]
+		if r1j == nil || r1j.OTExt == nil {
+			return nil, nil, &InvalidInputError{Phase: "SignRound2", Detail: fmt.Sprintf("missing round 1 message from party %d", j)}
+		}
 
 		// Record j's round 1 commitment for later verification in round 3.
-		round1Commits[j] = allRound1[j].Commitment
+		round1Commits[j] = r1j.Commitment
 
-		// Pi is Alice in the i→j VOLE direction.
-		aliceState := setup.VoleAlice[j]
+		// Pi is Alice in the i→j VOLE direction: consume j's OT-extension batch.
+		base := setup.AliceBaseOT[j]
+		if base == nil {
+			return nil, nil, &CorruptStateError{Phase: "SignRound2", Detail: fmt.Sprintf("missing base-OT receiver seeds for party %d", j)}
+		}
 		sid := voleSIDForPair(state.SigID, setup.MyID, j)
+		alpha0, alpha1, err := OTExtSend(base.Seeds, base.Sigma, []byte(sid), r1j.OTExt)
+		if err != nil {
+			// FRVOLE instance with Pj aborted (consistency check failed).
+			badParties = append(badParties, j)
+			setup.Blacklist[j] = true
+			continue
+		}
+		aliceState, err := VOLEAliceSetup(alpha0, alpha1)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dkls23 SignRound2: VOLE setup with %d: %w", j, err)
+		}
 		cu, cv, voleMsg, err := VOLEAliceMultiply(aliceState, sid, &state.R_i, &sk_i)
 		if err != nil {
 			return nil, nil, fmt.Errorf("dkls23 SignRound2: VOLE multiply with %d: %w", j, err)
@@ -356,6 +468,10 @@ func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 		}
 	}
 
+	if len(badParties) > 0 {
+		return nil, nil, &CheatingPartyError{PartyIDs: badParties, Phase: "SignRound2", Detail: "OT extension consistency check failed"}
+	}
+
 	state2 := &Round2State{
 		Round1State:   state,
 		SK_i:          sk_i,
@@ -363,6 +479,7 @@ func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 		C_v:           c_v,
 		Round1Commits: round1Commits,
 	}
+	setup.markSessionStage(state.SigID, sessionRound2Done)
 	return state2, outMsgs, nil
 }
 
@@ -374,7 +491,7 @@ type Round3Msg struct {
 	U_i []byte // 32-byte big-endian
 }
 
-// SignRound3 executes round 3 of the threshold signing protocol (paper §3.6, step 3).
+// SignRound3 executes round 3 of the threshold signing protocol (paper §3.6, step 8).
 // Pi receives all round 2 messages, verifies checks 1-3, and outputs signature fragments.
 //
 // Verification checks per counterparty j:
@@ -385,10 +502,19 @@ type Round3Msg struct {
 //  5. Check 3: sum_k pk_k == master_pk
 //
 // If any check fails for party j: blacklist j and return error.
+//
+// The returned map contains one entry per counterparty plus an entry under
+// Pi's own ID holding Pi's own fragment (for use with SignCombine).
 func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRound2 map[int]*Round2Msg) (map[int]*Round3Msg, error) {
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, state2.Signers, "SignRound3"); err != nil {
+		return nil, err
+	}
+	// Round 3 releases this party's signature fragments, which are a function
+	// of the counterparties' round 2 values; releasing fragments for two
+	// different sets of round 2 inputs would reveal r_i. Exactly once per session.
+	if err := setup.requireSessionStage(state2.SigID, sessionRound2Done, "SignRound3"); err != nil {
 		return nil, err
 	}
 
@@ -616,9 +742,10 @@ func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRoun
 		outMsgs[j] = &Round3Msg{W_i: wArr[:], U_i: uArr[:]}
 	}
 
-	// Also return rx through the "self" entry (key = myID).
+	// Also return my own fragment through the "self" entry (key = myID).
 	outMsgs[setup.MyID] = &Round3Msg{W_i: wArr[:], U_i: uArr[:]}
 
+	setup.markSessionStage(state2.SigID, sessionRound3Done)
 	return outMsgs, nil
 }
 
@@ -659,9 +786,13 @@ func ComputeRx(noncePoints map[int][]byte) (btcec.ModNScalar, error) {
 	return rx, nil
 }
 
-// SignCombine collects round 3 fragments and outputs the final ECDSA (r, s) signature.
-// s = sum(w_j) / sum(u_j) mod q; r = rx.
+// SignCombine collects round 3 fragments and outputs the final ECDSA (r, s) signature
+// (paper §3.6, step 10). s = sum(w_j) / sum(u_j) mod q; r = rx.
 // Verifies the signature against the master public key before returning.
+//
+// myW and myU are this party's own fragment. If allRound3 also contains an
+// entry under this party's own ID (as returned by SignRound3), that entry is
+// ignored so the fragment is not counted twice.
 func SignCombine(setup *SignerSetup, rx *btcec.ModNScalar, myW, myU *btcec.ModNScalar, allRound3 map[int]*Round3Msg, message []byte) (r, s []byte, err error) {
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
@@ -670,7 +801,10 @@ func SignCombine(setup *SignerSetup, rx *btcec.ModNScalar, myW, myU *btcec.ModNS
 	sumW.Set(myW)
 	sumU.Set(myU)
 
-	for _, r3j := range allRound3 {
+	for id, r3j := range allRound3 {
+		if id == setup.MyID || r3j == nil {
+			continue
+		}
 		var wj, uj btcec.ModNScalar
 		wj.SetByteSlice(r3j.W_i)
 		uj.SetByteSlice(r3j.U_i)

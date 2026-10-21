@@ -14,17 +14,17 @@ func BenchmarkDKG3of3(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		configs := map[int]DKGPartyConfig{}
-		coeffs := map[int][]btcec.ModNScalar{}
+		privs := map[int]*DKGPrivateState{}
 		r1 := map[int]*DKGRound1Output{}
 		for _, id := range allIDs {
 			cfg := DKGPartyConfig{MyID: id, AllIDs: allIDs, Threshold: threshold}
 			configs[id] = cfg
-			out, c, err := DKGRound1(cfg)
+			out, priv, err := DKGRound1(cfg)
 			if err != nil {
 				b.Fatal(err)
 			}
 			r1[id] = out
-			coeffs[id] = c
+			privs[id] = priv
 		}
 		r2 := map[int]*DKGRound2Output{}
 		for _, id := range allIDs {
@@ -34,14 +34,14 @@ func BenchmarkDKG3of3(b *testing.B) {
 					peers[j] = r1[j]
 				}
 			}
-			out, err := DKGRound2(configs[id], coeffs[id], peers)
+			out, err := DKGRound2(configs[id], privs[id], peers)
 			if err != nil {
 				b.Fatal(err)
 			}
 			r2[id] = out
 		}
 		for _, id := range allIDs {
-			_, _, err := DKGFinalize(configs[id], coeffs[id], r1, r2)
+			_, _, err := DKGFinalize(configs[id], privs[id], r1, r2)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -125,10 +125,25 @@ func BenchmarkSign3of3(b *testing.B) {
 	}
 }
 
-func BenchmarkVOLESetup(b *testing.B) {
+func BenchmarkBaseOTSetup(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, err := runVOLEPairwise()
+		_, _, err := runBaseOT()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkVOLESession(b *testing.B) {
+	b.StopTimer()
+	alice, bob, err := runBaseOT()
+	require.NoError(b, err)
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		sid := []byte(fmt.Sprintf("bench-session-%d", i))
+		_, _, err := runVOLESession(alice, bob, sid)
 		if err != nil {
 			b.Fatal(err)
 		}

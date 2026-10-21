@@ -2,30 +2,33 @@
 
 ## Development Setup
 
-Requires Go 1.24 or later.
+Requires Go 1.26 or later; `go.mod` pins the toolchain that CI uses.
 
 ```bash
-go test -race ./...
+make ci
 ```
+
+runs everything CI runs: gofmt, `go mod tidy` check, `go vet`, staticcheck, the race-detected test suite, coverage, both example programs, a short fuzz pass over every fuzz target, and govulncheck. The individual targets are listed in the Makefile.
 
 ## Code Style
 
-- `gofmt` and `go vet` must pass
-- `staticcheck` must pass
-- Error messages use the format: `"dkls23 FunctionName: description"`
+- `gofmt`, `go vet`, and `staticcheck` must pass
+- Error messages use the format `"dkls23 FunctionName: description"` or `"frost FunctionName: description"`
+- Exported types and functions carry GoDoc comments that cite the paper section or RFC section they implement
 
 ## Testing
 
 - Maintain 90%+ test coverage
 - Add tests for new public API functions and error paths
 - Run with `-race` to catch concurrency issues
+- Tests must assert protocol behaviour, not just the absence of errors; a tampered or malicious input should be shown to be rejected and attributed to the right party
 
 ## Pull Requests
 
 - Keep PRs focused on a single change
 - Include tests for new functionality
-- Update CHANGELOG.md
+- Update `CHANGELOG.md`
 
 ## Security-Sensitive Changes
 
-Changes to cryptographic code (DKG, signing, VOLE, OT, key refresh) require careful review. Please coordinate with maintainers before submitting large changes to these areas.
+All code in `dkls23/` and `frost/` is security-critical. Changes to it must follow the cited specifications (the DKLS23 paper, RFC 9591, the FROST paper, and the papers they reference) rather than introduce new constructions, and must say which section they implement. Please coordinate with the maintainers before submitting large changes to these areas, and report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
