@@ -159,7 +159,8 @@ round-trips, and identifiable abort.
   example does with `node.SessionID`).
 - **No independent human audit**: Both packages were first reviewed by an
   automated audit (Claude Code, Anthropic Claude Opus 4.6). A 2026-10-16
-  follow-up review found that this first audit had missed a critical
+  follow-up review (Claude Code, Anthropic Claude Fable 5.1) found that this
+  first audit had missed a critical
   key-recovery flaw in dkls23 (reuse of the OT-extension batch across signing
   sessions) and several protocol deviations from the cited specifications; all
   are resolved and documented in [`AUDIT.md`](AUDIT.md). Automated review is

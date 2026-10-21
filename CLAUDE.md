@@ -98,6 +98,27 @@ When adding new frost tests:
 - Add `t.Parallel()` to any test that takes >100ms or calls `fullSetup`/`buildDKG`/`fullSign`.
 - Never share mutable state between parallel tests; each test should own its setup.
 
+## Rules for Protocol Changes
+
+These rules exist because the 2026-10-16 review found that earlier code had drifted from the specifications in ways that were exploitable (see AUDIT.md). They apply to every change under `dkls23/` and `frost/`.
+
+1. **Implement the cited specification; never invent.** dkls23 follows the DKLS23 paper (ePrint 2023/765) and the papers it delegates to: KOS15 (ePrint 2015/546) for the OT extension, Masny-Rindal (ePrint 2019/706) for the base OT, KMOS21 (ePrint 2019/1328) for refresh. frost follows RFC 9591 and, for the DKG the RFC does not specify, the FROST paper (ePrint 2020/852). Every protocol function's GoDoc names the protocol, figure, or section it implements. Where a spec leaves a detail open (an encoding, a domain tag, a hash input order), choose the simplest unambiguous option and document it in the GoDoc and in AUDIT.md.
+2. **Only one-time setup material is persistent in dkls23.** `SignerSetup` stores base-OT seeds and FZero seeds. OT-extension batches and VOLE correlations are per signing session and must never be stored, cached, or reused; reuse leaks nonce differences and the key.
+3. **Validate everything received before use.** Lengths, canonical encodings, points on the curve, and for frost the full RFC 9591 §6.1 `DeserializeElement` rules (non-identity, prime-order subgroup) via `deserializeElement`. Misbehaviour is attributed to a party with `CheatingPartyError` and the party is blacklisted only where the spec says attribution is sound.
+4. **No secret-dependent control flow or memory access.** Secret bits select with masks or `subtle.ConstantTimeCopy`; secret scalars use the constant-time scalar types; `math/big` only on public values; ephemeral secrets are zeroized.
+5. **Versioned wire formats.** Any change to a persisted type bumps the package's wire-format version constant and keeps a rejection test for old or missing versions.
+6. **Tests prove behaviour, not absence of errors.** New protocol code needs: a correctness test, a tampering test for each received field showing rejection and attribution, and where vectors exist a vector test. `frost/vectors_test.go` (RFC 9591 Appendix E.1) and `dkls23` `TestSignSessionsUseFreshVOLE` must keep passing unchanged.
+7. **Documentation follows the code.** Security-relevant findings get an ID in AUDIT.md; SECURITY.md claims must stay true; CHANGELOG.md gets an entry; breaking changes are listed in the README's upgrading section.
+
+Spec sources: RFCs from rfc-editor.org as text. IACR ePrint blocks scripted downloads; the Wayback Machine serves the PDFs (`https://web.archive.org/web/<year>id_/https://eprint.iacr.org/<paper>.pdf`), and `pdftotext -layout` gives a greppable text.
+
+## Release Checklist
+
+1. `make ci` green on the release commit.
+2. CHANGELOG.md: rename `Unreleased` to the version and date, update the compare link.
+3. README.md: the upgrading section names the version being upgraded from.
+4. Tag `vX.Y.Z` on `main`. Go's semantic import versioning means a v2 or later requires the module path to end in `/vN`; v1 does not.
+
 ## Security-Sensitive Areas
 
 All code in `dkls23/` and `frost/` is security-critical.

@@ -43,6 +43,8 @@ proof-of-concept test. All of them are resolved in the current source.
 the DKLS23 paper (ePrint 2023/765, Protocols 3.6, 5.2, 7.1, §5.1, §8.1-8.2),
 RFC 9591, the FROST paper (ePrint 2020/852, Figure 1) and MR19 (ePrint
 2019/706, Figure 8, Appendix D.1).
+**Reviewer**: Claude Code (Anthropic Claude Fable 5.1); automated review,
+not a substitute for an independent third-party audit.
 **Method**: independent source review, exploit construction, and
 re-implementation of the deviating components to match the cited
 specifications. The exploit for FU-CRIT-1 was written as a Go test and run

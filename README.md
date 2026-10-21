@@ -188,7 +188,7 @@ Both packages were reviewed by an automated audit, and a 2026-10-16 follow-up re
 
 ## Authors
 
-Co-authored by [Chris Almeida](https://github.com/chrisalmeida) and [Claude Code](https://claude.ai/code) (Anthropic Claude Opus 4.6).
+Co-authored by [Chris Almeida](https://github.com/chrisalmeida) and [Claude Code](https://claude.ai/code) (Anthropic Claude Fable 5.1).
 
 ## References
 
