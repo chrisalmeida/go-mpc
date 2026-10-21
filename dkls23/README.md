@@ -37,13 +37,22 @@ fresh VOLE correlation from it. Nothing derived inside a signing session is
 stored or reused: reusing an OT-extension batch across two sessions reveals
 the difference of the signer's nonces and allows full key recovery.
 
-Round structure (Protocol 3.6):
+---
 
-| Round | Message carries | Paper step |
-|---|---|---|
-| 1 | FCom commitment to R_i; Bob's OT-extension batch (corrections + consistency proof) for each counterparty | 5-6 |
-| 2 | Decommitment of R_i; VOLE multiply message; Γ^u, Γ^v, ψ, pk_i | 7 |
-| 3 | Signature fragments w_i, u_i after checks 1-3 | 8 |
+## Protocol flow
+
+| Phase | Calls | Messages | Paper |
+|---|---|---|---|
+| DKG round 1 | `DKGRound1` | broadcast FCom commitments (nothing revealed) | 7.1 step 2 |
+| DKG round 2 | `DKGRound2` (needs every peer's round 1) | Feldman commitments + salt, one share + salt per peer | 7.1 step 3 |
+| DKG finalize | `DKGFinalize` | — | 7.1 step 4 |
+| Base OT (per directed pair, one-time) | `BaseOTReceiverRound1` → `BaseOTSenderRound2` → `BaseOTReceiverFinalize` | receiver's (r_0, r_1) pairs; sender's (m_0, m_1) pairs | §8.1 |
+| FZero seed (per pair, one-time) | `FZeroSetupRound1` → `FZeroSetupFinalize` | seed commitment; seed + salt | §3.1 |
+| Sign round 1 | `SignRound1` | FCom commitment to R_i; the session's OT-extension batch for each counterparty | 3.6 steps 5-6 |
+| Sign round 2 | `SignRound2` (verifies each batch, derives the VOLE) | decommitment of R_i; VOLE multiply message; Γ^u, Γ^v, ψ, pk_i | 3.6 step 7 |
+| Sign round 3 | `SignRound3` (checks 1-3) | signature fragments w_i, u_i | 3.6 step 8 |
+| Combine | `ComputeRx`, `SignCombine` (verifies the signature) | — | 3.6 step 10 |
+| Refresh | `RefreshRound1` → `RefreshRound2` → `RefreshFinalize` | Feldman commitments, seed commitments; shares + seeds | KMOS21 |
 
 A counterparty whose OT-extension batch fails the consistency check, whose
 VOLE proof fails, or whose decommitment or check values are inconsistent is

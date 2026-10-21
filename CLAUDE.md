@@ -17,7 +17,10 @@ make test          # run all tests
 make test-race     # run with race detector (what CI runs)
 make bench         # run benchmarks
 make cover         # show coverage summary
-make lint          # go vet + staticcheck
+make lint          # gofmt + go vet + staticcheck
+make fuzz          # run every fuzz target briefly
+make vuln          # govulncheck
+make examples      # build and run both demos
 make ci            # full CI pipeline locally
 ```
 
