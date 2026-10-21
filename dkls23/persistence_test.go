@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"testing"
@@ -120,11 +121,24 @@ func TestUnmarshalSetupWrongVersion(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "version")
 
-	// A future version must be rejected rather than misread.
-	bumped := []byte(`{"version":99,` + string(data[len(`{"version":1,`):]))
+	// A future version must be rejected rather than misread: rewrite only the
+	// version field of an otherwise valid document.
+	var doc map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &doc))
+	require.JSONEq(t, "1", string(doc["version"]))
+	doc["version"] = json.RawMessage("99")
+	bumped, err := json.Marshal(doc)
+	require.NoError(t, err)
 	_, err = UnmarshalSetup(bumped)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "version")
+	require.Contains(t, err.Error(), "version 99")
+
+	// The same document with the correct version still loads.
+	doc["version"] = json.RawMessage("1")
+	ok, err := json.Marshal(doc)
+	require.NoError(t, err)
+	_, err = UnmarshalSetup(ok)
+	require.NoError(t, err)
 }
 
 func TestMarshalEncryptedEncryptError(t *testing.T) {

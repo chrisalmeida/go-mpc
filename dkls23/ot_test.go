@@ -61,7 +61,7 @@ func assertValidDistinctPoints(t *testing.T, name string, k int, a, b []byte) {
 	require.NotEqual(t, a, b, "%s_0 and %s_1 must be distinct at k=%d", name, name, k)
 }
 
-func TestBaseOT(t *testing.T) {
+func TestBaseOTCorrectness(t *testing.T) {
 	t.Parallel()
 	choices := randomBools(t, LambdaC)
 	input := append([]bool(nil), choices...)
@@ -127,11 +127,12 @@ func TestBaseOTBothChoiceValues(t *testing.T) {
 	}
 }
 
-func TestBaseOTReceiverMsgIsIndependentOfChoice(t *testing.T) {
+func TestBaseOTReceiverMsgIsFreshAndWellFormed(t *testing.T) {
 	t.Parallel()
-	// Receiver security is endemic: regardless of the choice bit both r_0 and
-	// r_1 are valid, distinct points and nothing in the message is a fixed
-	// function of c. This is a sanity check, not a distinguishing test.
+	// For either choice bit both r_0 and r_1 are valid, distinct points, and
+	// two runs with the same choices produce different messages. This is a
+	// well-formedness and freshness check; it is not a statistical test of
+	// receiver privacy (which MR19 Theorem 4.1 establishes).
 	for _, c := range []bool{false, true} {
 		state, msg, err := BaseOTReceiverRound1([]bool{c, c, c})
 		require.NoError(t, err)
@@ -370,10 +371,11 @@ func TestBaseOTSenderRejectsIdentityForcingMessage(t *testing.T) {
 	require.Contains(t, err.Error(), "point at infinity")
 }
 
-func TestBaseOTSwappedReplyYieldsOtherSeed(t *testing.T) {
+func TestBaseOTSwappedReplyYieldsUnrelatedSeed(t *testing.T) {
 	t.Parallel()
-	// Swapping m_{B,0} and m_{B,1} makes the receiver agree on the other key:
-	// the seed is a function of the agreed Diffie-Hellman key, not of c alone.
+	// Swapping m_{B,0} and m_{B,1} makes the receiver derive a key that is
+	// neither K^0 nor K^1: the seed is a function of the agreed Diffie-Hellman
+	// key, not of c alone.
 	choices := []bool{false, true}
 	state, msg, err := BaseOTReceiverRound1(choices)
 	require.NoError(t, err)

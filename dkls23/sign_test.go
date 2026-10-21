@@ -507,7 +507,10 @@ func TestSignBadVOLEMessage(t *testing.T) {
 	require.Equal(t, []int{2}, cheat.PartyIDs)
 }
 
-func TestSignBadGammaAndPK(t *testing.T) {
+// TestSignRound3RejectsMalformedCheckValues: every round 2 field that round 3
+// parses (Γ^u, Γ^v, pk_i, the decommitted R_j) is replaced in turn with a
+// wrong or unparseable value; the sender must be identified and blacklisted.
+func TestSignRound3RejectsMalformedCheckValues(t *testing.T) {
 	t.Parallel()
 	setups := fullSetup(t)
 	signers := []int{1, 2, 3}

@@ -2,6 +2,8 @@ module github.com/chrisalmeida/go-mpc
 
 go 1.25.0
 
+toolchain go1.26.1
+
 require (
 	filippo.io/edwards25519 v1.2.0
 	github.com/btcsuite/btcd/btcec/v2 v2.3.6

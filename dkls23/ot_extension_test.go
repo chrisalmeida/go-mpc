@@ -150,7 +150,7 @@ func maliciousOTExtReceive(t *testing.T, f *oteFixture, sid []byte, badRow, badC
 	return msg
 }
 
-func TestOTExtension(t *testing.T) {
+func TestOTExtensionCorrectness(t *testing.T) {
 	t.Parallel()
 	f := newOTEFixture(t)
 	sid := []byte("ote-test-session-1")
@@ -599,7 +599,10 @@ func TestOTExtReceiverMsgJSONErrors(t *testing.T) {
 	require.Len(t, v.U, LambdaC)
 }
 
-func TestOTEHelpers(t *testing.T) {
+// TestOTExtensionBitPacking checks the bit-vector helpers that carry beta,
+// sigma and the matrix columns: packing order, pad handling, column
+// extraction, and the XOR/AND primitives.
+func TestOTExtensionBitPacking(t *testing.T) {
 	t.Parallel()
 	// boolsToBitVec packs beta into the first Xi bits with a zero pad.
 	var beta [Xi]bool
@@ -653,7 +656,13 @@ func TestOTEHelpers(t *testing.T) {
 	for i := range x {
 		require.Equal(t, byte(i)^0xFF, x[i])
 	}
+}
 
+// TestOTExtensionPRGAndChallengeKeying checks that the row PRG is keyed by
+// both the base seed and the session id, and that the Fiat-Shamir challenge
+// is deterministic in (sid, U) and sensitive to every bit of either.
+func TestOTExtensionPRGAndChallengeKeying(t *testing.T) {
+	t.Parallel()
 	// prg is keyed by both seed and sid.
 	seed := make([]byte, 32)
 	seed2 := make([]byte, 32)
@@ -671,8 +680,13 @@ func TestOTEHelpers(t *testing.T) {
 	U[LambdaC-1][XiExt/8-1] ^= 0x80
 	c3 := oteChallenge([]byte("a"), U)
 	require.NotEqual(t, c1, c3)
+}
 
-	// oteSeedHash separates choice bit, index, column and sid.
+// TestOTExtensionSeedHashDomainSeparation checks that the per-column OT
+// output seed is separated by choice bit, column index, column value and
+// session id.
+func TestOTExtensionSeedHashDomainSeparation(t *testing.T) {
+	t.Parallel()
 	var col gf128
 	base := oteSeedHash(false, 0, []byte("s"), col)
 	require.Len(t, base, 32)

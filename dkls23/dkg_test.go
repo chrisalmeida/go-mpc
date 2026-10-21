@@ -147,10 +147,10 @@ func TestDKGFeldmanDecommitMismatch(t *testing.T) {
 	require.Equal(t, []int{2}, cheat.PartyIDs)
 }
 
-// TestDKGBadFeldmanCommitment: a party changes its polynomial after seeing the
-// others' commitments (rushing adversary). Its round 1 commitment no longer
-// opens to the revealed Feldman points.
-func TestDKGBadFeldmanCommitment(t *testing.T) {
+// TestDKGRejectsPolynomialChangedAfterCommitment: a party changes its
+// polynomial after seeing the others' commitments (rushing adversary). Its
+// round 1 commitment no longer opens to the revealed Feldman points.
+func TestDKGRejectsPolynomialChangedAfterCommitment(t *testing.T) {
 	allIDs := []int{1, 2, 3}
 	allRound1, allRound2, allPriv := runDKGRounds(t, allIDs, 2)
 
@@ -196,7 +196,9 @@ func TestDKGWrongCommitmentCount(t *testing.T) {
 	require.Equal(t, []int{2}, cheat.PartyIDs)
 }
 
-func TestDKGBadShare(t *testing.T) {
+// TestDKGRejectsShareInconsistentWithCommitments: a party sends a share that
+// opens its hash commitment but does not lie on the committed polynomial.
+func TestDKGRejectsShareInconsistentWithCommitments(t *testing.T) {
 	allIDs := []int{1, 2, 3}
 	allRound1, allRound2, allPriv := runDKGRounds(t, allIDs, 2)
 

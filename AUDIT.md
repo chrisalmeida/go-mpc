@@ -190,6 +190,12 @@ different commitment lists makes an honest signer's share fail verification,
 so automatic permanent blacklisting is only safe with an honest or
 reliable-broadcast Coordinator.
 
+The sections that follow this one are the original review's text, preserved
+as a historical record. Where it describes mechanisms that the follow-up
+review removed or replaced (for example the `SignCounter` field, the previous
+base OT, or the claim that non-canonical points were rejected), the follow-up
+entries above take precedence.
+
 ### FU-LOW-4: Base OT was not the specified protocol — RESOLVED
 
 **File**: `ot.go`

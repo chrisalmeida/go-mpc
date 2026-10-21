@@ -51,8 +51,8 @@ fuzz:
 
 # Scan dependencies and call graph for known vulnerabilities
 vuln:
-	go install golang.org/x/vuln/cmd/govulncheck@latest
-	govulncheck ./...
+	go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+	go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
 # Build and run the example modules
 examples:
