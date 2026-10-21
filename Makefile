@@ -41,11 +41,11 @@ staticcheck:
 # Run all linters
 lint: fmt vet staticcheck
 
-# Run every fuzz target briefly
+# Run every fuzz target briefly (see scripts/fuzz-smoke.sh for the retry rule)
 fuzz:
 	@for pkg in ./dkls23 ./frost; do \
 		for target in $$(go test -list 'Fuzz.*' $$pkg | grep '^Fuzz'); do \
-			go test $$pkg -run '^$$' -fuzz "^$$target\$$" -fuzztime 5s || exit 1; \
+			./scripts/fuzz-smoke.sh $$pkg $$target 5s || exit 1; \
 		done; \
 	done
 

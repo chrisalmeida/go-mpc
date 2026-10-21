@@ -50,7 +50,7 @@ jobs:
         run: |
           for pkg in ./dkls23 ./frost; do
             for target in $(go test -list 'Fuzz.*' $pkg | grep '^Fuzz'); do
-              go test $pkg -run '^$' -fuzz "^${target}\$" -fuzztime 5s
+              ./scripts/fuzz-smoke.sh $pkg $target 5s
             done
           done
 
