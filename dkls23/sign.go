@@ -223,6 +223,10 @@ func sampleBeta() ([Xi]bool, error) {
 // carried in Round1Msg.OTExt.
 // The configured group and all pairwise material for the selected signers
 // are checked before sampling or returning any round output.
+//
+// This round takes no message. Paper §3.3 places its pipelining point after
+// it and its presigning point before round 3; see SignRound3 and AUDIT.md
+// FU-LOW-8 for the policy on running rounds ahead of the message.
 func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, map[int]*Round1Msg, error) {
 	if setup == nil {
 		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: "setup is required"}
@@ -513,6 +517,13 @@ type Round3Msg struct {
 // The local nonce, FZero value, masked share and retained peer-map entries
 // are checked before processing peer messages. These checks do not establish
 // the origin of a restored state or replace caller-side replay protection.
+//
+// The message enters the protocol here, the presigning point of paper §3.3.
+// Running rounds 1 and 2 before the message is known is therefore possible
+// but is an explicit opt-in under the paper's warning: a retained Round2State
+// is a presignature and must complete exactly one message, which the session
+// stage record enforces by rejecting a second round 3 for the same session id
+// (AUDIT.md FU-LOW-8).
 func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRound2 map[int]*Round2Msg) (map[int]*Round3Msg, error) {
 	if setup == nil || state2 == nil || state2.Round1State == nil {
 		return nil, &InvalidInputError{Phase: "SignRound3", Detail: "setup and round 2 state are required"}

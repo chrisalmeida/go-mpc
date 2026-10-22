@@ -303,6 +303,7 @@ only, as described under Known Limitations.
 | Session guard: at most one committed result per round across connections; rolled-back attempts can be recomputed without releasing uncommitted output; stale backups, nonce reuse, failed commits, callback errors and panics, protocol aborts | `TestRoundsCommitOnceAcrossConnections`, `TestRolledBackRoundCanBeRecomputedBeforeCommit`, `TestStaleBackupAndNonceReuseAreRejected`, `TestCommitFailuresReleaseNoOutputAndRecoverFromStore`, `TestComputationFailureAndPanicRollBack`, `TestProtocolAbortCommitsBlacklistButWithholdsOutput` in [session/guard_test.go](session/guard_test.go); end to end, DKLS23 `TestTransactionalSigningRecoversCommittedRoundAndRejectsCopies` and FROST `TestTransactionalSigningRecoversCommitmentAndConsumesRestoredNoncesOnce` in each `store_test.go` |
 | Session guard: refresh quiescence and activation, durable abort and blacklist, invalid requests and updates, corrupt records, store faults and contract violations | `TestRefreshQuiescesSigningAndRequiresExplicitActivation`, `TestAbortAndBlacklistSurviveReopening` in [session/guard_test.go](session/guard_test.go); `TestInvalidRequestsAreRejectedBeforeCompute`, `TestInvalidUpdatesAreRejectedWithoutCommit`, `TestCorruptRecordsAreReportedNotRepaired`, `TestProgressAndAbortRulesAcrossOperations`, `TestRefreshAbortAndActivationConsistency`, `TestStoreErrorsPropagateAndCommitNothing`, `TestStoreContractViolationsAreReported` in [session/guard_rules_test.go](session/guard_rules_test.go) |
 | Store contract checks (atomic commit, rollback on error and panic preserving complete committed records and nonce reservations, no aliasing, serialized connections, namespaces) and the test model's fault injection | `storetest.Run` via `TestModelStorageContract`, `TestConformanceRejectsDestructiveRollback` and `TestModelInjectsOneCommitFailureAndHonorsCancellation` in [session/storetest](session/storetest); a finite conformance run does not establish every part of the contract or a backend's physical durability |
+| DKLS23 message enters at round 3; a presignature completes exactly one message | `TestSignPresignatureCompletesExactlyOneMessage` in [dkls23/presign_test.go](dkls23/presign_test.go); specification check in AUDIT.md FU-LOW-8 |
 | Persistence version checks | DKLS23 `TestEncodingSignerSetupVersion`; FROST `TestWireFormatVersion` in each `encoding_test.go` |
 
 ## Known Limitations
@@ -350,6 +351,16 @@ only, as described under Known Limitations.
   cannot see each other's records. The `session` package's revision check
   rejects the older of two copies once the authoritative store has advanced,
   provided the store itself was not restored alongside the signer.
+- **DKLS23 pipelining and pre-signing**: `SignRound1` and `SignRound2` take no
+  message; it enters at `SignRound3`, which is where DKLS23 §3.3 places it for
+  pre-signing. Running round 1 ahead (pipelining) keeps the paper's standard
+  security argument. Running rounds 1 and 2 ahead (pre-signing) rests on Groth
+  and Shoup's stronger assumption; the paper calls the protocol compatible with
+  it but warns that it is for those who accept the risk. A stored round-2 state
+  is nonce material: it must complete exactly one message, must never rest
+  unencrypted, and must be consumed or aborted before a refresh.
+  `TestSignPresignatureCompletesExactlyOneMessage` backs the single-use claim;
+  AUDIT.md FU-LOW-8 records the specification check.
 - **Peer transcript replay and distributed recovery**: Local lifetime checks
   do not provide reliable broadcast, fresh authenticated peer transcript
   envelopes, distributed commit, or backup rollback protection. Implement

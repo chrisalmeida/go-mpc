@@ -6,7 +6,7 @@
 **Auditor**: Automated cryptographic review (not a substitute for an independent third-party audit)
 
 **2026-10-21 hardening addendum**: see FU-HIGH-2, FU-HIGH-3 and
-FU-MED-5 through FU-MED-12 and FU-LOW-7 below. These include implementation fixes, an open
+FU-MED-5 through FU-MED-12, FU-LOW-7 and FU-LOW-8 below. These include implementation fixes, an open
 state-association finding and regression evidence from an automated source
 review, not an independent audit or a
 production-security certification. Remaining gates are in
@@ -681,6 +681,54 @@ the completed signatures.
 side effects are requirements on caller-written codecs; the generic guard
 cannot enforce them. Fault tests use the in-memory transaction model and
 do not establish a backend's physical durability.
+
+### FU-LOW-8: DKLS23 pipelining and pre-signing — SPECIFICATION CHECKED
+
+**Files**: `dkls23/sign.go` (GoDoc), `dkls23/presign_test.go`, `SECURITY.md`,
+`docs/encrypted-state-and-cold-signing.md`
+**Severity**: Low (usage policy and documentation; no defect)
+**Category**: Specification conformance
+**Specification**: DKLS23 §3.3 "Pipelining and Presigning"; Protocol 3.6 marks
+"if pipelining, supply m here" after round 1 and "if presigning, supply m
+here" before round 3; Functionality 3.7; Groth and Shoup [GS22b].
+
+**Question**: cold signing benefits from running the message-independent
+rounds before the message is known. Does the paper cover that use?
+
+**Answer from the paper**: two modes. *Pipelining* runs round 1 before the
+message; R is fixed only in round 2, so the standard order of quantifiers is
+respected and the signatures are secure if single-party ECDSA is, under the
+revised Functionality 3.7. *Presigning* runs rounds 1 and 2 before the message;
+the environment can then condition the message on R, which does not preserve
+the standard order of quantifiers. The paper relies on Groth and Shoup's proof
+under a new assumption on SHA2 in a variant of the generic group model, states
+that the attack conditions Groth and Shoup identify do not apply to the
+protocol as presented, warns that presigning should only be used by those who
+understand and accept its risks, and states that the protocol is compatible
+with it.
+
+**Implementation status**: `SignRound1` and `SignRound2` take no message and
+`SignRound3` takes it, which is the paper's presigning point, so neither mode
+needs a code change. A retained round-2 state is a presignature: completing it
+with two different messages would yield two signatures under one nonce and
+reveal the key. The session stage record already refuses a second round 3 for
+the same session id with `SessionIDReusedError`.
+
+**Policy**: pipelining is acceptable generally. Presigning is an explicit
+opt-in under the paper's warning, and a presignature is handled as nonce
+material: it completes exactly one message, never rests unencrypted, is
+consumed or aborted before a refresh, and is never shared between copies.
+Additive key derivation is out of scope for this library; because the Groth and
+Shoup analysis singles out that combination, presigning must be re-evaluated
+before any derivation feature is ever added.
+
+**Tested**: `TestSignPresignatureCompletesExactlyOneMessage` runs rounds 1 and
+2 without a message, supplies it at round 3, verifies the signature with btcec,
+and shows every party rejects a second message for the same presignature with
+`SessionIDReusedError`. **Only read**: §3.3, Functionality 3.7 and the [GS22b]
+citation as stated by DKLS23; the Groth and Shoup paper itself was not read
+for this entry, and no claim is made about its assumption beyond what DKLS23
+states.
 
 ---
 

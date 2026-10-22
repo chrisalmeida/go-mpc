@@ -22,6 +22,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- **dkls23: document pipelining and pre-signing per DKLS23 §3.3.** Rounds 1
+  and 2 take no message and round 3 does, which is the paper's pre-signing
+  point. Pipelining is acceptable generally; pre-signing is an explicit opt-in
+  under the paper's warning, and a presignature completes exactly one message,
+  enforced by the session stage record and covered by a regression test. No
+  code change. (AUDIT.md FU-LOW-8)
 - **session: strengthen rollback conformance and narrow execution claims.**
   `storetest.Run` now checks that errors and panics preserve previously
   committed key/session records, cached outputs and nonce reservations while
