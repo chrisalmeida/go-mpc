@@ -1,11 +1,93 @@
 package dkls23
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/stretchr/testify/require"
 )
+
+// TestRejectedUnmarshalPreservesReceiver checks the remaining custom wire
+// decoders in addition to the live-session import tests. A late decode error
+// must not publish earlier fields or zero the field whose decoding failed.
+func TestRejectedUnmarshalPreservesReceiver(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	var one btcec.ModNScalar
+	one.SetInt(1)
+	bob := &VOLEBobState{Chi: one, Gamma: make([][Ell + Rho][32]byte, 1)}
+	bob.Beta[0], bob.Gamma[0][0][0] = true, 1
+	alice := &VOLEAliceState{Alpha0: bob.Gamma, Alpha1: bob.Gamma, C_u: one, C_v: one}
+	multiply := &VOLEMultiplyMsg{SID: "preserve", Mu: [32]byte{1}}
+	multiply.ATilde[0][0][0], multiply.Eta[0][0] = 1, 1
+	ote := &OTExtReceiverMsg{U: make([][XiExt / 8]byte, LambdaC), XBar: [16]byte{1}, TBar: [16]byte{2}}
+	ote.U[0][0] = 1
+	for _, tc := range []struct {
+		name   string
+		target any
+		fields []string
+	}{
+		{"DKGRound1Output", &DKGRound1Output{FeldmanCommitment: [32]byte{1}, PairwiseCommitments: map[int][32]byte{2: {2}}}, []string{"feldman_commitment", "pairwise_commitments"}},
+		{"DKGRound2Output", &DKGRound2Output{FeldmanCommitments: [][]byte{{1}}, FeldmanSalt: [32]byte{2}, SecretShares: map[int][]byte{2: {3}}, PairwiseSalts: map[int][SaltLen]byte{2: {4}}}, []string{"feldman_commitments", "feldman_salt", "secret_shares", "pairwise_salts"}},
+		{"BaseOTSenderSeeds", setups[1].BobBaseOT[2], []string{"seeds0", "seeds1"}},
+		{"BaseOTReceiverSeeds", setups[1].AliceBaseOT[2], []string{"seeds", "sigma"}},
+		{"OTExtReceiverMsg", ote, []string{"u", "x_bar", "t_bar"}},
+		{"VOLEBobState", bob, []string{"beta", "chi", "gamma"}},
+		{"VOLEAliceState", alice, []string{"alpha0", "alpha1", "c_u", "c_v"}},
+		{"VOLEMultiplyMsg", multiply, []string{"a_tilde", "eta", "mu"}},
+		{"Round1Msg", &Round1Msg{Commitment: [32]byte{1}, OTExt: ote}, []string{"commitment", "ot_ext"}},
+		{"Round2Msg", &Round2Msg{Decommitment: []byte{1}, Salt: [SaltLen]byte{2}, VoleMsg: multiply, GammaU: []byte{3}, GammaV: []byte{4}, Psi: []byte{5}, PKi: []byte{6}}, []string{"decommitment", "salt", "vole_msg", "gamma_u", "gamma_v", "psi", "pki"}},
+		{"Round3Msg", &Round3Msg{W_i: []byte{1}, U_i: []byte{2}}, []string{"w_i", "u_i"}},
+		{"RefreshRound1Output", &RefreshRound1Output{FeldmanCommitments: [][]byte{{1}}, PairwiseCommitments: map[int][32]byte{2: {2}}, PairwiseSalts: map[int][SaltLen]byte{2: {3}}, SeedCommitment: [32]byte{4}, SeedSalt: [SaltLen]byte{5}}, []string{"feldman_commitments", "pairwise_commitments", "pairwise_salts", "seed_commitment", "seed_salt"}},
+		{"RefreshRound2Output", &RefreshRound2Output{SecretShares: map[int][]byte{2: {1}}, Seed: [16]byte{2}}, []string{"secret_shares", "seed"}},
+		{"FZeroCommitMsg", &FZeroCommitMsg{Commitment: [32]byte{1}}, []string{"commitment"}},
+		{"FZeroRevealMsg", &FZeroRevealMsg{Seed: [16]byte{1}, Salt: [SaltLen]byte{2}}, []string{"seed", "salt"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, err := json.Marshal(tc.target)
+			require.NoError(t, err)
+			for _, field := range tc.fields {
+				t.Run(field, func(t *testing.T) {
+					require.NoError(t, json.Unmarshal(before, tc.target))
+					var fields map[string]json.RawMessage
+					require.NoError(t, json.Unmarshal(before, &fields))
+					original, ok := fields[field]
+					require.True(t, ok, "fixture must contain %s", field)
+					switch original[0] {
+					case '"':
+						fields[field] = json.RawMessage(`"ZZ"`)
+					case '[':
+						fields[field] = json.RawMessage(`["ZZ"]`)
+					case '{':
+						fields[field] = json.RawMessage(`{"invalid":"ZZ"}`)
+					default:
+						t.Fatalf("unsupported fixture field %s", field)
+					}
+					// A full-size U array reaches row decoding rather than merely
+					// failing the row-count check.
+					if field == "u" {
+						rows := make([]string, LambdaC)
+						for i := range rows {
+							rows[i] = strings.Repeat("00", XiExt/8)
+						}
+						rows[LambdaC-1] = "ZZ"
+						fields[field], err = json.Marshal(rows)
+						require.NoError(t, err)
+					}
+					rejected, err := json.Marshal(fields)
+					require.NoError(t, err)
+					require.Error(t, json.Unmarshal(rejected, tc.target))
+					after, err := json.Marshal(tc.target)
+					require.NoError(t, err)
+					require.True(t, bytes.Equal(before, after), "rejected %s changed receiver", field)
+				})
+			}
+		})
+	}
+}
 
 // bad is invalid hex that passes JSON parsing but fails hex/base64 decoding.
 const bad = "ZZZZ"

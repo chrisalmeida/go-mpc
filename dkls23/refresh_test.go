@@ -295,9 +295,20 @@ func TestRefreshBadFeldman(t *testing.T) {
 		allSeeds[id] = seed
 	}
 
-	// Party 2 corrupts its Feldman commitments (the committed polynomial no
-	// longer matches the shares that will be revealed in round 2).
-	allR1[2].FeldmanCommitments[0][1] ^= 0xff
+	// Use a different valid point, reaching the Feldman equation rather than
+	// relying on a point-decoding failure to reject the transcript.
+	changed := allCoeffs[2][0]
+	var one btcec.ModNScalar
+	one.SetInt(1)
+	changed.Add(&one)
+	if changed.IsZero() {
+		changed.SetInt(1)
+	}
+	point, err := scalarMulGCompressed(&changed)
+	require.NoError(t, err)
+	allR1[2].FeldmanCommitments[0] = point
+	_, err = compressedToPoint(point)
+	require.NoError(t, err)
 
 	allR2 := make(map[int]*RefreshRound2Output)
 	for _, id := range allIDs {
@@ -309,9 +320,9 @@ func TestRefreshBadFeldman(t *testing.T) {
 	// Party 1 and party 3 must detect party 2's bad Feldman.
 	for _, id := range []int{1, 3} {
 		err := RefreshFinalize(setups[id], allCoeffs[id], allSeeds[id], allR1, allR2)
-		require.Error(t, err, "party %d must detect bad Feldman from party 2", id)
-		require.Contains(t, err.Error(), "2", "error must identify party 2 as bad sender")
-		t.Logf("party %d correctly detected bad Feldman from party 2: %v", id, err)
+		var cheating *CheatingPartyError
+		require.ErrorAs(t, err, &cheating, "party %d must detect bad Feldman from party 2", id)
+		require.Equal(t, []int{2}, cheating.PartyIDs)
 	}
 }
 
@@ -366,6 +377,30 @@ func TestRefreshBaseOTSeedsStayCorrelated(t *testing.T) {
 			require.NoError(t, err, "pair %d→%d: OT extension over refreshed seeds", i, j)
 		}
 	}
+}
+
+// FZero refresh must change each pair's shared seed without breaking its
+// agreement or the zero-sharing used by the signing protocol.
+func TestRefreshFZeroSeedsChangeAndMatchPeers(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	before := make(map[int]map[int][16]byte)
+	for id, setup := range setups {
+		before[id] = make(map[int][16]byte)
+		for peer, seed := range setup.FZeroSeeds {
+			before[id][peer] = seed
+		}
+	}
+	runRefresh(t, setups)
+	for id, setup := range setups {
+		for peer, old := range before[id] {
+			require.NotEqual(t, old, setup.FZeroSeeds[peer], "pair %d/%d seed must change", id, peer)
+			require.Equal(t, setup.FZeroSeeds[peer], setups[peer].FZeroSeeds[id], "pair %d/%d must agree", id, peer)
+		}
+	}
+	message := []byte("sign after FZero seed refresh")
+	r, signature := runSigning(t, setups, []int{1, 2, 3}, message)
+	verifyECDSA(t, setups[1].PubKey, message, r, signature)
 }
 
 // TestRefreshClearsSessionIDs: a refresh replaces every seed a session id

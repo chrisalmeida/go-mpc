@@ -10,6 +10,54 @@ import (
 // --- UnmarshalJSON fuzz targets ---
 // These verify that arbitrary byte inputs never panic during deserialization.
 
+// fuzzWire seeds both a decodable document and malformed documents. Protocol
+// validation remains the responsibility of the receiving round function.
+func fuzzWire[T any](f *testing.F, example *T) {
+	encoded, err := json.Marshal(example)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(encoded)
+	f.Add([]byte(`{}`))
+	f.Add([]byte(`null`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var value T
+		_ = json.Unmarshal(data, &value)
+	})
+}
+
+func FuzzUnmarshalOTExtReceiverMsg(f *testing.F) {
+	fuzzWire(f, &OTExtReceiverMsg{U: make([][XiExt / 8]byte, LambdaC)})
+}
+
+func FuzzUnmarshalRound2Msg(f *testing.F) {
+	fuzzWire(f, &Round2Msg{Decommitment: []byte{1}, GammaU: []byte{2}, GammaV: []byte{3}, Psi: []byte{4}, PKi: []byte{5}})
+}
+
+func FuzzUnmarshalRound3Msg(f *testing.F) {
+	fuzzWire(f, &Round3Msg{W_i: []byte{1}, U_i: []byte{2}})
+}
+
+func FuzzUnmarshalRefreshRound2Output(f *testing.F) {
+	fuzzWire(f, &RefreshRound2Output{SecretShares: map[int][]byte{1: {1}}})
+}
+
+func FuzzUnmarshalFZeroCommitMsg(f *testing.F) {
+	fuzzWire(f, &FZeroCommitMsg{Commitment: [32]byte{1}})
+}
+
+func FuzzUnmarshalFZeroRevealMsg(f *testing.F) {
+	fuzzWire(f, &FZeroRevealMsg{Seed: [16]byte{1}, Salt: [SaltLen]byte{2}})
+}
+
+func FuzzUnmarshalBaseOTReceiverMsg(f *testing.F) {
+	fuzzWire(f, &BaseOTReceiverMsg{R0: [][]byte{{1}}, R1: [][]byte{{2}}})
+}
+
+func FuzzUnmarshalBaseOTSenderMsg(f *testing.F) {
+	fuzzWire(f, &BaseOTSenderMsg{M0: [][]byte{{1}}, M1: [][]byte{{2}}})
+}
+
 func FuzzUnmarshalVOLEBobState(f *testing.F) {
 	f.Add([]byte(`{"beta":"","chi":"","gamma":""}`))
 	f.Add([]byte(`{}`))
@@ -77,15 +125,20 @@ func FuzzUnmarshalSignerSetup(f *testing.F) {
 	})
 }
 
-func FuzzUnmarshalBaseOTSeeds(f *testing.F) {
-	f.Add([]byte(`{"seeds":[],"sigma":""}`))
-	f.Add([]byte(`{"seeds0":[],"seeds1":[]}`))
-	f.Fuzz(func(t *testing.T, data []byte) {
-		var r BaseOTReceiverSeeds
-		_ = json.Unmarshal(data, &r)
-		var s BaseOTSenderSeeds
-		_ = json.Unmarshal(data, &s)
-	})
+func FuzzUnmarshalBaseOTReceiverSeeds(f *testing.F) {
+	seeds := make([][]byte, LambdaC)
+	for i := range seeds {
+		seeds[i] = make([]byte, 32)
+	}
+	fuzzWire(f, &BaseOTReceiverSeeds{Seeds: seeds, Sigma: make([]bool, LambdaC)})
+}
+
+func FuzzUnmarshalBaseOTSenderSeeds(f *testing.F) {
+	seeds := make([][]byte, LambdaC)
+	for i := range seeds {
+		seeds[i] = make([]byte, 32)
+	}
+	fuzzWire(f, &BaseOTSenderSeeds{Seeds0: seeds, Seeds1: seeds})
 }
 
 func FuzzUnmarshalDKGRound1Output(f *testing.F) {

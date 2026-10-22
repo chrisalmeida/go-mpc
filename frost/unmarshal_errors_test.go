@@ -1,11 +1,64 @@
 package frost
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+// TestRejectedUnmarshalPreservesReceiver covers every custom decoder except
+// SignerState, whose rejection tests also finish the active signing session.
+func TestRejectedUnmarshalPreservesReceiver(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		target any
+		fields []string
+	}{
+		{"KeyShare", fullSetup(t)[1], []string{"secret_share", "public_key", "verification_share", "group_commitments"}},
+		{"DKGRound1Output", &DKGRound1Output{FeldmanCommitments: [][]byte{{1}}, PairwiseCommitments: map[int][32]byte{2: {2}}, PairwiseSalts: map[int][SaltLen]byte{2: {3}}, ProofR: make([]byte, ElementLen), ProofMu: make([]byte, ScalarLen)}, []string{"feldman_commitments", "pairwise_commitments", "pairwise_salts", "proof_r", "proof_mu"}},
+		{"DKGRound2Output", &DKGRound2Output{SecretShares: map[int][]byte{2: {1}}}, []string{"secret_shares"}},
+		{"NonceCommitment", &NonceCommitment{HidingNonceCommitment: []byte{1}, BindingNonceCommitment: []byte{2}}, []string{"hiding_nonce_commitment", "binding_nonce_commitment"}},
+		{"SignatureShare", &SignatureShare{SignerID: 1, Zi: []byte{2}}, []string{"zi"}},
+		{"Signature", &Signature{R: []byte{1}, Z: []byte{2}}, []string{"r", "z"}},
+		{"RefreshRound1Output", &RefreshRound1Output{FeldmanCommitments: [][]byte{{1}}, PairwiseCommitments: map[int][32]byte{2: {2}}, PairwiseSalts: map[int][SaltLen]byte{2: {3}}, SeedCommitment: [32]byte{4}, SeedSalt: [SaltLen]byte{5}}, []string{"feldman_commitments", "pairwise_commitments", "pairwise_salts", "seed_commitment", "seed_salt"}},
+		{"RefreshRound2Output", &RefreshRound2Output{SecretShares: map[int][]byte{2: {1}}, Seed: [16]byte{2}}, []string{"secret_shares", "seed"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, err := json.Marshal(tc.target)
+			require.NoError(t, err)
+			for _, field := range tc.fields {
+				t.Run(field, func(t *testing.T) {
+					require.NoError(t, json.Unmarshal(before, tc.target))
+					var fields map[string]json.RawMessage
+					require.NoError(t, json.Unmarshal(before, &fields))
+					original, ok := fields[field]
+					require.True(t, ok, "fixture must contain %s", field)
+					switch original[0] {
+					case '"':
+						fields[field] = json.RawMessage(`"ZZ"`)
+					case '[':
+						fields[field] = json.RawMessage(`["ZZ"]`)
+					case '{':
+						fields[field] = json.RawMessage(`{"invalid":"ZZ"}`)
+					default:
+						t.Fatalf("unsupported fixture field %s", field)
+					}
+					rejected, err := json.Marshal(fields)
+					require.NoError(t, err)
+					err = json.Unmarshal(rejected, tc.target)
+					require.Error(t, err)
+					require.NotContains(t, err.Error(), "version", "field rejection must pass the version check")
+					after, err := json.Marshal(tc.target)
+					require.NoError(t, err)
+					require.True(t, bytes.Equal(before, after), "rejected %s changed receiver", field)
+				})
+			}
+		})
+	}
+}
 
 // bad is invalid hex that passes JSON parsing but fails hex decoding.
 const bad = "ZZZZ"
@@ -18,16 +71,17 @@ func TestUnmarshalKeyShareErrors(t *testing.T) {
 	cases := []struct {
 		name string
 		json string
+		want string
 	}{
-		{"bad secret_share", `{"id":1,"secret_share":"` + bad + `","public_key":"","verification_share":"","group_commitments":[],"threshold":1,"all_ids":[1]}`},
-		{"bad public_key", `{"id":1,"secret_share":"` + valid32 + `","public_key":"` + bad + `","verification_share":"","group_commitments":[],"threshold":1,"all_ids":[1]}`},
-		{"bad verification_share", `{"id":1,"secret_share":"` + valid32 + `","public_key":"` + valid32 + `","verification_share":"` + bad + `","group_commitments":[],"threshold":1,"all_ids":[1]}`},
-		{"bad group_commitment", `{"id":1,"secret_share":"` + valid32 + `","public_key":"` + valid32 + `","verification_share":"` + valid32 + `","group_commitments":["` + bad + `"],"threshold":1,"all_ids":[1]}`},
+		{"bad secret_share", `{"version":1,"id":1,"secret_share":"` + bad + `","public_key":"","verification_share":"","group_commitments":[],"threshold":1,"all_ids":[1]}`, "decode secret_share"},
+		{"bad public_key", `{"version":1,"id":1,"secret_share":"` + valid32 + `","public_key":"` + bad + `","verification_share":"","group_commitments":[],"threshold":1,"all_ids":[1]}`, "decode public_key"},
+		{"bad verification_share", `{"version":1,"id":1,"secret_share":"` + valid32 + `","public_key":"` + valid32 + `","verification_share":"` + bad + `","group_commitments":[],"threshold":1,"all_ids":[1]}`, "decode verification_share"},
+		{"bad group_commitment", `{"version":1,"id":1,"secret_share":"` + valid32 + `","public_key":"` + valid32 + `","verification_share":"` + valid32 + `","group_commitments":["` + bad + `"],"threshold":1,"all_ids":[1]}`, "decode group_commitment[0]"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var v KeyShare
-			require.Error(t, json.Unmarshal([]byte(tc.json), &v))
+			require.ErrorContains(t, json.Unmarshal([]byte(tc.json), &v), tc.want)
 		})
 	}
 }
@@ -39,12 +93,16 @@ func TestUnmarshalSignerStateErrors(t *testing.T) {
 		json string
 	}{
 		{"bad json", `not json`},
-		{"bad blacklist key", `{"key_share":null,"blacklist":{"notint":true}}`},
+		{"bad blacklist key", `{"version":1,"key_share":null,"blacklist":{"notint":true}}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var v SignerState
-			require.Error(t, json.Unmarshal([]byte(tc.json), &v))
+			err := json.Unmarshal([]byte(tc.json), &v)
+			require.Error(t, err)
+			if tc.name == "bad blacklist key" {
+				require.ErrorContains(t, err, "notint")
+			}
 		})
 	}
 }

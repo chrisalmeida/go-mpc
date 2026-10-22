@@ -6,6 +6,85 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`session` package: transactional progress guard** for DKLS23 and FROST
+  signing and refresh over a caller-supplied `session.Store`. `Advance` commits
+  at most one result per operation and round, saving the key checkpoint,
+  private round checkpoint, nonce marker, cached output and blacklist changes
+  atomically before returning bytes to send; `Output` replays committed bytes
+  after a lost acknowledgement; a revision check rejects stale backups;
+  refresh is prepared by its final round and promoted by `Activate`. After
+  rollback, a later explicit call can recompute the round from fresh checkpoints.
+  `session/storetest` provides the `Store` conformance suite and an in-memory
+  fault-injecting model. No protocol, wire format or persisted format changes;
+  the repository ships no production backend. (AUDIT.md FU-MED-6)
+
+### Security
+
+- **session: strengthen rollback conformance and narrow execution claims.**
+  `storetest.Run` now checks that errors and panics preserve previously
+  committed key/session records, cached outputs and nonce reservations while
+  discarding tentative writes. Regression tests reject adapters that erase
+  progress during rollback. Documents state at most one committed result per
+  round and cover recomputation after rollback; passing the conformance suite
+  alone does not establish the complete storage contract. (FU-MED-11, FU-MED-12)
+- **both: validate local signing and refresh material before use.** Reject
+  invalid group configuration, malformed key material and unconfigured signing
+  participants before returning output. DKLS23 checks all selected peers' base
+  OT/FZero material, locally recomputable private round-state equations and
+  retained peer-map entries. FROST checks canonical shares and the matching
+  verification share when present. Refresh rejects missing or incorrectly
+  sized local polynomials. Valid restoration, partial DKLS23 pairwise setup
+  and refreshed FROST shares remain supported. Persisted formats and protocol
+  transcripts are unchanged; strict raw decoding, state origin binding and
+  durable recovery remain separate open work. (AUDIT.md FU-MED-10)
+- **frost: serialize nonce consumption** per RFC 9591 §5.1–5.2. Concurrent
+  round-2 calls and copies of a returned round-1 state share one consumption
+  record protected by its own mutex, including across equivalent signer
+  wrappers. States check the matching key, participant set and epoch.
+  Regression tests verify one successful call and a valid signature.
+  (AUDIT.md FU-HIGH-2)
+- **dkls23: use constant-time secp256k1 point operations and encoding** via
+  `github.com/bytemare/secp256k1` v0.5.0, replacing secret uses of btcec's
+  `NonConst` operations. Scalar arithmetic and independent ECDSA verification
+  continue to use btcec. No protocol equation, hash input or message changes.
+  This backend and its integration still require independent audit.
+  (FU-HIGH-3)
+- **dkls23: reduce FZero PRF outputs in constant time.** The former
+  `reduce64Public` passed secret outputs to `math/big`. The replacement
+  computes the identical 512-bit integer reduction using `ModNScalar` and the
+  existing gadget vector. Differential tests pin the reduction and PRF input.
+  (FU-MED-5)
+- **both: reject duplicate refresh finalization on live signer objects.**
+  Completed local seed contributions are recorded after successful updates
+  under the signer's write lock. Pending contributions retain their existing
+  restoration behavior. The local record is not serialized; durable replay
+  protection and authenticated session routing remain caller responsibilities.
+  (FU-MED-7)
+- **both: preserve live state after rejected imports.** Unsupported versions
+  and malformed fields no longer partially replace signer state, invalidate
+  active signing sessions or erase pending refresh. DKLS23 private round-state
+  decoding also publishes replacements only after validation. Tests complete
+  the original operations and independently verify their signatures. (FU-MED-8)
+
+### Changed
+
+- FROST round 2 takes the signer's write lock. Distinct sessions can interleave
+  between rounds, but their round-2 calls on one signer execute serially.
+- Map security claims to named tests, distinguish inspected source from
+  measured timing and erasure, and clarify strict FROST protocol decoding
+  versus cofactored signature verification. Repair version-masked error
+  tests, add missing decoder fuzz targets and test sequential/concurrent
+  DKLS23 round replay with independent signature verification. (FU-LOW-7)
+
+### Fixed
+
+- Preserve receivers on rejection in every custom JSON decoder, extending
+  transactional decoding to the remaining key, message and ephemeral state
+  types with populated-receiver regression tests. Successful decoding
+  behavior and wire formats are retained. (FU-MED-9)
+
 ## [0.3.0] - 2026-10-21
 
 This release is a breaking change: it is not wire- or storage-compatible with

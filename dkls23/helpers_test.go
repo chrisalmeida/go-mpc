@@ -11,6 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// curveOrder is used only by independent big.Int reference calculations.
+var curveOrder = btcec.S256().N
+
 // runBaseOT runs the one-time base OT for one directed VOLE pair and returns
 // Alice's receiver seeds (she is the base-OT receiver with choice bits sigma)
 // and Bob's sender seed pairs.
@@ -269,11 +272,13 @@ func fullSign(t testing.TB, setups map[int]*SignerSetup, msg []byte) (
 func computeRxFromStates(signers []int, states map[int]*Round2State) btcec.ModNScalar {
 	var R btcec.JacobianPoint
 	for _, id := range signers {
-		pt, err := compressedToPoint(states[id].R_iPoint)
+		pub, err := btcec.ParsePubKey(states[id].R_iPoint)
 		if err != nil {
 			panic(err)
 		}
-		btcec.AddNonConst(&R, pt, &R)
+		var pt btcec.JacobianPoint
+		pub.AsJacobian(&pt)
+		btcec.AddNonConst(&R, &pt, &R)
 	}
 	R.ToAffine()
 	rxBytes := make([]byte, 32)

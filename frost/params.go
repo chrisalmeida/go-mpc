@@ -45,10 +45,21 @@
 // [Aggregate] and [SignerState] before treating a share verification failure
 // as proof that the named signer cheated.
 //
+// Dependency source inspected at v1.2.0: Scalar arithmetic delegates to
+// generated fiat-crypto methods; ScalarMult/ScalarBaseMult use fixed digit
+// schedules and lookup-table selection. References for those library timing
+// properties (not a timing test of this integration):
+// https://github.com/FiloSottile/edwards25519/blob/v1.2.0/scalar.go
+// https://github.com/FiloSottile/edwards25519/blob/v1.2.0/scalar_fiat.go
+// https://github.com/FiloSottile/edwards25519/blob/v1.2.0/scalarmult.go
+// https://github.com/FiloSottile/edwards25519/blob/v1.2.0/edwards25519.go
+//
 // # Concurrency
 //
-// [SignerState] is safe for concurrent reads (parallel signing sessions).
-// Mutating operations acquire a write lock internally.
+// [SignerState] is safe for concurrent protocol calls. Round 2 consumes its
+// nonce state under a write lock. Refresh finalization records completed
+// local contributions under a write lock. Callers must not
+// mutate exported fields during protocol calls or copy mutex-bearing states.
 //
 // # Usage flow
 //
@@ -99,6 +110,10 @@ var orderMinus2 = [32]byte{
 //
 // The exponent L-2 is a public constant, so the square-and-multiply
 // loop's branch pattern is fixed and leaks no information about val.
+// Scalar.Multiply delegates to the generated fiatScalarMul implementation;
+// source inspected at v1.2.0 (functional inverse tests do not measure timing):
+// https://github.com/FiloSottile/edwards25519/blob/v1.2.0/scalar.go
+// https://github.com/FiloSottile/edwards25519/blob/v1.2.0/scalar_fiat.go
 func scalarInverse(val *edwards25519.Scalar) *edwards25519.Scalar {
 	// Convert L-2 to big-endian for bit scanning.
 	var expBE [32]byte

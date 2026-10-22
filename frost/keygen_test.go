@@ -300,6 +300,38 @@ func TestDKGCheatingDetection(t *testing.T) {
 	requireCheating(t, err, 2)
 }
 
+// A valid hash commitment must not mask a share inconsistent with the
+// polynomial's public Feldman commitments (FROST paper Figure 1, Round 2).
+func TestDKGRejectsShareInconsistentWithCommitments(t *testing.T) {
+	t.Parallel()
+	s := runDKGRound1(t, []int{1, 2, 3}, 2)
+	runDKGRound2(t, s)
+	original, err := edwards25519.NewScalar().SetCanonicalBytes(s.r2[2].SecretShares[1])
+	require.NoError(t, err)
+	forged := edwards25519.NewScalar().Add(original, scalarFromUint64(1)).Bytes()
+	s.r2[2].SecretShares[1] = forged
+	com, salt, err := commit(forged)
+	require.NoError(t, err)
+	s.r1[2].PairwiseCommitments[1], s.r1[2].PairwiseSalts[1] = com, salt
+	require.NoError(t, openCommitment(forged, com, salt), "the hash commitment must pass")
+	_, err = parseFeldmanCommitments(s.r1[2].FeldmanCommitments)
+	require.NoError(t, err, "the points must decode")
+
+	share, err := DKGFinalize(s.configs[1], s.coeffs[1], s.r1, s.r2)
+	requireCheating(t, err, 2)
+	require.Nil(t, share)
+	// The forged evaluation was sent only to party 1. The other two parties
+	// still finish and sign as a 2-of-3 quorum, checked with crypto/ed25519.
+	keys := make(map[int]*KeyShare)
+	for _, id := range []int{2, 3} {
+		keys[id], err = DKGFinalize(s.configs[id], s.coeffs[id], s.r1, s.r2)
+		require.NoError(t, err)
+	}
+	msg := []byte("unaffected recipients after a forged evaluation")
+	sig := fullSign(t, keys, []int{2, 3}, msg)
+	require.True(t, ed25519.Verify(keys[2].PublicKey, msg, sig.Bytes()))
+}
+
 func TestDKG2of2Minimal(t *testing.T) {
 	t.Parallel()
 	keyShares, err := buildDKG([]int{1, 2}, 2)

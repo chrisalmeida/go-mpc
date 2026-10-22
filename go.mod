@@ -7,6 +7,7 @@ toolchain go1.26.1
 require (
 	filippo.io/edwards25519 v1.2.0
 	github.com/btcsuite/btcd/btcec/v2 v2.5.0
+	github.com/bytemare/secp256k1 v0.5.0
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/crypto v0.58.0
 )

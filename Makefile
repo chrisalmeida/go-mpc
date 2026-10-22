@@ -20,7 +20,7 @@ bench:
 
 # Show test coverage
 cover:
-	go test -coverprofile=coverage.out ./dkls23 ./frost
+	go test -coverprofile=coverage.out ./dkls23 ./frost ./session
 	go tool cover -func=coverage.out | tail -1
 	@rm -f coverage.out
 

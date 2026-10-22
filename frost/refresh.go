@@ -28,6 +28,14 @@ import (
 	"filippo.io/edwards25519"
 )
 
+// refreshContribution identifies an applied local contribution using existing
+// public values. It is bookkeeping, not a protocol message or hash input.
+type refreshContribution struct {
+	publicKey string
+	partyID   int
+	seed      [16]byte
+}
+
 // RefreshRound1Output is broadcast by each party Pi in refresh round 1.
 type RefreshRound1Output struct {
 	// FeldmanCommitments are the t-1 compressed Edwards points C_{i,k} = δ_{i,k}·B
@@ -115,8 +123,14 @@ func refreshFeldmanVerify(share *edwards25519.Scalar, x int, nonConstFeldman [][
 // Returns the broadcast output, the polynomial coefficients (kept private until
 // round 2), and the seed (kept private until round 2).
 func RefreshRound1(signer *SignerState) (*RefreshRound1Output, []*edwards25519.Scalar, [16]byte, error) {
+	if signer == nil {
+		return nil, nil, [16]byte{}, &InvalidInputError{Phase: "RefreshRound1", Detail: "signer is required"}
+	}
 	signer.mu.RLock()
 	defer signer.mu.RUnlock()
+	if err := validateSignerState(signer, "RefreshRound1"); err != nil {
+		return nil, nil, [16]byte{}, err
+	}
 
 	if err := checkBlacklist(signer, signer.KeyShare.AllIDs, "RefreshRound1"); err != nil {
 		return nil, nil, [16]byte{}, err
@@ -183,8 +197,17 @@ func RefreshRound1(signer *SignerState) (*RefreshRound1Output, []*edwards25519.S
 // RefreshRound2 decommits pairwise evaluations and reveals the seed.
 // coeffs and mySeed must be the values returned by RefreshRound1.
 func RefreshRound2(signer *SignerState, coeffs []*edwards25519.Scalar, mySeed [16]byte) (*RefreshRound2Output, error) {
+	if signer == nil {
+		return nil, &InvalidInputError{Phase: "RefreshRound2", Detail: "signer is required"}
+	}
 	signer.mu.RLock()
 	defer signer.mu.RUnlock()
+	if err := validateSignerState(signer, "RefreshRound2"); err != nil {
+		return nil, err
+	}
+	if err := validateRefreshCoefficients(coeffs, signer.KeyShare.Threshold, "RefreshRound2"); err != nil {
+		return nil, err
+	}
 
 	secretShares := make(map[int][]byte)
 	for _, j := range signer.KeyShare.AllIDs {
@@ -212,6 +235,9 @@ func RefreshRound2(signer *SignerState, coeffs []*edwards25519.Scalar, mySeed [1
 // The group public key and group commitments A_0 are unchanged (since Σ f_i(0) = 0).
 // Returns an error naming all bad senders if any verification fails; state is
 // NOT modified in that case.
+// A completed local seed contribution cannot be applied again on this signer.
+// This in-memory replay record does not replace durable caller-side routing
+// and replay protection after state restoration.
 func RefreshFinalize(
 	signer *SignerState,
 	coeffs []*edwards25519.Scalar,
@@ -219,11 +245,23 @@ func RefreshFinalize(
 	allRound1 map[int]*RefreshRound1Output,
 	allRound2 map[int]*RefreshRound2Output,
 ) error {
+	if signer == nil {
+		return &InvalidInputError{Phase: "RefreshFinalize", Detail: "signer is required"}
+	}
 	signer.mu.Lock()
 	defer signer.mu.Unlock()
-
+	if err := validateSignerState(signer, "RefreshFinalize"); err != nil {
+		return err
+	}
 	if err := checkBlacklist(signer, signer.KeyShare.AllIDs, "RefreshFinalize"); err != nil {
 		return err
+	}
+	if err := validateRefreshCoefficients(coeffs, signer.KeyShare.Threshold, "RefreshFinalize"); err != nil {
+		return err
+	}
+	contribution := refreshContribution{publicKey: string(signer.KeyShare.PublicKey), partyID: signer.KeyShare.ID, seed: mySeed}
+	if signer.completedRefresh[contribution] {
+		return &CorruptStateError{Phase: "RefreshFinalize", Detail: "local refresh contribution already applied"}
 	}
 
 	myID := signer.KeyShare.ID
@@ -322,5 +360,9 @@ func RefreshFinalize(
 	signer.KeyShare.SecretShare = newShare.Bytes()
 	signer.KeyShare.VerificationShare = newVerificationShare
 	signer.Epoch++
+	if signer.completedRefresh == nil {
+		signer.completedRefresh = make(map[refreshContribution]bool)
+	}
+	signer.completedRefresh[contribution] = true
 	return nil
 }

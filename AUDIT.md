@@ -5,6 +5,13 @@
 **Date**: 2026-04-03 (frost), 2026-03-27 (dkls23 original)
 **Auditor**: Automated cryptographic review (not a substitute for an independent third-party audit)
 
+**2026-10-21 hardening addendum**: see FU-HIGH-2, FU-HIGH-3 and
+FU-MED-5 through FU-MED-12 and FU-LOW-7 below. These include implementation fixes, an open
+state-association finding and regression evidence from an automated source
+review, not an independent audit or a
+production-security certification. Remaining gates are in
+[SECURITY.md](SECURITY.md#production-review-gates).
+
 ---
 
 ## Executive Summary
@@ -243,6 +250,437 @@ choice-bit-dependent selections are constant-time byte copies on affine
 coordinates; a message that would force an agreed key to the point at
 infinity is rejected. The receiver now speaks first (two rounds), and the
 receiver's key-agreement secrets are zeroized after finalization.
+
+---
+
+## 2026-10-21 Hardening Addendum
+
+**Reviewer**: Codex (automated source review and regression construction).
+**Scope**: nonce/state lifetime, secret curve operations and hash-output
+reduction, refresh replay, and accuracy of security claims. No protocol
+messages, hash transcripts, security parameters or proof equations changed.
+
+### FU-HIGH-2: Concurrent FROST nonce consumption — FIX IMPLEMENTED
+
+**Files**: `frost/sign.go`, `frost/session_test.go`
+**Severity**: High
+**Category**: One-use nonce state / data race
+**Specification**: RFC 9591 §5.1–5.2: a nonce pair is used at most once and
+deleted after signing.
+
+`SignRound2` held a shared read lock while reading `consumed` and mutating
+nonce scalars. A targeted race-enabled test submitted 16 concurrent calls
+with one state: 10 returned success and the race detector reported conflicting
+reads/writes. This establishes a broken one-use guard, not a demonstrated
+private-key recovery attack from the race.
+
+**Resolution**: round 2 holds the signer's write lock; copies of states
+returned by round 1 share a consumption record with its own mutex. Matching
+key, party, participant-set and epoch checks permit equivalent signer wrappers
+without permitting concurrent consumption. Nonce/commitment consistency is checked, caller
+participant lists and outbound commitments are independently copied, and
+successful signing zeroizes nonce objects. Raw secret nonce material must
+never be manually duplicated or reused. Regression tests require exactly one
+successful share, including across restored wrappers, and verify the resulting
+signature with `crypto/ed25519`.
+The RFC Appendix E.1 vector test is unchanged.
+
+**Tested**: `TestSignConcurrentNonceConsumption` requires exactly one success
+and independently verifies the aggregate for original, copied, restored-wrapper
+and raw-state cases. `TestSignCopiedNonceStateIsSingleUse` verifies the winning
+share after a sequential retry. `TestSignRejectsChangedNonceAssociation` tests
+different public keys and participant sets; the other signer/epoch and
+restoration tests are mapped in SECURITY.md. These tests do not demonstrate
+resistance to manually duplicated independent secret nonce material.
+
+### FU-HIGH-3: Variable-time operations on DKLS23 secrets — FIX IMPLEMENTED
+
+**Files**: `dkls23/curve.go`, `ot.go`, `dkg.go`, `sign.go`, `refresh.go`
+**Severity**: High (side-channel risk; exploitability is deployment-dependent)
+**Category**: Secret-dependent curve arithmetic and encoding
+**Specification**: secp256k1 group operations of DKLS23 Protocols 3.6, 7.1,
+and MR19 Figure 8 / Appendix D.1. These operations must preserve the same
+group values and encodings; the cryptographic construction is unchanged.
+
+Secret nonces, polynomial coefficients, masked shares and OT DH scalars were
+passed to btcec `ScalarBaseMultNonConst` / `ScalarMultNonConst`. Having a
+constant-time scalar representation did not make these point operations
+constant-time. Point serialization and the surrounding point operations also
+needed review, especially on secret DH points.
+
+**Resolution**: use `github.com/bytemare/secp256k1` v0.5.0 for a fixed 256-bit
+ladder, complete point addition and coordinate encoding. Secret-selected
+finite points use constant-time byte copies of full coordinates, not a
+secret-selected compressed-point decoder. btcec remains for scalar arithmetic
+and independent public ECDSA verification. Differential tests cover both
+point multiplication forms, zero, q-1, addition and cancellation. Received
+points must use the existing 33-byte compressed SEC1 format.
+
+**Assurance limit**: this is not a claim that the new backend or its compiled
+integration has received an independent audit. No practical timing/cache
+key-recovery exploit was demonstrated. Independent review and target-specific
+side-channel analysis remain production gates.
+
+**Tested**: `TestCurveOperationsMatchBTCEC` and
+`TestPointDecodeRequiresCompressedSEC1` check arithmetic and accepted encodings.
+`TestProductionAvoidsVariableTimeAPIs` parses both packages' production source
+to reject `math/big` imports and calls named `NonConst`.
+**Only read**: pinned backend multiplication, complete addition, coordinate
+encoding and scalar conversion source, with references in `curve.go`. Neither
+the differential tests nor the source-policy test measures compiled timing.
+
+### FU-MED-5: FZero secret output treated as public — FIX IMPLEMENTED
+
+**Files**: `dkls23/params.go`, `commitment.go`, `vole.go`, `reduction_test.go`
+**Severity**: Medium
+**Category**: Variable-time reduction of secret PRF outputs
+**Specification**: DKLS23 §3.1 FZero and Protocol 5.2 Fiat-Shamir challenge
+derivation, with the existing 64-byte SHAKE output reduced modulo q.
+
+`reduce64Public` used `math/big` for FZero outputs derived from a private
+pairwise seed. These values were incorrectly described as public. No
+practical key-recovery attack from this reduction was demonstrated.
+
+**Resolution**: reduce the exact same integer as
+`high * (2^256 mod q) + low`, using constant-time `ModNScalar` operations and
+the already computed `gadget[256]`. Both callers use a fixed 64-byte array;
+FZero's output buffer is cleared. Differential tests against `big.Int` and
+an independently encoded FZero transcript verify identical results, including
+zero, all-ones and group-order boundaries. Production code no longer imports
+`math/big`; reference calculations use it only in tests.
+
+**Tested**: `TestReduce64MatchesBigInt` and
+`TestFZeroMatchesReferenceReduction` check the exact reduction and PRF
+transcript; `TestProductionAvoidsVariableTimeAPIs` checks the import policy.
+**Only read**: timing properties of the dependency's scalar methods and the
+explicit buffer clear. The tests establish arithmetic compatibility, not
+compiled constant-time behavior or removal of memory copies.
+
+### FU-MED-6: Persisted DKLS23 signing state lacks key/epoch association — OPEN, GUARD PROVIDED
+
+**Files**: `dkls23/sign.go`, `dkls23/encoding.go`
+**Severity**: Medium
+**Category**: Session-state association / stale private state
+**Specification**: DKLS23 Protocol 3.6's local setup and `sigid` association.
+
+The existing persisted round-state format does not carry a key or epoch
+binding. A different setup can have the same session id and recorded stage,
+or a refresh can permit that id under new seeds while old private state still
+exists. The application must retain the correct association between private
+round state, setup, participants and key epoch.
+
+**Disposition**: existing session-id freshness and round-progress checks are
+retained. This branch preserves the existing persisted formats and restoration
+behavior; it does not add process-identity restrictions or redesign persistence.
+The missing persisted association remains open and requires a separately
+reviewed compatibility change. Regression tests finish signing after valid
+setup and round-state restoration and independently verify the signatures.
+
+**Mitigation (session package)**: the `session` package keeps every key and
+round checkpoint under a `Scope` (protocol, public key, party id) and a
+`Version` (epoch, revision) in a caller-supplied transactional store, hands the
+codec owned copies, and commits progress, the nonce marker and the public
+output together before releasing any bytes. The integration codecs in
+`dkls23/store_test.go` and `frost/store_test.go` reject a checkpoint whose
+party, public key or epoch differ from the scope, which supplies the
+association the persisted format lacks without changing that format.
+FU-MED-10's local consistency checks run inside the same codec path.
+
+**Tested**: `TestSignResumesWithRestoredSetup`,
+`TestSignResumesWithRestoredRoundState` and `TestSignResumesAfterInPlaceRestore`
+check valid restoration and independent ECDSA verification. With the guard,
+`TestTransactionalSigningRecoversCommittedRoundAndRejectsCopies` (DKLS23) and
+`TestTransactionalSigningRecoversCommitmentAndConsumesRestoredNoncesOnce`
+(FROST) complete signing sessions through `session.Advance` with a lost commit
+acknowledgement and concurrent calls, verifying the signatures independently;
+the DKLS23 test also rejects a request from an old backup.
+`session/guard_test.go` and `guard_rules_test.go` cover stale versions, nonce
+reuse, failed commits, corrupt records and store faults. These establish at
+most one committed result per round. Rolled-back attempts can be computed
+again by a later explicit call (FU-MED-12).
+**Only read**: the missing key/epoch fields in the persisted schema, and the
+`Store` contract's durability, which only a real backend's own crash tests can
+establish. The format itself is unchanged, so the association exists only for
+callers that use the guard; for the rest it remains a Known Limitation, not a
+resolved guarantee.
+
+### FU-MED-7: Duplicate refresh finalization accepted — LOCAL REPLAY FIX IMPLEMENTED
+
+**Files**: both packages' `refresh.go`, signer state, encoding and refresh
+session tests
+**Severity**: Medium
+**Category**: Local refresh replay / key-state consistency
+**Specification**: one application of the existing refresh polynomial and
+auxiliary-state update per refresh instance; no modification to its equations.
+
+A targeted reproduction in each package called `RefreshFinalize` twice with
+the same local contribution and received messages. Both calls succeeded and
+the epoch became 2. The epoch counter was bookkeeping, not an enforced
+refresh replay guard. Repeated updates can desynchronize shares and auxiliary
+state. This review did not establish full proactive security of refresh.
+
+**Resolution**: after all validation and a successful update, finalization
+records the completed local seed contribution, public key and party id under
+the signer's write lock. The seed is already public in refresh round 2. A
+repeat is rejected before mutation. No new protocol identifier, hash input,
+message or equation is introduced, and round 1 does not retire pending work.
+Concurrent and sequential replay tests require exactly one epoch increment;
+an older completed contribution stays rejected after a subsequent refresh.
+Independent signature verification checks the resulting group shares.
+Compatibility tests also finish pending refresh after signer restoration.
+
+**Integration limit**: the completion record is local and is not serialized.
+It does not provide replay protection on a newly restored object or bind
+peer messages to a fresh authenticated session. Applications must durably
+track applied refreshes, route authenticated transcripts and coordinate
+epoch activation. KMOS21 conformance, the corruption/erasure model and refresh
+auxiliary-state security remain independent-review gates. Earlier claims that
+an epoch counter alone prevents replay are superseded by this entry.
+
+**Tested**: each package's `TestRefreshFinalizeIsSingleUse` races eight calls,
+requires one successful epoch increment, retries sequentially, verifies a
+signature independently and rejects an older contribution after another
+refresh. `TestRefreshPreservesPendingContribution` and
+`TestRejectedImportPreservesPendingRefresh` exercise restoration and failed
+imports. **Only read**: the local completion record's omission from JSON.
+The tests do not establish durable replay protection or proactive security.
+
+### FU-MED-8: Rejected private-state imports modify active sessions — FIX IMPLEMENTED
+
+**Files**: both packages' `encoding.go`, signing and refresh session tests
+**Severity**: Medium
+**Category**: Partial state replacement / failed-import side effects
+**Requirement**: rejected deserialization must leave the destination unchanged
+(CLAUDE.md, Testing). This is an implementation property, not a new protocol
+message, equation or transcript input.
+
+Existing DKLS23 setup and round-state decoders published fields before
+validating later fields, and the FROST signer decoder replaced the key share
+before validating blacklist keys. A rejected import could leave mixed state
+or discard a live operation.
+
+**Resolution**: decode and validate into temporary values, then publish only
+after success. Signer replacement retains the receiver's mutex and acquires
+its write lock for publication. DKLS23 round 1 and round 2 replacements are
+also published only after complete decoding. Tests reject unsupported
+versions, malformed early and late fields, verify unchanged serialized state,
+and complete the original operation with independent signature verification.
+Additional tests finish pending refresh after a rejected import and verify a
+signature under the refreshed shares. Persisted field layouts and valid
+restoration behavior are unchanged.
+
+**Tested**: each package's `TestRejectedImportPreservesSigningSession` compares
+serialized state before and after rejected inputs and completes signing with
+an independent verifier. `TestRejectedImportPreservesPendingRefresh` does the
+same for pending refresh. This entry originally covered signer and DKLS23
+private round-state decoders; FU-MED-9 covers the remaining custom decoders.
+
+### FU-MED-9: Other custom JSON decoders mutate receivers on rejection — FIX IMPLEMENTED
+
+**Files**: both packages' `encoding.go`, `dkls23/setup_messages.go`, both
+`unmarshal_errors_test.go` files
+**Severity**: Medium
+**Category**: Failed-import side effects / state integrity
+**Requirement**: CLAUDE.md rule 11 requires a receiver-preservation test for
+every custom `UnmarshalJSON`; this is an API-state property, not a protocol
+construction or wire-format change.
+
+The claim-evidence review extended FU-MED-8's rejection tests to every custom
+decoder. These tests failed on the existing DKG messages, OT seed states,
+VOLE states/messages, signing messages, refresh messages, FZero messages and
+FROST key-share/nonce/signature decoders: a malformed field could overwrite
+that field or publish earlier fields before an error was returned.
+
+**Resolution**: decode through a temporary receiver and publish only on success.
+These types have no mutex; signer decoders continue to retain and lock their
+existing mutexes. Temporary copies preserve existing successful decoding
+behavior, including fixed-array copy behavior. No new input restrictions,
+wire fields, versions, hash inputs or protocol checks were introduced.
+
+**Tested**: `TestRejectedUnmarshalPreservesReceiver` in each package corrupts
+fields of populated receivers and requires byte-identical serialized state
+after rejection. The tests failed before this fix and pass after it. Existing
+round-trip and restoration tests check successful imports. The already
+transactional OT-extension decoder is included in the rejection tests.
+**Only read**: the full set of decoder error paths for publication order.
+This does not assert complete semantic validation of a successfully decoded
+transcript; receiving rounds still perform protocol checks. The two base-OT
+message types use standard `encoding/json`, whose error behavior is outside
+the custom-decoder guarantee; callers must discard rejected messages.
+
+### FU-LOW-7: Security claims exceeded their regression evidence — CORRECTED
+
+**Files**: `SECURITY.md`, README files, `CLAUDE.md`, GoDoc and fuzz/error tests
+**Severity**: Low
+**Category**: Assurance and test-coverage claims
+
+The existing security document claimed strict subgroup/identity validation
+for every received group element, while FROST public signature verification
+intentionally uses RFC 8032 decoding and the cofactored equation required by
+RFC 9591 §6.1. It also described blacklists as permanent across all future
+sessions and fuzz/error coverage as universal. Four FROST key-share error
+cases and the blacklist-key case omitted the required version, so those
+tests rejected the version before reaching their named field.
+
+**Resolution**: distinguish strict protocol element decoding from signature
+verification, scope blacklist enforcement to retained state, and map the
+remaining implementation claims to named tests in SECURITY.md. Move untested
+timing, complete erasure, RNG-failure resistance and semantic-decoder
+assumptions to Known Limitations. Preserve the verifier and protected vectors.
+
+**Tested**: repaired malformed-field cases include valid versions and assert
+field-specific errors. Named fuzz targets now cover every custom decoder and
+both base-OT messages; valid-version FROST seeds reach field decoding.
+`TestSignSessionRoundsAreSingleUseConcurrent` races all three DKLS23 signing
+rounds, requires exactly one success, rejects an immediate sequential replay
+of each round and independently verifies the resulting ECDSA signature.
+The FROST cofactored-verification and invalid-element tests falsify the
+previous overly broad validation claim. The implementation-behavior tables
+in SECURITY.md identify the other existing positive and negative tests.
+
+The DKG cheating test stopped at the hash opening, and refresh Feldman tests
+could stop at point decoding. The new FROST
+`TestDKGRejectsShareInconsistentWithCommitments` recomputes the forged share's
+hash commitment, requires valid point decoding, rejects exactly the offending
+party and independently verifies a signature by unaffected recipients.
+Both packages' `TestRefreshBadFeldman` now use different valid points and
+require typed attribution, reaching the Feldman equation rather than relying
+on an earlier decoding error.
+`TestRefreshFZeroSeedsChangeAndMatchPeers` checks that every DKLS23 FZero
+pairwise seed changes, agrees across peers, and still permits independent
+signature verification; base-OT correlation tests alone do not test this.
+
+**Only read**: RFC 9591 §6.1 and dependency sources cited in GoDoc, including
+scalar arithmetic, point multiplication/addition/encoding and explicit
+clears. No new compiled timing, cache-side-channel or memory-erasure
+experiment was performed. Historical "resolved" and "verified" labels above
+and below record earlier reviews; they do not supply missing evidence for
+the broader security claims. The current SECURITY.md evidence and Known
+Limitations take precedence over such historical assurances.
+
+### FU-MED-10: Malformed local state used before validation — LOCAL CHECKS ADDED
+
+**Files**: both `validation.go`, `sign.go` and `refresh.go` files
+**Severity**: Medium
+**Category**: Local state integrity / input validation / incorrect attribution
+
+**Failure scenario**: decoded or directly configured local state could reach
+protocol arithmetic before its required configuration and material were
+checked. FROST round 1 accepted noncanonical secret bytes and participants
+outside the configured group. DKLS23 round 1 silently skipped missing FZero
+material, and later rounds could release output using inconsistent private
+state. A missing retained peer commitment could instead blacklist an honest
+peer. Refresh accepted a local polynomial with the wrong coefficient count.
+
+**Resolution**: validate configured groups, local key material and signing
+membership before use. Check present DKLS23 base-OT material and require both
+directions plus FZero for selected peers; preserve setup on demand for
+unselected peers. Before later-round output, check the local nonce/opening,
+FZero and VOLE choice/scalar relations, the masked-share equation and required
+peer-map entries. Report failures of these local checks before evaluating peer messages.
+FROST validates canonical secret shares, public keys and optional verification
+and original DKG metadata. Its current verification share must match its
+current secret; original polynomial coefficients are not used to validate
+refreshed secrets. Refresh validates local configuration and coefficient
+count, including missing FROST coefficients. No hash input, security parameter,
+protocol equation or stored-format version changes.
+
+**Tested**: `TestSignRound1RejectsInvalidSetupBeforeOutput`,
+`TestSignRound1RejectsInvalidKeyBeforeOutput`,
+`TestSignRound1RejectsInvalidConfiguredElements` and both packages'
+`TestSignRound1RejectsUnconfiguredParticipant` cover malformed local inputs.
+The pre-fix tests reproduced acceptance of an unconfigured FROST signer and
+round-1 DKLS23 output without a required FZero seed.
+`TestSigningRejectsMalformedRestoredSetup` and
+`TestSigningRejectsMalformedRestoredKey` exercise malformed, valid-version
+documents accepted by legacy import helpers and rejected before signing output.
+DKLS23 `TestSignRound2RejectsInconsistentPrivateState` and
+`TestSignRound3RejectsIncompletePrivateState` cover private-state corruption,
+unchanged progress/blacklists on rejection, then repair the state and verify
+the completed ECDSA signature independently. FROST
+`TestSignRound2RejectsInconsistentRestoredKey` preserves unconsumed nonces on
+rejection and independently verifies the signature after restoring the key.
+Both packages test invalid local refresh inputs and wrong polynomial sizes
+before output/mutation. Positive tests cover DKLS23 subset setup, minimal
+FROST signing configuration, refreshed shares with original commitments and
+existing pending signing/refresh restoration. The protected vectors and
+fresh-VOLE test are unchanged.
+`TestSigningAllowsZeroInversionMask` independently verifies a complete signature
+with a zero local inversion-mask share, retaining Protocol 3.6 step 5's field
+domain rather than imposing a nonzero-mask condition.
+
+**Only read / remaining limits**: source review of the cited Protocols 3.6
+and 5.2, RFC 9591 §5, existing refresh behavior, and dependency scalar/point
+code supports the choice of local equations. These tests do not authenticate
+stored data, establish peer seed correlations or DKLS23 share-to-group-key
+correspondence, or detect raw scalar encodings already reduced by legacy
+decoders. FU-MED-6 remains open: local consistency does not establish a
+restored document's original key/epoch/phase binding. Durable replay records,
+rollback protection and distributed epoch activation also remain caller-side
+integration work. Existing stored formats and valid restoration are retained.
+
+### FU-MED-11: Rollback conformance missed destruction of committed progress — CHECKS ADDED
+
+**Files**: `session/storetest/contract.go`, `contract_test.go`
+**Severity**: Medium
+**Category**: Storage-contract test coverage / replay-protection assurance
+
+**Failure scenario**: rollback checks started with empty storage. An adapter
+that erased all of a scope's previously committed records on an error or
+panic passed the suite. Losing session progress and nonce reservations could
+then permit restoration and release of a previously used session/nonce.
+
+**Resolution**: test both empty and populated stores. Commit an initial key,
+session checkpoint, cached output and nonce reservation, then attempt
+replacements, a new session and a new nonce reservation before returning an
+error or panicking. After reopening, compare the complete retained key and
+session records, verify the original nonce is still reserved, and verify all
+tentative new records and reservations are absent. Documentation requires
+the backend to satisfy the complete contract; passing a finite suite alone
+does not establish it.
+
+**Tested**: `TestConformanceRejectsDestructiveRollback` runs the conformance
+suite in subprocesses against deliberately broken adapters that erase
+committed progress on callback errors or panics. Both variants passed the
+old suite, causing this regression test to fail before the fix. The updated
+suite rejects both for losing the committed key, session and nonce;
+`TestModelStorageContract` passes the same cases against `storetest.Model`.
+These tests run under `-race`.
+**Only read / remaining limits**: the `Store` contract and guard's reliance
+on committed progress were reviewed. No production backend, physical crash
+durability or resistance to restoring an old database snapshot was tested.
+
+### FU-MED-12: Session documents overstated computation uniqueness — CLAIM CORRECTED
+
+**Files**: `session/README.md`, `session/store.go`, `session/guard.go`,
+`session/guard_test.go`, root documentation
+**Severity**: Medium
+**Category**: Incorrect execution guarantee / recovery guidance
+
+**Failure scenario**: documents stated that a round was computed at most
+once per operation. A commit failure before persistence leaves progress
+unchanged, so a later explicit `Advance` can compute that round again.
+Treating computation as irreversible could make a caller retain consumed
+objects or perform external side effects during a failed attempt.
+
+**Resolution**: state at most one committed result per operation and round.
+Describe recomputation after confirmed rollback, require fresh checkpoint
+decoding for every invocation and retain the prohibition on external side
+effects or sending output from `Compute`. Recover confirmed commits through
+cached `Output`. No execution policy, protocol or persisted format changes.
+
+**Tested**: `TestRolledBackRoundCanBeRecomputedBeforeCommit` covers both
+protocols. It observes two computations across a failed commit and a later
+explicit retry, unchanged authoritative key/progress and no recoverable
+output after rollback, one revision increment after success, caching of
+only the successful attempt's distinct output, and rejection of subsequent
+recomputation. `TestRoundsCommitOnceAcrossConnections` covers concurrent
+commits; both packages' transactional signing tests independently verify
+the completed signatures.
+**Only read / remaining limits**: callback freshness and lack of external
+side effects are requirements on caller-written codecs; the generic guard
+cannot enforce them. Fault tests use the in-memory transaction model and
+do not establish a backend's physical durability.
 
 ---
 

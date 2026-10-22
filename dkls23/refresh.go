@@ -46,6 +46,14 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
+// refreshContribution identifies an applied local contribution using existing
+// public values. It is bookkeeping, not a protocol message or hash input.
+type refreshContribution struct {
+	publicKey string
+	partyID   int
+	seed      [16]byte
+}
+
 // RefreshRound1Output is broadcast by each party Pi in refresh round 1.
 // It contains Feldman commitments for a zero-constant polynomial and FCom
 // commitments to the pairwise evaluations and a fresh per-party seed.
@@ -81,8 +89,14 @@ type RefreshRound2Output struct {
 // Returns the broadcast output, the polynomial coefficients (kept private until
 // RefreshRound2), and the seed (kept private until RefreshRound2).
 func RefreshRound1(setup *SignerSetup) (*RefreshRound1Output, []btcec.ModNScalar, [16]byte, error) {
+	if setup == nil {
+		return nil, nil, [16]byte{}, &InvalidInputError{Phase: "RefreshRound1", Detail: "setup is required"}
+	}
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
+	if err := validateSetupState(setup, "RefreshRound1"); err != nil {
+		return nil, nil, [16]byte{}, err
+	}
 	t := setup.Threshold
 
 	// Sample t-1 coefficients δ_1, …, δ_{t-1} for the zero-constant polynomial.
@@ -151,8 +165,17 @@ func RefreshRound1(setup *SignerSetup) (*RefreshRound1Output, []btcec.ModNScalar
 // RefreshRound2 decommits pairwise evaluations and reveals the seed.
 // coeffs and mySeed must be the values returned by RefreshRound1.
 func RefreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byte) (*RefreshRound2Output, error) {
+	if setup == nil {
+		return nil, &InvalidInputError{Phase: "RefreshRound2", Detail: "setup is required"}
+	}
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
+	if err := validateSetupState(setup, "RefreshRound2"); err != nil {
+		return nil, err
+	}
+	if len(coeffs) != setup.Threshold-1 {
+		return nil, &CorruptStateError{Phase: "RefreshRound2", Detail: "incorrect local polynomial size"}
+	}
 	secretShares := make(map[int][]byte)
 	for _, j := range setup.AllIDs {
 		if j == setup.MyID {
@@ -185,6 +208,9 @@ func RefreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byt
 //
 // Returns an error naming all bad senders if any verification fails; setup is
 // NOT modified in that case.
+// A completed local seed contribution cannot be applied again on this setup.
+// This in-memory replay record does not replace durable caller-side routing
+// and replay protection after state restoration.
 func RefreshFinalize(
 	setup *SignerSetup,
 	coeffs []btcec.ModNScalar,
@@ -192,10 +218,23 @@ func RefreshFinalize(
 	allRound1 map[int]*RefreshRound1Output,
 	allRound2 map[int]*RefreshRound2Output,
 ) error {
+	if setup == nil {
+		return &InvalidInputError{Phase: "RefreshFinalize", Detail: "setup is required"}
+	}
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
+	if err := validateSetupState(setup, "RefreshFinalize"); err != nil {
+		return err
+	}
 	if err := checkBlacklist(setup, setup.AllIDs, "RefreshFinalize"); err != nil {
 		return err
+	}
+	if len(coeffs) != setup.Threshold-1 {
+		return &CorruptStateError{Phase: "RefreshFinalize", Detail: "incorrect local polynomial size"}
+	}
+	contribution := refreshContribution{publicKey: string(setup.PubKey), partyID: setup.MyID, seed: mySeed}
+	if setup.completedRefresh[contribution] {
+		return &CorruptStateError{Phase: "RefreshFinalize", Detail: "local refresh contribution already applied"}
 	}
 	var badSenders []int
 
@@ -334,6 +373,10 @@ func RefreshFinalize(
 	// so ids used in earlier epochs cannot reproduce anything under the new
 	// seeds. Clearing the record bounds its growth to one epoch.
 	setup.SessionIDs = make(map[string]int)
+	if setup.completedRefresh == nil {
+		setup.completedRefresh = make(map[refreshContribution]bool)
+	}
+	setup.completedRefresh[contribution] = true
 	return nil
 }
 
@@ -377,33 +420,22 @@ func refreshFeldmanVerify(share *btcec.ModNScalar, x int, nonConstFeldman [][]by
 	xPow.Set(&xScalar) // x^1
 
 	// RHS = Σ_{k=1}^{t-1} C_{i,k} · x^k.
-	var rhs btcec.JacobianPoint
+	rhs := newCurvePoint()
 	for _, commitBytes := range nonConstFeldman {
 		Cik, err := compressedToPoint(commitBytes)
 		if err != nil {
 			return fmt.Errorf("dkls23: parse refresh Feldman commitment: %w", err)
 		}
 		scaled := scalarMul(&xPow, Cik)
-		btcec.AddNonConst(&rhs, scaled, &rhs)
+		rhs.Add(scaled)
 		xPow.Mul(&xScalar)
 	}
-	rhs.ToAffine()
 
 	// LHS = share · G.
-	var lhs btcec.JacobianPoint
-	btcec.ScalarBaseMultNonConst(share, &lhs)
-	lhs.ToAffine()
+	lhs := scalarMulG(share)
 
-	// Both sides must be the point at infinity (zero share) or equal affine points.
-	lhsInf := lhs.X.IsZero() && lhs.Y.IsZero()
-	rhsInf := rhs.X.IsZero() && rhs.Y.IsZero()
-	if lhsInf != rhsInf {
-		return errors.New("dkls23: refresh Feldman verification failed: point at infinity mismatch")
-	}
-	if lhsInf {
-		return nil
-	}
-	if !lhs.X.Equals(&rhs.X) || !lhs.Y.Equals(&rhs.Y) {
+	// Complete group equality also covers the zero-share / identity case.
+	if lhs.Equal(rhs) != 1 {
 		return errors.New("dkls23: refresh Feldman verification failed: share inconsistent with commitments")
 	}
 	return nil

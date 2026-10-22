@@ -15,10 +15,18 @@
 //
 // The protocol operates in a t-of-n threshold setting over secp256k1.
 // All secret scalar arithmetic uses constant-time ModNScalar operations.
+// Point operations and SEC1 encoding use github.com/bytemare/secp256k1;
+// the backend integration has not received an independent security audit.
 // Cheating parties are detected by the OT-extension consistency check, the
 // VOLE consistency check, and the R-commitment decommitment and check-value
 // verification; detected parties are blacklisted and excluded from future
 // sessions.
+//
+// ModNScalar's fixed-width arithmetic and byte conversion are documented
+// and implemented in the underlying decred v4.4.1 dependency:
+// https://github.com/decred/dcrd/blob/dcrec/secp256k1/v4.4.1/dcrec/secp256k1/modnscalar.go
+// Point backend source references are in curve.go. These source references
+// do not establish the compiled integration's timing behavior.
 //
 // Only the base-OT seeds and FZero seeds are persistent (Section 8.2). The
 // OT-extension batch and the VOLE correlation derived from it are specific
@@ -40,11 +48,7 @@
 // See the example/ directory for a runnable demonstration.
 package dkls23
 
-import (
-	"math/big"
-
-	"github.com/btcsuite/btcd/btcec/v2"
-)
+import "github.com/btcsuite/btcd/btcec/v2"
 
 // Security parameters per DKLS23 §2 / Appendix A.
 const (
@@ -89,10 +93,6 @@ const (
 	domainFZeroRefresh = "fzero-refresh"
 )
 
-// curveOrder is the secp256k1 group order q.
-// Retained for the 64-byte reduction of public hash outputs in reduce64Public.
-var curveOrder = btcec.S256().N
-
 // gadget is the precomputed gadget vector g[j] = 2^j mod q for j in [0, Xi).
 // It is used for the binary decomposition inner product in VOLE.
 var gadget [Xi]btcec.ModNScalar
@@ -127,9 +127,9 @@ func GadgetInnerProduct(beta [Xi]bool) btcec.ModNScalar {
 	return acc
 }
 
-// condUint32 returns 1 if b is true, 0 otherwise.
-// On Go 1.20+ this compiles to a branchless conditional-move instruction
-// (CSEL on ARM64, CMOV on x86-64).
+// condUint32 returns 1 if b is true, 0 otherwise. The source conditional must
+// compile without a secret-dependent branch. This has not been verified for
+// every toolchain and architecture; see SECURITY.md's Known Limitations.
 func condUint32(b bool) uint32 {
 	var v uint32
 	if b {
@@ -154,6 +154,8 @@ var orderMinus2 = [32]byte{
 // The exponent q-2 is a public constant, so the square-and-multiply
 // loop's branch pattern is fixed and leaks no information about val.
 // All arithmetic uses constant-time ModNScalar.Square and ModNScalar.Mul.
+// Those methods' documentation and fixed-width source are in:
+// https://github.com/decred/dcrd/blob/dcrec/secp256k1/v4.4.1/dcrec/secp256k1/modnscalar.go
 //
 // This replaces btcec's InverseValNonConst, which uses math/big internally.
 func scalarInverse(val *btcec.ModNScalar) btcec.ModNScalar {
@@ -170,16 +172,20 @@ func scalarInverse(val *btcec.ModNScalar) btcec.ModNScalar {
 	return result
 }
 
-// reduce64Public reduces a 64-byte big-endian value modulo the secp256k1 group order
-// and returns the result as a ModNScalar. This is used for Fiat-Shamir challenge
-// derivation and FZero hashing where the input is a public hash output, so the
-// non-constant-time big.Int reduction is acceptable.
-func reduce64Public(b []byte) btcec.ModNScalar {
-	v := new(big.Int).SetBytes(b)
-	v.Mod(v, curveOrder)
-	var buf [32]byte
-	v.FillBytes(buf[:])
-	var s btcec.ModNScalar
-	s.SetBytes(&buf)
-	return s
+// reduce64 reduces the same 64-byte big-endian hash output modulo q used by
+// DKLS23's FZero (Section 3.1) and VOLE Fiat-Shamir challenges (Protocol 5.2).
+// FZero's PRF output is secret, so reduction must be constant-time too.
+// For b = high*2^256 + low, reduce both halves with ModNScalar and combine
+// using the existing gadget[256] = 2^256 mod q. No hash input or distribution
+// changes. The array parameter fixes the input width independently of value.
+// The same ModNScalar source cited by scalarInverse documents SetByteSlice,
+// Mul and Add; fixed 32-byte halves avoid length-dependent input paths.
+func reduce64(b *[64]byte) btcec.ModNScalar {
+	var high, low btcec.ModNScalar
+	high.SetByteSlice(b[:32])
+	low.SetByteSlice(b[32:])
+	high.Mul(&gadget[Kappa])
+	high.Add(&low)
+	low.Zero()
+	return high
 }
