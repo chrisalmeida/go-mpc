@@ -11,7 +11,7 @@ Threshold signing library in Go. Two protocols, implemented strictly from their 
 
 - **Module**: `github.com/chrisalmeida/go-mpc`
 - **Go**: `go 1.26.0` minimum (required by `golang.org/x/crypto`), `toolchain go1.26.1` pinned in `go.mod` (CI reads it via `go-version-file`)
-- **Scope**: cryptography only. Callers supply transport, authentication, broadcast, session ids, and storage. No resharing (changing t or n), no key derivation.
+- **Scope**: cryptography, plus `session/`, a storage-agnostic progress guard for the signing and refresh rounds. Callers still supply transport, authentication, broadcast, session ids, and the storage backend behind `session.Store`. No resharing (changing t or n), no key derivation.
 
 ## Repository Map
 
@@ -28,6 +28,7 @@ Threshold signing library in Go. Two protocols, implemented strictly from their 
   - `refresh.go` — KMOS21 proactive refresh of shares, base-OT seeds and FZero seeds: `RefreshRound1` → `RefreshRound2` → `RefreshFinalize`
   - `setup_messages.go` — wire types for the one-time pairwise setup (FZero messages; base-OT messages live in `ot.go`)
   - `encoding.go` — JSON marshaling for every type; `SetupWireVersion`
+  - `validation.go` — local setup and selected-peer checks; private signing-state consistency checks before later-round output
   - `persistence.go` — `SetupEncryptor` interface, `MarshalEncrypted`/`UnmarshalEncrypted`
   - `errors.go` — `CheatingPartyError`, `InvalidInputError`, `CorruptStateError`, `BlacklistedPartyError`
 - `frost/` — FROST package. Every file is security-critical.
@@ -38,13 +39,19 @@ Threshold signing library in Go. Two protocols, implemented strictly from their 
   - `verify.go` — cofactored verification (`Verify`, `VerifyBytes`)
   - `refresh.go` — proactive refresh with zero-constant polynomials
   - `encoding.go` — JSON marshaling; `WireFormatVersion`
+  - `validation.go` — configured key/participant checks, optional verification/DKG metadata validation, local refresh polynomial checks
   - `persistence.go`, `errors.go` — as in dkls23
+- `session/` — caller-side transactional progress guard for both protocols (AUDIT.md FU-MED-6); it chooses neither a database nor a private-state format.
+  - `store.go` — `Scope`, `ID`, `Version`, `KeyRecord`, `Record`; the `Store`/`Transaction` contract; `Request`, `Input`, `Update`, `Compute`; sentinel errors
+  - `guard.go` — `Initialize`, `InspectKey`, `InspectSession`, `Advance` (at most one committed result per round, nonce-marker reservation, cached outputs, refresh prepare), `Output`, `Abort`, `Blacklist`, `Activate`; rolled-back attempts can be recomputed by a later explicit call
+  - `storetest/` — `Run`, the `Store` conformance suite every adapter must pass under `-race`, and `Model`, an in-memory fault-injecting store for tests (not a backend)
+  - `dkls23/store_test.go`, `frost/store_test.go` — complete signing sessions driven through `Advance`, with a lost commit acknowledgement, concurrent calls and a stale backup
 - `example/` — separate module (`go.mod` with `replace github.com/chrisalmeida/go-mpc => ../`), not part of `go test ./...`
   - `shared/` — AES-256-GCM `SetupEncryptor` used by both demos
   - `dkls23/` — 3-of-3 demo: DKG → base OT + FZero → persist → sign → refresh → persist → sign; `node/` wraps the package per party
   - `frost/` — 2-of-3 demo with every signer subset, persistence and refresh
   - Each demo writes `shares/` (gitignored); delete it to start from a fresh DKG
-- Documents: `README.md` (user-facing, includes "Upgrading from v0.x"), `dkls23/README.md` and `frost/README.md` (per-package file maps and protocol flow), `SECURITY.md` (threat model, timing design and evidence, limitations, disclosure), `AUDIT.md` (findings with IDs; the 2026-10-16 follow-up section and the 2026-10-21 hardening addendum supersede the original text where they disagree), `CHANGELOG.md` (Keep a Changelog), `CONTRIBUTING.md`, `AGENTS.md` (a pointer to this file for agents that read that name instead; keep it a pointer, not a copy)
+- Documents: `README.md` (user-facing, includes "Upgrading from v0.x"), `dkls23/README.md` and `frost/README.md` (per-package file maps and protocol flow), `SECURITY.md` (threat model, timing design and evidence, limitations, disclosure), `AUDIT.md` (findings with IDs; the 2026-10-16 follow-up section and the 2026-10-21 hardening addendum supersede the original text where they disagree), `CHANGELOG.md` (Keep a Changelog), `CONTRIBUTING.md`, `session/README.md` (the guard's flow and the `Store` contract), `AGENTS.md` (a pointer to this file for agents that read that name instead; keep it a pointer, not a copy)
 
 ## Development Workflow
 
@@ -101,6 +108,7 @@ These rules exist because the 2026-10-16 review found that earlier code had drif
 
 - **dkls23**: the curve backend adapter and `selectPoint` in `curve.go`; `reduce64` on FZero output; DKG commitment opening and commitment-count check; base-OT message validation and identity rejection; OT-extension consistency check and pad handling; VOLE Fiat-Shamir proof; R-commitment decommitment and checks 1-3; final signature verification in `SignCombine`; refresh commitment opening and seed re-randomization; encryption key handling in persistence.
 - **frost**: DKG proof-of-knowledge verification and Feldman checks; `deserializeElement` on every received element; hedged nonce generation and the `consumed` guard plus shared `nonceUse` record against nonce reuse (round 2 holds the signer's write lock); binding-factor and commitment-list encoding; share verification in `Aggregate`; cofactored verification; refresh commitment and count checks; encryption key handling.
+- **session**: `Advance`'s version check, participant binding, nonce-marker reservation, output caching and refresh prepare/activate gating; the `loadKey`/`loadSession` corruption checks; the `Store` contract exercised by `storetest.Run`, including rollback that preserves previously committed records and nonce reservations. Passing the suite does not establish every part of the backend's contract or physical durability.
 
 ## Testing
 
@@ -114,7 +122,7 @@ These rules exist because the 2026-10-16 review found that earlier code had drif
 - Every wire type has a `FuzzUnmarshal<Type>` target and a table of unmarshal error cases; every `UnmarshalJSON` must fail cleanly on bad input: no panic, and the rejection test asserts the receiver re-marshals byte-identical to its state before the call, not merely that an error is returned.
 - Every one-use or single-application guard has a sequential second-call test and a concurrent test under `-race`, each asserting exactly one success and that the resulting signature or state still verifies independently.
 - Every property stated in SECURITY.md or a GoDoc comment is backed by a test that would fail if it were false, and the test name or AUDIT.md entry says which claim it backs. A claim with no such test moves to Known Limitations (rule 11).
-- Coverage stays at 90%+ per package; everything runs under `-race`.
+- Coverage stays at 90%+ per production package (`dkls23`, `frost`, `session`; `make cover` measures exactly these). `session/storetest` is exempt only for the failure branches of its conformance harness, which run solely against a broken backend. Everything runs under `-race`.
 
 ### dkls23 fixtures (`helpers_test.go`, `sign_test.go`, `dkg_test.go`)
 
@@ -132,6 +140,13 @@ These rules exist because the 2026-10-16 review found that earlier code had drif
 - `runDKGRound1` / `runDKGRound2` — a `dkgSession` with configs, coefficients, and messages exposed; `requireCheating(t, err, ids...)` asserts a `CheatingPartyError` naming exactly those parties; `requireRound2AndFinalizeReject`.
 - `invalidElements(t)` — the catalogue of encodings `deserializeElement` must reject (identity, small order, mixed order, non-canonical, wrong length); reuse it when a new place parses an element.
 - `vectorSigners` and the `vec*` constants — RFC 9591 Appendix E.1 values; never edit them to make a test pass.
+
+### session fixtures (`guard_test.go`, `guard_rules_test.go`)
+
+- `storetest.Model` — in-memory store; `Open()` returns an independent connection, `FailNext(BeforeCommit|AfterCommit)` injects one commit failure into the next writing transaction.
+- `scope`, `request`, `update`, `initialize` — a valid scope per protocol, a request for one round, a well-formed `Compute`, and an initialized key.
+- `signingInProgress`, `refreshInProgress`, `refreshPrepared` — models with one signing round done, one refresh round done, or a refresh prepared but not activated; `write` edits records directly to model corruption.
+- `faultStore` fails one `Transaction` method; `misbehavingStore` breaks the callback contract (skipped, repeated, nil transaction, cancelled context).
 
 ### Performance
 

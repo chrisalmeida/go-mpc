@@ -168,28 +168,22 @@ func checkBlacklist(signer *SignerState, partyIDs []int, phase string) error {
 // nonce_generate).
 //
 // Nonce reuse across signing sessions is fatal: it enables full key recovery.
+// The configured key share, public key and participant membership are checked
+// before nonce generation. Optional verification and DKG metadata is validated
+// when present; the original DKG polynomial is not used to verify a refreshed
+// secret share.
 func SignRound1(signer *SignerState, signers []int) (*Round1State, *NonceCommitment, error) {
+	if signer == nil {
+		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: "signer is required"}
+	}
 	signer.mu.RLock()
 	defer signer.mu.RUnlock()
 
-	if err := validatePartyIDs(signers, "SignRound1"); err != nil {
+	if err := validateSigningState(signer, signers, "SignRound1"); err != nil {
 		return nil, nil, err
 	}
 	if err := checkBlacklist(signer, signers, "SignRound1"); err != nil {
 		return nil, nil, err
-	}
-	if len(signers) < signer.KeyShare.Threshold {
-		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: fmt.Sprintf("signer count %d below threshold %d", len(signers), signer.KeyShare.Threshold)}
-	}
-	myIDFound := false
-	for _, id := range signers {
-		if id == signer.KeyShare.ID {
-			myIDFound = true
-			break
-		}
-	}
-	if !myIDFound {
-		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: "myID not in signers list"}
 	}
 
 	hidingNonce, err := nonceGenerate(signer.KeyShare.SecretShare)
@@ -302,17 +296,11 @@ func SignRound2(signer *SignerState, state *Round1State, input *Round2Input) (*S
 	if state.consumed || (state.use != nil && state.use.consumed) {
 		return nil, &CorruptStateError{Phase: "SignRound2", Detail: "round 1 state already consumed (nonce reuse prevented)"}
 	}
-	if err := validatePartyIDs(state.Signers, "SignRound2"); err != nil {
+	if err := validateSigningState(signer, state.Signers, "SignRound2"); err != nil {
 		return nil, err
 	}
 	if err := checkBlacklist(signer, state.Signers, "SignRound2"); err != nil {
 		return nil, err
-	}
-	if len(state.Signers) < signer.KeyShare.Threshold || !slices.Contains(state.Signers, signer.KeyShare.ID) {
-		return nil, &InvalidInputError{Phase: "SignRound2", Detail: "invalid signing participant set"}
-	}
-	if _, err := deserializeElement(signer.KeyShare.PublicKey); err != nil {
-		return nil, &CorruptStateError{Phase: "SignRound2", Detail: fmt.Sprintf("invalid group public key: %v", err)}
 	}
 
 	// Sort signers for deterministic encoding.

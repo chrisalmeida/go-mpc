@@ -117,7 +117,7 @@ cd example/frost && go run .
 
 - **Transport, authentication, and broadcast.** Both protocols assume authenticated point-to-point channels and, for identifiable abort, a coordinator or broadcast that does not equivocate. See [SECURITY.md](SECURITY.md).
 - **Session management.** Callers generate the session ids. DKLS23 rejects a session id that the setup has already used in the current epoch (`SessionIDReusedError`) and runs each round of a session exactly once, but two copies of a setup restored from the same snapshot cannot see each other's records, so ids must still be unique in practice. FROST DKGs need a fresh context per run. The example programs show one way to do both.
-- **Crash recovery and refresh coordination.** Callers must durably record DKLS23 session reservations before sending outputs, prevent reuse of the same private session state across restored copies, and authenticate fresh peer refresh transcripts. The library rejects duplicate refresh finalization on live signer objects; it does not coordinate distributed epoch activation or recovery. See [SECURITY.md](SECURITY.md).
+- **Crash recovery and refresh coordination.** Callers must durably record DKLS23 session reservations before sending outputs, prevent reuse of the same private session state across restored copies, and authenticate fresh peer refresh transcripts. The library rejects duplicate refresh finalization on live signer objects; it does not coordinate distributed epoch activation or recovery. The `session` package implements the reservation, checkpoint, nonce-marker and refresh-activation bookkeeping over a transactional store you supply; see [session/README.md](session/README.md) and [SECURITY.md](SECURITY.md).
 - **Resharing.** Refresh keeps the same parties and threshold. Adding or removing parties, or changing t or n, is not supported.
 - **Key derivation.** There is no BIP32-style derivation of child keys.
 
@@ -133,6 +133,22 @@ on a live signer. Rejected custom JSON imports leave their receivers unchanged;
 successful decoding does not imply complete semantic validation. Existing APIs,
 persisted formats, protocol transcripts and restoration behavior are retained;
 the RFC 9591 Appendix E.1 vectors and fresh-VOLE regression remain unchanged.
+
+Signing and refresh now reject malformed local configuration and key material
+before use. Signing rejects unconfigured participants; DKLS23 also checks the
+selected peers' setup material and locally recomputable private round state.
+Valid pending sessions still resume after restoration. These checks do not
+authenticate stored documents or provide durable replay protection; see
+[AUDIT.md](AUDIT.md), FU-MED-10.
+
+The new `session` package is a storage-agnostic progress guard for both
+protocols: at most one committed result per round, outputs cached for
+retransmission after a lost acknowledgement, nonce markers that reject cloned
+randomness, a revision check that rejects stale backups, and a prepare/activate
+gate for refresh. It needs a transactional `session.Store` from the
+application; the repository ships only the in-memory test model. Rolled-back
+attempts can be recomputed by a later explicit call using freshly decoded
+checkpoints. See [session/README.md](session/README.md) and AUDIT.md FU-MED-6.
 
 ## Upgrading from v0.2.x
 
@@ -175,6 +191,10 @@ frost/               Threshold Schnorr / Ed25519 (RFC 9591)
   persistence.go     Encrypted key share serialization
   errors.go          Typed error categories
   params.go          Ciphersuite constants and element decoding
+session/             Transactional progress guard over a caller-supplied store
+  store.go           Scope, versions, records, the Store contract, sentinel errors
+  guard.go           Initialize, Advance, Output, Abort, Blacklist, Activate
+  storetest/         Store conformance suite and in-memory fault-injecting model
 example/
   shared/            AES-256-GCM encryptor (shared by both demos)
   dkls23/            Complete 3-of-3 DKLS23 demo

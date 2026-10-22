@@ -221,27 +221,19 @@ func sampleBeta() ([Xi]bool, error) {
 // counterparty j, samples a fresh FRVOLE instance in which Pi is Bob: a fresh
 // OT-extension batch (Functionality 5.1, fresh sid) whose receiver message is
 // carried in Round1Msg.OTExt.
+// The configured group and all pairwise material for the selected signers
+// are checked before sampling or returning any round output.
 func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, map[int]*Round1Msg, error) {
+	if setup == nil {
+		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: "setup is required"}
+	}
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
-	if err := validatePartyIDs(signers, "SignRound1"); err != nil {
+	if err := validateSigningSetup(setup, signers, "SignRound1"); err != nil {
 		return nil, nil, err
 	}
 	if err := checkBlacklist(setup, signers, "SignRound1"); err != nil {
 		return nil, nil, err
-	}
-	if len(signers) < setup.Threshold {
-		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: fmt.Sprintf("signer count %d below threshold %d", len(signers), setup.Threshold)}
-	}
-	myIDFound := false
-	for _, id := range signers {
-		if id == setup.MyID {
-			myIDFound = true
-			break
-		}
-	}
-	if !myIDFound {
-		return nil, nil, &InvalidInputError{Phase: "SignRound1", Detail: "myID not in signers list"}
 	}
 	// Paper step 4: ignore the request unless sigid is fresh.
 	if sigID == "" {
@@ -372,6 +364,8 @@ type Round2Msg struct {
 // If the OT-extension consistency check fails for party j, the shared FRVOLE
 // instance with Pj has aborted: j is blacklisted and a CheatingPartyError is
 // returned (paper step 8).
+// Locally recomputable private state is checked first; failures of these
+// local checks return CorruptStateError without blaming or blacklisting a peer.
 func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round1Msg) (*Round2State, map[int]*Round2Msg, error) {
 	if setup == nil || state == nil {
 		return nil, nil, &InvalidInputError{Phase: "SignRound2", Detail: "setup and round 1 state are required"}
@@ -384,6 +378,9 @@ func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 	// Round 2 consumes the counterparties' batches and sends this party's VOLE
 	// multiply messages; it may run exactly once per session on this setup.
 	if err := setup.requireSessionStage(state.SigID, sessionRound1Done, "SignRound2"); err != nil {
+		return nil, nil, err
+	}
+	if err := validateRound1State(setup, state, "SignRound2"); err != nil {
 		return nil, nil, err
 	}
 
@@ -513,6 +510,9 @@ type Round3Msg struct {
 //
 // The returned map contains one entry per counterparty plus an entry under
 // Pi's own ID holding Pi's own fragment (for use with SignCombine).
+// The local nonce, FZero value, masked share and retained peer-map entries
+// are checked before processing peer messages. These checks do not establish
+// the origin of a restored state or replace caller-side replay protection.
 func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRound2 map[int]*Round2Msg) (map[int]*Round3Msg, error) {
 	if setup == nil || state2 == nil || state2.Round1State == nil {
 		return nil, &InvalidInputError{Phase: "SignRound3", Detail: "setup and round 2 state are required"}
@@ -526,6 +526,9 @@ func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRoun
 	// of the counterparties' round 2 values; releasing fragments for two
 	// different sets of round 2 inputs would reveal r_i. Exactly once per session.
 	if err := setup.requireSessionStage(state2.SigID, sessionRound2Done, "SignRound3"); err != nil {
+		return nil, err
+	}
+	if err := validateRound2State(setup, state2, "SignRound3"); err != nil {
 		return nil, err
 	}
 

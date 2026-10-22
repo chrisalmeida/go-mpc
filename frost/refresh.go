@@ -123,8 +123,14 @@ func refreshFeldmanVerify(share *edwards25519.Scalar, x int, nonConstFeldman [][
 // Returns the broadcast output, the polynomial coefficients (kept private until
 // round 2), and the seed (kept private until round 2).
 func RefreshRound1(signer *SignerState) (*RefreshRound1Output, []*edwards25519.Scalar, [16]byte, error) {
+	if signer == nil {
+		return nil, nil, [16]byte{}, &InvalidInputError{Phase: "RefreshRound1", Detail: "signer is required"}
+	}
 	signer.mu.RLock()
 	defer signer.mu.RUnlock()
+	if err := validateSignerState(signer, "RefreshRound1"); err != nil {
+		return nil, nil, [16]byte{}, err
+	}
 
 	if err := checkBlacklist(signer, signer.KeyShare.AllIDs, "RefreshRound1"); err != nil {
 		return nil, nil, [16]byte{}, err
@@ -191,8 +197,17 @@ func RefreshRound1(signer *SignerState) (*RefreshRound1Output, []*edwards25519.S
 // RefreshRound2 decommits pairwise evaluations and reveals the seed.
 // coeffs and mySeed must be the values returned by RefreshRound1.
 func RefreshRound2(signer *SignerState, coeffs []*edwards25519.Scalar, mySeed [16]byte) (*RefreshRound2Output, error) {
+	if signer == nil {
+		return nil, &InvalidInputError{Phase: "RefreshRound2", Detail: "signer is required"}
+	}
 	signer.mu.RLock()
 	defer signer.mu.RUnlock()
+	if err := validateSignerState(signer, "RefreshRound2"); err != nil {
+		return nil, err
+	}
+	if err := validateRefreshCoefficients(coeffs, signer.KeyShare.Threshold, "RefreshRound2"); err != nil {
+		return nil, err
+	}
 
 	secretShares := make(map[int][]byte)
 	for _, j := range signer.KeyShare.AllIDs {
@@ -230,10 +245,18 @@ func RefreshFinalize(
 	allRound1 map[int]*RefreshRound1Output,
 	allRound2 map[int]*RefreshRound2Output,
 ) error {
+	if signer == nil {
+		return &InvalidInputError{Phase: "RefreshFinalize", Detail: "signer is required"}
+	}
 	signer.mu.Lock()
 	defer signer.mu.Unlock()
-
+	if err := validateSignerState(signer, "RefreshFinalize"); err != nil {
+		return err
+	}
 	if err := checkBlacklist(signer, signer.KeyShare.AllIDs, "RefreshFinalize"); err != nil {
+		return err
+	}
+	if err := validateRefreshCoefficients(coeffs, signer.KeyShare.Threshold, "RefreshFinalize"); err != nil {
 		return err
 	}
 	contribution := refreshContribution{publicKey: string(signer.KeyShare.PublicKey), partyID: signer.KeyShare.ID, seed: mySeed}

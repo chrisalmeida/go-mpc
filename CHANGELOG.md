@@ -6,8 +6,39 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`session` package: transactional progress guard** for DKLS23 and FROST
+  signing and refresh over a caller-supplied `session.Store`. `Advance` commits
+  at most one result per operation and round, saving the key checkpoint,
+  private round checkpoint, nonce marker, cached output and blacklist changes
+  atomically before returning bytes to send; `Output` replays committed bytes
+  after a lost acknowledgement; a revision check rejects stale backups;
+  refresh is prepared by its final round and promoted by `Activate`. After
+  rollback, a later explicit call can recompute the round from fresh checkpoints.
+  `session/storetest` provides the `Store` conformance suite and an in-memory
+  fault-injecting model. No protocol, wire format or persisted format changes;
+  the repository ships no production backend. (AUDIT.md FU-MED-6)
+
 ### Security
 
+- **session: strengthen rollback conformance and narrow execution claims.**
+  `storetest.Run` now checks that errors and panics preserve previously
+  committed key/session records, cached outputs and nonce reservations while
+  discarding tentative writes. Regression tests reject adapters that erase
+  progress during rollback. Documents state at most one committed result per
+  round and cover recomputation after rollback; passing the conformance suite
+  alone does not establish the complete storage contract. (FU-MED-11, FU-MED-12)
+- **both: validate local signing and refresh material before use.** Reject
+  invalid group configuration, malformed key material and unconfigured signing
+  participants before returning output. DKLS23 checks all selected peers' base
+  OT/FZero material, locally recomputable private round-state equations and
+  retained peer-map entries. FROST checks canonical shares and the matching
+  verification share when present. Refresh rejects missing or incorrectly
+  sized local polynomials. Valid restoration, partial DKLS23 pairwise setup
+  and refreshed FROST shares remain supported. Persisted formats and protocol
+  transcripts are unchanged; strict raw decoding, state origin binding and
+  durable recovery remain separate open work. (AUDIT.md FU-MED-10)
 - **frost: serialize nonce consumption** per RFC 9591 §5.1–5.2. Concurrent
   round-2 calls and copies of a returned round-1 state share one consumption
   record protected by its own mutex, including across equivalent signer

@@ -18,6 +18,7 @@ Implementation of **RFC 9591** ("Two-Round Threshold Schnorr Signatures with FRO
 | `verify.go` | Cofactored signature verification; RFC 8032 compatibility | RFC 9591 §6.1 |
 | `refresh.go` | Proactive share refresh with zero-constant Feldman polynomials | |
 | `encoding.go` | Versioned JSON wire format for every message and persisted type | |
+| `validation.go` | Validate local keys, participant membership, optional public metadata and refresh polynomial size before use | RFC 9591 §5 |
 | `persistence.go` | Pluggable encrypted storage for `KeyShare` and `SignerState` | |
 | `errors.go` | Typed errors: `CheatingPartyError`, `InvalidInputError`, `CorruptStateError`, `BlacklistedPartyError` | |
 
@@ -44,10 +45,20 @@ Treat exported fields as read-only and never reuse nonces for another session.
 These local checks do not change the
 signing equations, hash transcripts, message encoding or RFC test vectors.
 
+Signing and refresh validate the configured local key before use, including
+canonical scalar encoding and a matching verification share when provided.
+Signing rejects participants outside `AllIDs`. Optional DKG metadata is checked
+when present, but the original coefficient commitments cannot verify refreshed
+secret shares. The current verification share is checked against the current
+secret instead. See AUDIT.md FU-MED-10.
+
 Refresh finalization records completed local contributions on the live signer
 and rejects repeats. This local record is not serialized. Pending contribution
 restoration is unchanged; durable replay protection, fresh authenticated peer
 session routing and coordinated epoch activation remain caller responsibilities.
+The module's `session` package provides the durable progress guard and the
+refresh prepare/activate gate over a caller-supplied transactional store;
+`store_test.go` drives a full signing session through it.
 
 ---
 

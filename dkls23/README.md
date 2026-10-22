@@ -21,6 +21,7 @@ Paper: https://eprint.iacr.org/2023/765.pdf
 | `refresh.go` | **Proactive refresh** (KMOS21) — re-randomizes shares, base-OT seeds, FZero seeds | |
 | `persistence.go` | JSON serialization and pluggable encrypted storage for `SignerSetup` | |
 | `encoding.go` | Custom JSON marshaling for all protocol message types (versioned `SignerSetup` wire format) | |
+| `validation.go` | Validate local setup, selected peers and locally recomputable private signing state before use | Protocols 3.6, 5.2 |
 | `setup_messages.go` | Wire types for the one-time base OT and FZero setup messages | |
 | `errors.go` | Typed errors: `CheatingPartyError`, `InvalidInputError`, `CorruptStateError`, `BlacklistedPartyError` | |
 
@@ -42,6 +43,17 @@ Existing setup and private round-state JSON remain usable with the matching
 session progress. Callers must retain the correct key/epoch association and
 durably reserve fresh session ids before transmitting outputs. Serialization
 alone does not prevent rollback or reuse of the same secrets across copies.
+The module's `session` package implements that reservation and recovery
+discipline over a caller-supplied transactional store; `store_test.go` drives
+a full signing session through it.
+
+Signing checks participant membership and both directions of base OT plus
+FZero material for every selected peer before returning round-1 output.
+Setup for unselected peers may remain absent. Later rounds check the local
+nonce opening, FZero value, VOLE choice/scalar relation, masked share and
+required peer-map entries. Failures of these local checks return
+`CorruptStateError` before peer messages are evaluated. These checks cannot establish
+the origin or freshness of a restored document. See AUDIT.md FU-MED-10.
 
 Refresh finalization records completed local contributions on the live setup
 and rejects repeats. This local record is not serialized. Pending contribution

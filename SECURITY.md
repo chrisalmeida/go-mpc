@@ -180,6 +180,16 @@ properties are Known Limitations and independent-review production gates.
   checks before using decoded messages.
   Regression tests finish the active signing or refresh operation after
   rejected imports and verify the resulting signatures independently.
+- Signing and refresh check local configuration and key material before use.
+  Signing rejects unconfigured participants; DKLS23 requires both base-OT
+  directions and FZero material for every selected peer, while permitting
+  absent setup for unselected peers. Later DKLS23 rounds check the stored
+  nonce opening, FZero value, VOLE choice/scalar relation, masked share and
+  required peer-map entries before evaluating peer messages. FROST checks
+  canonical secret-share encoding and its verification share when provided;
+  optional original DKG metadata is validated without treating it as a proof
+  of the current refreshed share. These are local consistency checks, not
+  authentication or proof of the original state association (FU-MED-10).
 - Retain the matching key, epoch, participant set and session progress with
   private signing or refresh state. Existing restoration behavior is retained;
   signer object identity is not an authorization check. Never use a nonce pair
@@ -192,13 +202,34 @@ properties are Known Limitations and independent-review production gates.
   rollback detection or coordination of the same ephemeral secrets across
   copies. Supply transactional storage for those properties. Snapshot
   restoration and RNG-state cloning must not cause session or nonce reuse.
+- The `session` package implements these rules over a caller-supplied
+  transactional `Store`. Given a backend that satisfies the documented
+  transaction and durability contract, `Advance` commits at most one result
+  per operation and round, saving the updated key checkpoint, private round
+  checkpoint, nonce marker, cached output and blacklist changes atomically
+  before returning any bytes. It returns committed bytes again through
+  `Output` after a lost acknowledgement, rejects requests carrying an older
+  key revision, and blocks signing while a refresh
+  is pending until `Activate`. The nonce-marker check also rejects a repeated
+  nonce under another session or epoch, which is how cloned RNG state would
+  surface. The guard cannot supply the backend's durability, authenticate
+  peers, notice a store and signer restored together from one old snapshot,
+  or agree on activation with the group. The repository ships only the
+  in-memory test model, not a backend. A rolled-back attempt can be recomputed
+  by a later explicit `Advance` call; `Compute` must decode fresh checkpoints,
+  avoid external side effects and return output only through `Update`.
+  `storetest.Run` checks rollback from empty and populated storage, retaining
+  complete committed records and nonce reservations. Passing the finite
+  suite does not establish every part of the contract or physical durability
+  (FU-MED-11 and FU-MED-12).
 - On refresh, quiesce old signing sessions, authenticate the refresh session,
   agree on success, and persist the new epoch consistently across the group.
   A local one-use guard cannot solve a partial distributed commit or recovery
   from old backups. Recovery must not silently activate mixed epochs.
 - The examples demonstrate protocol calls and encryption, not a production
   storage or recovery system. Their colocated encryption keys and direct
-  `os.WriteFile` calls do not meet these requirements.
+  `os.WriteFile` calls do not meet these requirements, and they do not yet
+  use the `session` package.
 
 ## Evidence and Test Coverage
 
@@ -265,6 +296,13 @@ only, as described under Known Limitations.
 | Rejected custom decodes preserve the serialized receiver | `TestRejectedUnmarshalPreservesReceiver` in each `unmarshal_errors_test.go`; `TestRejectedImportPreservesSigningSession` in each `session_test.go` for signer and private round state |
 | Rejected imports preserve pending refresh | `TestRejectedImportPreservesPendingRefresh` in each `refresh_session_test.go` |
 | Existing restoration behavior | DKLS23 `TestSignResumesWithRestoredSetup`, `TestSignResumesWithRestoredRoundState`, `TestSignResumesAfterInPlaceRestore`; FROST `TestSignResumesWithRestoredSigner`, `TestSignResumesAfterInPlaceRestore`; both `TestRefreshPreservesPendingContribution` |
+| Reject malformed local keys/configuration and unconfigured signers before output | DKLS23 `TestSignRound1RejectsInvalidSetupBeforeOutput`, `TestSigningRejectsMalformedRestoredSetup`; FROST `TestSignRound1RejectsInvalidKeyBeforeOutput`, `TestSignRound1RejectsInvalidConfiguredElements`, `TestSigningRejectsMalformedRestoredKey`; both `TestSignRound1RejectsUnconfiguredParticipant` in `validation_test.go` |
+| Covered local consistency failures preserve session progress, nonces and blacklists | DKLS23 `TestSignRound2RejectsInconsistentPrivateState`, `TestSignRound3RejectsIncompletePrivateState`; FROST `TestSignRound2RejectsInconsistentRestoredKey`; repaired states finish independently verified signatures |
+| Preserve valid subset setup, minimal FROST keys and refreshed signing material | DKLS23 `TestSigningAcceptsPairwiseSetupForSelectedSubset`, `TestSetupValidationAcceptsRefreshedSigningMaterial`; FROST `TestSigningAcceptsMinimalKeyConfiguration`, `TestKeyValidationAcceptsRefreshedShareWithOriginalCommitments` |
+| Reject invalid local refresh material before output or mutation | DKLS23 `TestRefreshRejectsInvalidSetupBeforeOutputOrMutation`, FROST `TestRefreshRejectsInvalidKeyBeforeOutputOrMutation`, and both `TestRefreshRound2RejectsWrongLocalPolynomialSize` |
+| Session guard: at most one committed result per round across connections; rolled-back attempts can be recomputed without releasing uncommitted output; stale backups, nonce reuse, failed commits, callback errors and panics, protocol aborts | `TestRoundsCommitOnceAcrossConnections`, `TestRolledBackRoundCanBeRecomputedBeforeCommit`, `TestStaleBackupAndNonceReuseAreRejected`, `TestCommitFailuresReleaseNoOutputAndRecoverFromStore`, `TestComputationFailureAndPanicRollBack`, `TestProtocolAbortCommitsBlacklistButWithholdsOutput` in [session/guard_test.go](session/guard_test.go); end to end, DKLS23 `TestTransactionalSigningRecoversCommittedRoundAndRejectsCopies` and FROST `TestTransactionalSigningRecoversCommitmentAndConsumesRestoredNoncesOnce` in each `store_test.go` |
+| Session guard: refresh quiescence and activation, durable abort and blacklist, invalid requests and updates, corrupt records, store faults and contract violations | `TestRefreshQuiescesSigningAndRequiresExplicitActivation`, `TestAbortAndBlacklistSurviveReopening` in [session/guard_test.go](session/guard_test.go); `TestInvalidRequestsAreRejectedBeforeCompute`, `TestInvalidUpdatesAreRejectedWithoutCommit`, `TestCorruptRecordsAreReportedNotRepaired`, `TestProgressAndAbortRulesAcrossOperations`, `TestRefreshAbortAndActivationConsistency`, `TestStoreErrorsPropagateAndCommitNothing`, `TestStoreContractViolationsAreReported` in [session/guard_rules_test.go](session/guard_rules_test.go) |
+| Store contract checks (atomic commit, rollback on error and panic preserving complete committed records and nonce reservations, no aliasing, serialized connections, namespaces) and the test model's fault injection | `storetest.Run` via `TestModelStorageContract`, `TestConformanceRejectsDestructiveRollback` and `TestModelInjectsOneCommitFailureAndHonorsCancellation` in [session/storetest](session/storetest); a finite conformance run does not establish every part of the contract or a backend's physical durability |
 | Persistence version checks | DKLS23 `TestEncodingSignerSetupVersion`; FROST `TestWireFormatVersion` in each `encoding_test.go` |
 
 ## Known Limitations
@@ -282,6 +320,12 @@ only, as described under Known Limitations.
   fields are checked only by the receiving protocol round. Decode messages
   into fresh objects and discard them on errors, including the base-OT
   messages that use standard `encoding/json` rather than custom decoders.
+  Local checks before signing/refresh cannot detect a noncanonical original
+  DKLS23 scalar once a legacy decoder has reduced it, authenticate a stored
+  transcript, prove DKLS23 share-to-group-key correspondence, or establish
+  correlations with a peer's secret setup material. Strict raw import
+  validation remains open alongside state association; durable recovery needs
+  a conforming `session.Store` backend, which this repository does not ship.
 - **Randomness and protocol assumptions**: The tests do not establish
   resistance to every malicious participant or failure of the CSPRNG. Hedged
   nonce derivation does not permit repeated randomness or RNG-state cloning.
@@ -303,7 +347,9 @@ only, as described under Known Limitations.
   re-keys everything a session id feeds into. Callers should still generate
   a fresh random id per session (as the example does with `node.SessionID`);
   the check is a backstop, and two setups restored from the same snapshot
-  cannot see each other's records.
+  cannot see each other's records. The `session` package's revision check
+  rejects the older of two copies once the authoritative store has advanced,
+  provided the store itself was not restored alongside the signer.
 - **Peer transcript replay and distributed recovery**: Local lifetime checks
   do not provide reliable broadcast, fresh authenticated peer transcript
   envelopes, distributed commit, or backup rollback protection. Implement

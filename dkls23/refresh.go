@@ -89,8 +89,14 @@ type RefreshRound2Output struct {
 // Returns the broadcast output, the polynomial coefficients (kept private until
 // RefreshRound2), and the seed (kept private until RefreshRound2).
 func RefreshRound1(setup *SignerSetup) (*RefreshRound1Output, []btcec.ModNScalar, [16]byte, error) {
+	if setup == nil {
+		return nil, nil, [16]byte{}, &InvalidInputError{Phase: "RefreshRound1", Detail: "setup is required"}
+	}
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
+	if err := validateSetupState(setup, "RefreshRound1"); err != nil {
+		return nil, nil, [16]byte{}, err
+	}
 	t := setup.Threshold
 
 	// Sample t-1 coefficients δ_1, …, δ_{t-1} for the zero-constant polynomial.
@@ -159,8 +165,17 @@ func RefreshRound1(setup *SignerSetup) (*RefreshRound1Output, []btcec.ModNScalar
 // RefreshRound2 decommits pairwise evaluations and reveals the seed.
 // coeffs and mySeed must be the values returned by RefreshRound1.
 func RefreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byte) (*RefreshRound2Output, error) {
+	if setup == nil {
+		return nil, &InvalidInputError{Phase: "RefreshRound2", Detail: "setup is required"}
+	}
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
+	if err := validateSetupState(setup, "RefreshRound2"); err != nil {
+		return nil, err
+	}
+	if len(coeffs) != setup.Threshold-1 {
+		return nil, &CorruptStateError{Phase: "RefreshRound2", Detail: "incorrect local polynomial size"}
+	}
 	secretShares := make(map[int][]byte)
 	for _, j := range setup.AllIDs {
 		if j == setup.MyID {
@@ -203,10 +218,19 @@ func RefreshFinalize(
 	allRound1 map[int]*RefreshRound1Output,
 	allRound2 map[int]*RefreshRound2Output,
 ) error {
+	if setup == nil {
+		return &InvalidInputError{Phase: "RefreshFinalize", Detail: "setup is required"}
+	}
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
+	if err := validateSetupState(setup, "RefreshFinalize"); err != nil {
+		return err
+	}
 	if err := checkBlacklist(setup, setup.AllIDs, "RefreshFinalize"); err != nil {
 		return err
+	}
+	if len(coeffs) != setup.Threshold-1 {
+		return &CorruptStateError{Phase: "RefreshFinalize", Detail: "incorrect local polynomial size"}
 	}
 	contribution := refreshContribution{publicKey: string(setup.PubKey), partyID: setup.MyID, seed: mySeed}
 	if setup.completedRefresh[contribution] {
