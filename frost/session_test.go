@@ -24,14 +24,19 @@ func sessionFixture(t *testing.T) (map[int]*SignerState, map[int]*Round1State, m
 	return signers, states, commitments
 }
 
-func finishNonceSession(t *testing.T, signers map[int]*SignerState, states map[int]*Round1State, commitments map[int]*NonceCommitment, message []byte) {
+func finishNonceSession(t *testing.T, signers map[int]*SignerState, states map[int]*Round1State, commitments map[int]*NonceCommitment, message []byte, completed ...*SignatureShare) {
 	t.Helper()
 	shares := make(map[int]*SignatureShare)
+	for _, share := range completed {
+		shares[share.SignerID] = share
+	}
 	verification := make(map[int][]byte)
 	for _, id := range []int{1, 2, 3} {
-		share, err := SignRound2(signers[id], states[id], &Round2Input{Message: message, AllCommitments: commitments})
-		require.NoError(t, err)
-		shares[id] = share
+		if shares[id] == nil {
+			share, err := SignRound2(signers[id], states[id], &Round2Input{Message: message, AllCommitments: commitments})
+			require.NoError(t, err)
+			shares[id] = share
+		}
 		verification[id] = signers[id].KeyShare.VerificationShare
 	}
 	signature, err := Aggregate(commitments, shares, message, signers[1].KeyShare.PublicKey, verification, []int{1, 2, 3})
@@ -88,14 +93,20 @@ func TestSignConcurrentNonceConsumption(t *testing.T) {
 		name           string
 		copied         bool
 		restoredSigner bool
+		rawNonces      bool
 	}{
-		{"original", false, false},
-		{"copied", true, false},
-		{"restored signers", true, true},
+		{"original", false, false, false},
+		{"copied", true, false, false},
+		{"restored signers", true, true, false},
+		{"raw state", false, false, true},
+		{"copied raw state", true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			signers, states, commitments := sessionFixture(t)
+			if tc.rawNonces {
+				states[1].use = nil
+			}
 			const workers = 16
 			type result struct {
 				share *SignatureShare
@@ -164,12 +175,37 @@ func TestSignCopiedNonceStateIsSingleUse(t *testing.T) {
 	signers, states, commitments := sessionFixture(t)
 	copied := *states[1]
 	input := &Round2Input{Message: []byte("one invocation"), AllCommitments: commitments}
-	_, err := SignRound2(signers[1], states[1], input)
+	winner, err := SignRound2(signers[1], states[1], input)
 	require.NoError(t, err)
 	share, err := SignRound2(signers[1], &copied, input)
 	var corrupt *CorruptStateError
 	require.ErrorAs(t, err, &corrupt)
 	require.Nil(t, share)
+	finishNonceSession(t, signers, states, commitments, input.Message, winner)
+}
+
+func TestSignRejectsChangedNonceAssociation(t *testing.T) {
+	t.Parallel()
+	for _, changed := range []string{"public key", "participants"} {
+		t.Run(changed, func(t *testing.T) {
+			t.Parallel()
+			signers, states, commitments := sessionFixture(t)
+			signer := signers[1]
+			copied := *states[1]
+			if changed == "public key" {
+				signer = roundTrip(t, "SignerState", signer)
+				signer.KeyShare.PublicKey = edwards25519.NewGeneratorPoint().ScalarBaseMult(scalarFromUint64(42)).Bytes()
+			} else {
+				copied.Signers = []int{1, 2, 4}
+			}
+			input := &Round2Input{Message: []byte("nonce association"), AllCommitments: commitments}
+			share, err := SignRound2(signer, &copied, input)
+			var corrupt *CorruptStateError
+			require.ErrorAs(t, err, &corrupt)
+			require.Nil(t, share)
+			finishNonceSession(t, signers, states, commitments, input.Message)
+		})
+	}
 }
 
 func TestSignRejectsNonceStateFromAnotherSigner(t *testing.T) {
@@ -236,10 +272,11 @@ func TestSignRejectsErasedManuallySuppliedNonceCopy(t *testing.T) {
 	states[1].use = nil
 	copied := *states[1]
 	input := &Round2Input{Message: []byte("raw nonce fixture"), AllCommitments: commitments}
-	_, err := SignRound2(signers[1], states[1], input)
+	winner, err := SignRound2(signers[1], states[1], input)
 	require.NoError(t, err)
 	share, err := SignRound2(signers[1], &copied, input)
 	var corrupt *CorruptStateError
 	require.ErrorAs(t, err, &corrupt)
 	require.Nil(t, share)
+	finishNonceSession(t, signers, states, commitments, input.Message, winner)
 }

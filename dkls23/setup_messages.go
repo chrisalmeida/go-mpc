@@ -61,13 +61,18 @@ func (m *FZeroCommitMsg) MarshalJSON() ([]byte, error) {
 }
 
 func (m *FZeroCommitMsg) UnmarshalJSON(data []byte) error {
+	next := *m
 	var j fzeroCommitMsgJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	m.Commitment, err = hexToFixed32(j.Commitment)
-	return err
+	next.Commitment, err = hexToFixed32(j.Commitment)
+	if err != nil {
+		return err
+	}
+	*m = next
+	return nil
 }
 
 type fzeroRevealMsgJSON struct {
@@ -83,15 +88,20 @@ func (m *FZeroRevealMsg) MarshalJSON() ([]byte, error) {
 }
 
 func (m *FZeroRevealMsg) UnmarshalJSON(data []byte) error {
+	next := *m
 	var j fzeroRevealMsgJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	m.Seed, err = hexToFixed16(j.Seed)
+	next.Seed, err = hexToFixed16(j.Seed)
 	if err != nil {
 		return err
 	}
-	m.Salt, err = hexToFixed32(j.Salt)
-	return err
+	next.Salt, err = hexToFixed32(j.Salt)
+	if err != nil {
+		return err
+	}
+	*m = next
+	return nil
 }

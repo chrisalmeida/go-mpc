@@ -41,6 +41,18 @@ All notable changes to this project are documented here. The format follows
 
 - FROST round 2 takes the signer's write lock. Distinct sessions can interleave
   between rounds, but their round-2 calls on one signer execute serially.
+- Map security claims to named tests, distinguish inspected source from
+  measured timing and erasure, and clarify strict FROST protocol decoding
+  versus cofactored signature verification. Repair version-masked error
+  tests, add missing decoder fuzz targets and test sequential/concurrent
+  DKLS23 round replay with independent signature verification. (FU-LOW-7)
+
+### Fixed
+
+- Preserve receivers on rejection in every custom JSON decoder, extending
+  transactional decoding to the remaining key, message and ephemeral state
+  types with populated-receiver regression tests. Successful decoding
+  behavior and wire formats are retained. (FU-MED-9)
 
 ## [0.3.0] - 2026-10-21
 

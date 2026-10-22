@@ -28,7 +28,7 @@ go get github.com/chrisalmeida/go-mpc
 
 ## DKLS23 — Threshold ECDSA over secp256k1
 
-Implementation of "Threshold ECDSA in Three Rounds" (Doerner, Kondi, Lee, shelat). Three signing rounds, no trusted dealer, constant-time operations on secret values.
+Implementation of "Threshold ECDSA in Three Rounds" (Doerner, Kondi, Lee, shelat). Three signing rounds, no trusted dealer. See [SECURITY.md](SECURITY.md) for the evidence supporting implementation behavior and the limits of timing assurance.
 
 **How it is put together**
 
@@ -37,7 +37,7 @@ Implementation of "Threshold ECDSA in Three Rounds" (Doerner, Kondi, Lee, shelat
 - **Per-session OT extension and VOLE** — every signing session runs a fresh KOS15 OT-extension batch with the one-message Fiat-Shamir consistency check of §5.1, and derives a fresh random VOLE (Protocol 5.2) from it. Session correlations are never reused across signing sessions.
 - **Signing** — Protocol 3.6: commit to the nonce share, multiply through the VOLE, verify the consistency checks, combine, and verify the final ECDSA signature before releasing it.
 - **Refresh** — KMOS21 proactive refresh re-randomizes the Shamir shares, the base-OT seeds, and the FZero seeds without changing the public key.
-- **Cheating detection** — a party whose OT-extension batch, VOLE proof, decommitment, or check values fail verification is identified and excluded from all future sessions.
+- **Cheating detection** — a party whose OT-extension batch, VOLE proof, decommitment, or check values fail verification is identified and blacklisted. Signing rejects that party while the blacklist entry is retained; callers must persist it and prevent rollback.
 
 **Quick start**
 
@@ -82,7 +82,7 @@ Implementation of RFC 9591 with the FROST(Ed25519, SHA-512) ciphersuite. Two sig
 
 - **Key generation** — the FROST paper's KeyGen (Figure 1): Feldman VSS with a Schnorr proof of knowledge of each party's constant term, bound to a caller-supplied context string and verified before any share is sent. RFC 9591 does not specify a DKG, so this is the paper's construction.
 - **Signing and aggregation** — RFC 9591 §5: hedged nonce generation, binding factors, group commitment, signature shares, and share verification for identifiable abort. The Appendix E.1 test vectors are reproduced exactly by the test suite.
-- **Element decoding** — every received point goes through the RFC 9591 §6.1 `DeserializeElement` rules: canonical encoding, not the identity, in the prime-order subgroup.
+- **Element decoding** — received protocol points go through the RFC 9591 §6.1 `DeserializeElement` rules: canonical encoding, not the identity, in the prime-order subgroup. Public signature verification follows the separate decoding rules below.
 - **Verification** — the cofactored equation of RFC 9591 §6.1 on top of RFC 8032 decoding; honestly produced signatures are also accepted by `crypto/ed25519.Verify`.
 - **Refresh** — zero-constant Feldman polynomials re-randomize the shares and verification shares without changing the public key.
 
@@ -129,7 +129,8 @@ variable-time secret point operations and secret FZero reduction with
 constant-time primitives. Treat exported state fields as read-only.
 
 Both packages reject repeated application of a completed refresh contribution
-on a live signer. Rejected imports leave active state unchanged. Existing APIs,
+on a live signer. Rejected custom JSON imports leave their receivers unchanged;
+successful decoding does not imply complete semantic validation. Existing APIs,
 persisted formats, protocol transcripts and restoration behavior are retained;
 the RFC 9591 Appendix E.1 vectors and fresh-VOLE regression remain unchanged.
 
@@ -142,7 +143,7 @@ v0.3.0 changes the protocol structure, the APIs, and the persisted formats. It i
 - **DKLS23 pairwise setup** stores only base-OT seeds (`SignerSetup.AliceBaseOT`, `SignerSetup.BobBaseOT`). The base OT is Masny-Rindal and the receiver speaks first: `BaseOTReceiverRound1` → `BaseOTSenderRound2` → `BaseOTReceiverFinalize`. The former VOLE setup functions, `SignSetupPairwise`, `SignCounter`, and the persisted VOLE state are gone.
 - **DKLS23 round 1 messages** carry the session's OT-extension batch, so they are larger than before and specific to each counterparty.
 - **FROST key generation** adds `DKGPartyConfig.Context`, which must be non-empty and identical across parties, and the proof fields on `DKGRound1Output`; `DKGRound2` now takes all parties' round 1 outputs and verifies the proofs.
-- **FROST input validation is stricter.** Non-canonical point encodings, the identity, and small-order or mixed-order points are rejected wherever an element is received.
+- **FROST protocol input validation is stricter.** Non-canonical point encodings, the identity, and small-order or mixed-order points are rejected in protocol elements. Public signature verification retains RFC 8032 decoding and the RFC 9591 cofactored equation.
 
 The reasons for these changes are documented in the 2026-10-16 follow-up section of [AUDIT.md](AUDIT.md), including a confirmed key-recovery flaw in the v0.x DKLS23 implementation.
 
@@ -194,7 +195,7 @@ make ci            # everything CI runs
 
 ## Security
 
-Secret scalar arithmetic uses constant-time operations in both packages. DKLS23 uses `bytemare/secp256k1` for point operations and `btcec.ModNScalar` for scalar arithmetic, including reduction of secret FZero outputs. Its OT choice bits select with masks and constant-time copies. FROST uses `filippo.io/edwards25519`. These implementation choices have not been independently audited or established as side-channel resistant on every supported target.
+DKLS23 uses `bytemare/secp256k1` for point operations and `btcec.ModNScalar` for scalar arithmetic, including reduction of secret FZero outputs. Its OT choice bits select with masks and `crypto/subtle` copies. FROST uses `filippo.io/edwards25519`. These source choices rely on the dependency behavior documented in GoDoc; their compiled timing, cache behavior and memory erasure have not been independently established. [SECURITY.md](SECURITY.md#evidence-and-test-coverage) maps functional claims to tests and records those assurance limits.
 
 Both packages have had automated reviews. A 2026-10-16 follow-up found a previously missed critical key-recovery flaw; further hardening found nonce concurrency, curve-operation and secret-reduction defects. [AUDIT.md](AUDIT.md) records fixes, evidence limits and open findings. Passing tests does not establish cryptographic security.
 

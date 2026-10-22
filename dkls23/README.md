@@ -67,7 +67,12 @@ and consistent epoch activation remain caller responsibilities.
 
 A counterparty whose OT-extension batch fails the consistency check, whose
 VOLE proof fails, or whose decommitment or check values are inconsistent is
-blacklisted and excluded from all future sessions (step 8).
+blacklisted (step 8). Future signing rounds reject that party while the entry
+is retained; callers must persist the blacklist and prevent rollback.
+
+[SECURITY.md](../SECURITY.md#evidence-and-test-coverage) maps implementation
+claims to regression tests and distinguishes source inspection of timing
+properties from independent side-channel evidence.
 
 ---
 

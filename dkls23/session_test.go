@@ -8,6 +8,87 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Protocol 3.6 step 4 and the persisted round-progress guard apply to every
+// signing round. Competing calls must release one output, including under
+// -race, and the winning outputs must still form a valid ECDSA signature.
+func TestSignSessionRoundsAreSingleUseConcurrent(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	s := &signingSession{
+		sigID: t.Name(), signers: []int{1, 2, 3},
+		r1States: make(map[int]*Round1State), r1Msgs: make(map[int]map[int]*Round1Msg),
+		r2States: make(map[int]*Round2State), r2Msgs: make(map[int]map[int]*Round2Msg),
+		r3Frags: make(map[int]map[int]*Round3Msg),
+	}
+	message := []byte("one successful output per round")
+	type result struct {
+		r1  *Round1State
+		m1  map[int]*Round1Msg
+		r2  *Round2State
+		m2  map[int]*Round2Msg
+		m3  map[int]*Round3Msg
+		err error
+	}
+	for round := 1; round <= 3; round++ {
+		call := func(id int) (out result) {
+			switch round {
+			case 1:
+				out.r1, out.m1, out.err = SignRound1(setups[id], s.sigID, s.signers)
+			case 2:
+				out.r2, out.m2, out.err = SignRound2(setups[id], s.r1States[id], s.round1For(id))
+			case 3:
+				out.m3, out.err = SignRound3(setups[id], s.r2States[id], message, s.round2For(id))
+			}
+			return
+		}
+		store := func(id int, out result) {
+			switch round {
+			case 1:
+				s.r1States[id], s.r1Msgs[id] = out.r1, out.m1
+			case 2:
+				s.r2States[id], s.r2Msgs[id] = out.r2, out.m2
+			case 3:
+				s.r3Frags[id] = out.m3
+			}
+		}
+		const workers = 8
+		start := make(chan struct{})
+		results := make(chan result, workers)
+		for range workers {
+			go func() { <-start; results <- call(1) }()
+		}
+		close(start)
+		successes := 0
+		var winner result
+		for range workers {
+			out := <-results
+			if out.err == nil {
+				successes++
+				winner = out
+			} else {
+				var reused *SessionIDReusedError
+				require.ErrorAs(t, out.err, &reused)
+				require.Nil(t, out.r1)
+				require.Nil(t, out.r2)
+				require.Nil(t, out.m1)
+				require.Nil(t, out.m2)
+				require.Nil(t, out.m3)
+			}
+		}
+		require.Equal(t, 1, successes, "round %d", round)
+		store(1, winner)
+		var reused *SessionIDReusedError
+		require.ErrorAs(t, call(1).err, &reused, "sequential replay of round %d", round)
+		for _, id := range []int{2, 3} {
+			out := call(id)
+			require.NoError(t, out.err)
+			store(id, out)
+		}
+	}
+	r, signature := s.combine(t, setups, message)
+	verifyECDSA(t, setups[1].PubKey, message, r, signature)
+}
+
 func TestRejectedImportPreservesSigningSession(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

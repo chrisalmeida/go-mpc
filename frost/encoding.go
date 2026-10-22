@@ -74,6 +74,7 @@ func (ks *KeyShare) MarshalJSON() ([]byte, error) {
 }
 
 func (ks *KeyShare) UnmarshalJSON(data []byte) error {
+	next := *ks
 	var j keyShareJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
@@ -82,28 +83,29 @@ func (ks *KeyShare) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var err error
-	ks.ID = j.ID
-	ks.SecretShare, err = hex.DecodeString(j.SecretShare)
+	next.ID = j.ID
+	next.SecretShare, err = hex.DecodeString(j.SecretShare)
 	if err != nil {
 		return fmt.Errorf("frost: decode secret_share: %w", err)
 	}
-	ks.PublicKey, err = hex.DecodeString(j.PublicKey)
+	next.PublicKey, err = hex.DecodeString(j.PublicKey)
 	if err != nil {
 		return fmt.Errorf("frost: decode public_key: %w", err)
 	}
-	ks.VerificationShare, err = hex.DecodeString(j.VerificationShare)
+	next.VerificationShare, err = hex.DecodeString(j.VerificationShare)
 	if err != nil {
 		return fmt.Errorf("frost: decode verification_share: %w", err)
 	}
-	ks.GroupCommitments = make([][]byte, len(j.GroupCommitments))
+	next.GroupCommitments = make([][]byte, len(j.GroupCommitments))
 	for i, c := range j.GroupCommitments {
-		ks.GroupCommitments[i], err = hex.DecodeString(c)
+		next.GroupCommitments[i], err = hex.DecodeString(c)
 		if err != nil {
 			return fmt.Errorf("frost: decode group_commitment[%d]: %w", i, err)
 		}
 	}
-	ks.Threshold = j.Threshold
-	ks.AllIDs = j.AllIDs
+	next.Threshold = j.Threshold
+	next.AllIDs = j.AllIDs
+	*ks = next
 	return nil
 }
 
@@ -183,19 +185,20 @@ func (o *DKGRound1Output) MarshalJSON() ([]byte, error) {
 }
 
 func (o *DKGRound1Output) UnmarshalJSON(data []byte) error {
+	next := *o
 	var j dkgRound1JSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
-	o.FeldmanCommitments = make([][]byte, len(j.FeldmanCommitments))
+	next.FeldmanCommitments = make([][]byte, len(j.FeldmanCommitments))
 	for i, s := range j.FeldmanCommitments {
 		b, err := hex.DecodeString(s)
 		if err != nil {
 			return fmt.Errorf("frost: decode feldman[%d]: %w", i, err)
 		}
-		o.FeldmanCommitments[i] = b
+		next.FeldmanCommitments[i] = b
 	}
-	o.PairwiseCommitments = make(map[int][32]byte)
+	next.PairwiseCommitments = make(map[int][32]byte)
 	for k, v := range j.PairwiseCommitments {
 		id, err := strconv.Atoi(k)
 		if err != nil {
@@ -207,9 +210,9 @@ func (o *DKGRound1Output) UnmarshalJSON(data []byte) error {
 		}
 		var arr [32]byte
 		copy(arr[:], b)
-		o.PairwiseCommitments[id] = arr
+		next.PairwiseCommitments[id] = arr
 	}
-	o.PairwiseSalts = make(map[int][SaltLen]byte)
+	next.PairwiseSalts = make(map[int][SaltLen]byte)
 	for k, v := range j.PairwiseSalts {
 		id, err := strconv.Atoi(k)
 		if err != nil {
@@ -221,15 +224,16 @@ func (o *DKGRound1Output) UnmarshalJSON(data []byte) error {
 		}
 		var arr [SaltLen]byte
 		copy(arr[:], b)
-		o.PairwiseSalts[id] = arr
+		next.PairwiseSalts[id] = arr
 	}
 	var err error
-	if o.ProofR, err = decodeFixedHex("proof_r", j.ProofR, ElementLen); err != nil {
+	if next.ProofR, err = decodeFixedHex("proof_r", j.ProofR, ElementLen); err != nil {
 		return err
 	}
-	if o.ProofMu, err = decodeFixedHex("proof_mu", j.ProofMu, ScalarLen); err != nil {
+	if next.ProofMu, err = decodeFixedHex("proof_mu", j.ProofMu, ScalarLen); err != nil {
 		return err
 	}
+	*o = next
 	return nil
 }
 
@@ -248,11 +252,12 @@ func (o *DKGRound2Output) MarshalJSON() ([]byte, error) {
 }
 
 func (o *DKGRound2Output) UnmarshalJSON(data []byte) error {
+	next := *o
 	var j dkgRound2JSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
-	o.SecretShares = make(map[int][]byte)
+	next.SecretShares = make(map[int][]byte)
 	for k, v := range j.SecretShares {
 		id, err := strconv.Atoi(k)
 		if err != nil {
@@ -262,8 +267,9 @@ func (o *DKGRound2Output) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return err
 		}
-		o.SecretShares[id] = b
+		next.SecretShares[id] = b
 	}
+	*o = next
 	return nil
 }
 
@@ -282,17 +288,22 @@ func (nc *NonceCommitment) MarshalJSON() ([]byte, error) {
 }
 
 func (nc *NonceCommitment) UnmarshalJSON(data []byte) error {
+	next := *nc
 	var j nonceCommitmentJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	nc.HidingNonceCommitment, err = hex.DecodeString(j.HidingNonceCommitment)
+	next.HidingNonceCommitment, err = hex.DecodeString(j.HidingNonceCommitment)
 	if err != nil {
 		return err
 	}
-	nc.BindingNonceCommitment, err = hex.DecodeString(j.BindingNonceCommitment)
-	return err
+	next.BindingNonceCommitment, err = hex.DecodeString(j.BindingNonceCommitment)
+	if err != nil {
+		return err
+	}
+	*nc = next
+	return nil
 }
 
 // --- SignatureShare ---
@@ -310,14 +321,19 @@ func (ss *SignatureShare) MarshalJSON() ([]byte, error) {
 }
 
 func (ss *SignatureShare) UnmarshalJSON(data []byte) error {
+	next := *ss
 	var j signatureShareJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
-	ss.SignerID = j.SignerID
+	next.SignerID = j.SignerID
 	var err error
-	ss.Zi, err = hex.DecodeString(j.Zi)
-	return err
+	next.Zi, err = hex.DecodeString(j.Zi)
+	if err != nil {
+		return err
+	}
+	*ss = next
+	return nil
 }
 
 // --- Signature ---
@@ -335,17 +351,22 @@ func (s *Signature) MarshalJSON() ([]byte, error) {
 }
 
 func (s *Signature) UnmarshalJSON(data []byte) error {
+	next := *s
 	var j signatureJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	s.R, err = hex.DecodeString(j.R)
+	next.R, err = hex.DecodeString(j.R)
 	if err != nil {
 		return err
 	}
-	s.Z, err = hex.DecodeString(j.Z)
-	return err
+	next.Z, err = hex.DecodeString(j.Z)
+	if err != nil {
+		return err
+	}
+	*s = next
+	return nil
 }
 
 // --- RefreshRound1Output ---
@@ -379,19 +400,20 @@ func (o *RefreshRound1Output) MarshalJSON() ([]byte, error) {
 }
 
 func (o *RefreshRound1Output) UnmarshalJSON(data []byte) error {
+	next := *o
 	var j refreshRound1JSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
-	o.FeldmanCommitments = make([][]byte, len(j.FeldmanCommitments))
+	next.FeldmanCommitments = make([][]byte, len(j.FeldmanCommitments))
 	for i, s := range j.FeldmanCommitments {
 		b, err := hex.DecodeString(s)
 		if err != nil {
 			return fmt.Errorf("frost: decode refresh feldman[%d]: %w", i, err)
 		}
-		o.FeldmanCommitments[i] = b
+		next.FeldmanCommitments[i] = b
 	}
-	o.PairwiseCommitments = make(map[int][32]byte)
+	next.PairwiseCommitments = make(map[int][32]byte)
 	for k, v := range j.PairwiseCommitments {
 		id, err := strconv.Atoi(k)
 		if err != nil {
@@ -403,9 +425,9 @@ func (o *RefreshRound1Output) UnmarshalJSON(data []byte) error {
 		}
 		var arr [32]byte
 		copy(arr[:], b)
-		o.PairwiseCommitments[id] = arr
+		next.PairwiseCommitments[id] = arr
 	}
-	o.PairwiseSalts = make(map[int][SaltLen]byte)
+	next.PairwiseSalts = make(map[int][SaltLen]byte)
 	for k, v := range j.PairwiseSalts {
 		id, err := strconv.Atoi(k)
 		if err != nil {
@@ -417,18 +439,19 @@ func (o *RefreshRound1Output) UnmarshalJSON(data []byte) error {
 		}
 		var arr [SaltLen]byte
 		copy(arr[:], b)
-		o.PairwiseSalts[id] = arr
+		next.PairwiseSalts[id] = arr
 	}
 	seedComBytes, err := hex.DecodeString(j.SeedCommitment)
 	if err != nil {
 		return fmt.Errorf("frost: decode seed_commitment: %w", err)
 	}
-	copy(o.SeedCommitment[:], seedComBytes)
+	copy(next.SeedCommitment[:], seedComBytes)
 	seedSaltBytes, err := hex.DecodeString(j.SeedSalt)
 	if err != nil {
 		return fmt.Errorf("frost: decode seed_salt: %w", err)
 	}
-	copy(o.SeedSalt[:], seedSaltBytes)
+	copy(next.SeedSalt[:], seedSaltBytes)
+	*o = next
 	return nil
 }
 
@@ -451,11 +474,12 @@ func (o *RefreshRound2Output) MarshalJSON() ([]byte, error) {
 }
 
 func (o *RefreshRound2Output) UnmarshalJSON(data []byte) error {
+	next := *o
 	var j refreshRound2JSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
-	o.SecretShares = make(map[int][]byte)
+	next.SecretShares = make(map[int][]byte)
 	for k, v := range j.SecretShares {
 		id, err := strconv.Atoi(k)
 		if err != nil {
@@ -465,13 +489,14 @@ func (o *RefreshRound2Output) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return err
 		}
-		o.SecretShares[id] = b
+		next.SecretShares[id] = b
 	}
 	seedBytes, err := hex.DecodeString(j.Seed)
 	if err != nil {
 		return fmt.Errorf("frost: decode seed: %w", err)
 	}
-	copy(o.Seed[:], seedBytes)
+	copy(next.Seed[:], seedBytes)
+	*o = next
 	return nil
 }
 

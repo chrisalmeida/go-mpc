@@ -54,8 +54,11 @@ session routing and coordinated epoch activation remain caller responsibilities.
 ## Conformance
 
 - `vectors_test.go` runs the RFC 9591 Appendix E.1 vectors through the implementation and checks nonce derivation, commitments, binding-factor inputs and factors, both signature shares, and the final 64-byte signature exactly.
-- Every received element is parsed with `deserializeElement`: canonical encoding, not the identity, in the prime-order subgroup.
+- Received protocol elements are parsed with `deserializeElement`: canonical encoding, not the identity, in the prime-order subgroup. Public signature verification uses RFC 8032 decoding and the cofactored equation required by RFC 9591 §6.1, including acceptance of small-order components as tested by `TestVerifyCofactoredEquation`.
 - Honestly produced signatures are accepted by `crypto/ed25519.Verify`.
+
+[SECURITY.md](../SECURITY.md#evidence-and-test-coverage) identifies the tests
+for these behaviors and the limits of timing and memory-erasure assurance.
 
 ---
 

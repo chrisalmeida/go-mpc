@@ -388,17 +388,22 @@ func (o *DKGRound1Output) MarshalJSON() ([]byte, error) {
 }
 
 func (o *DKGRound1Output) UnmarshalJSON(data []byte) error {
+	next := *o
 	var j dkgRound1OutputJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	o.FeldmanCommitment, err = hexToFixed32(j.FeldmanCommitment)
+	next.FeldmanCommitment, err = hexToFixed32(j.FeldmanCommitment)
 	if err != nil {
 		return err
 	}
-	o.PairwiseCommitments, err = jsonToIntMap32(j.PairwiseCommitments)
-	return err
+	next.PairwiseCommitments, err = jsonToIntMap32(j.PairwiseCommitments)
+	if err != nil {
+		return err
+	}
+	*o = next
+	return nil
 }
 
 // =====================================================================
@@ -422,25 +427,30 @@ func (o *DKGRound2Output) MarshalJSON() ([]byte, error) {
 }
 
 func (o *DKGRound2Output) UnmarshalJSON(data []byte) error {
+	next := *o
 	var j dkgRound2OutputJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	o.FeldmanCommitments, err = decodeBytesSlice(j.FeldmanCommitments)
+	next.FeldmanCommitments, err = decodeBytesSlice(j.FeldmanCommitments)
 	if err != nil {
 		return err
 	}
-	o.FeldmanSalt, err = hexToFixed32(j.FeldmanSalt)
+	next.FeldmanSalt, err = hexToFixed32(j.FeldmanSalt)
 	if err != nil {
 		return err
 	}
-	o.SecretShares, err = jsonToIntMapBytes(j.SecretShares)
+	next.SecretShares, err = jsonToIntMapBytes(j.SecretShares)
 	if err != nil {
 		return err
 	}
-	o.PairwiseSalts, err = jsonToIntMap32(j.PairwiseSalts)
-	return err
+	next.PairwiseSalts, err = jsonToIntMap32(j.PairwiseSalts)
+	if err != nil {
+		return err
+	}
+	*o = next
+	return nil
 }
 
 // =====================================================================
@@ -460,17 +470,22 @@ func (s *BaseOTSenderSeeds) MarshalJSON() ([]byte, error) {
 }
 
 func (s *BaseOTSenderSeeds) UnmarshalJSON(data []byte) error {
+	next := *s
 	var j baseOTSenderSeedsJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	s.Seeds0, err = decodeSeedSlice(j.Seeds0)
+	next.Seeds0, err = decodeSeedSlice(j.Seeds0)
 	if err != nil {
 		return err
 	}
-	s.Seeds1, err = decodeSeedSlice(j.Seeds1)
-	return err
+	next.Seeds1, err = decodeSeedSlice(j.Seeds1)
+	if err != nil {
+		return err
+	}
+	*s = next
+	return nil
 }
 
 type baseOTReceiverSeedsJSON struct {
@@ -486,17 +501,22 @@ func (s *BaseOTReceiverSeeds) MarshalJSON() ([]byte, error) {
 }
 
 func (s *BaseOTReceiverSeeds) UnmarshalJSON(data []byte) error {
+	next := *s
 	var j baseOTReceiverSeedsJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	s.Seeds, err = decodeSeedSlice(j.Seeds)
+	next.Seeds, err = decodeSeedSlice(j.Seeds)
 	if err != nil {
 		return err
 	}
-	s.Sigma, err = decodeBoolSlice(j.Sigma, LambdaC)
-	return err
+	next.Sigma, err = decodeBoolSlice(j.Sigma, LambdaC)
+	if err != nil {
+		return err
+	}
+	*s = next
+	return nil
 }
 
 // =====================================================================
@@ -518,21 +538,26 @@ func (s *VOLEBobState) MarshalJSON() ([]byte, error) {
 }
 
 func (s *VOLEBobState) UnmarshalJSON(data []byte) error {
+	next := *s
 	var j voleBobStateJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	s.Beta, err = decodeBoolArray(j.Beta)
+	next.Beta, err = decodeBoolArray(j.Beta)
 	if err != nil {
 		return err
 	}
-	s.Chi, err = hexToScalar(j.Chi)
+	next.Chi, err = hexToScalar(j.Chi)
 	if err != nil {
 		return err
 	}
-	s.Gamma, err = decodeVOLESlice(j.Gamma)
-	return err
+	next.Gamma, err = decodeVOLESlice(j.Gamma)
+	if err != nil {
+		return err
+	}
+	*s = next
+	return nil
 }
 
 // =====================================================================
@@ -556,25 +581,30 @@ func (s *VOLEAliceState) MarshalJSON() ([]byte, error) {
 }
 
 func (s *VOLEAliceState) UnmarshalJSON(data []byte) error {
+	next := *s
 	var j voleAliceStateJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	s.Alpha0, err = decodeVOLESlice(j.Alpha0)
+	next.Alpha0, err = decodeVOLESlice(j.Alpha0)
 	if err != nil {
 		return err
 	}
-	s.Alpha1, err = decodeVOLESlice(j.Alpha1)
+	next.Alpha1, err = decodeVOLESlice(j.Alpha1)
 	if err != nil {
 		return err
 	}
-	s.C_u, err = hexToScalar(j.CU)
+	next.C_u, err = hexToScalar(j.CU)
 	if err != nil {
 		return err
 	}
-	s.C_v, err = hexToScalar(j.CV)
-	return err
+	next.C_v, err = hexToScalar(j.CV)
+	if err != nil {
+		return err
+	}
+	*s = next
+	return nil
 }
 
 // =====================================================================
@@ -598,22 +628,27 @@ func (m *VOLEMultiplyMsg) MarshalJSON() ([]byte, error) {
 }
 
 func (m *VOLEMultiplyMsg) UnmarshalJSON(data []byte) error {
+	next := *m
 	var j voleMultiplyMsgJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
-	m.SID = j.SID
+	next.SID = j.SID
 	var err error
-	m.ATilde, err = decodeVOLEFixed(j.ATilde)
+	next.ATilde, err = decodeVOLEFixed(j.ATilde)
 	if err != nil {
 		return err
 	}
-	m.Eta, err = decodeRhoFixed(j.Eta)
+	next.Eta, err = decodeRhoFixed(j.Eta)
 	if err != nil {
 		return err
 	}
-	m.Mu, err = hexToFixed32(j.Mu)
-	return err
+	next.Mu, err = hexToFixed32(j.Mu)
+	if err != nil {
+		return err
+	}
+	*m = next
+	return nil
 }
 
 // =====================================================================
@@ -633,16 +668,18 @@ func (m *Round1Msg) MarshalJSON() ([]byte, error) {
 }
 
 func (m *Round1Msg) UnmarshalJSON(data []byte) error {
+	next := *m
 	var j round1MsgJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	m.Commitment, err = hexToFixed32(j.Commitment)
+	next.Commitment, err = hexToFixed32(j.Commitment)
 	if err != nil {
 		return err
 	}
-	m.OTExt = j.OTExt
+	next.OTExt = j.OTExt
+	*m = next
 	return nil
 }
 
@@ -793,34 +830,39 @@ func (m *Round2Msg) MarshalJSON() ([]byte, error) {
 }
 
 func (m *Round2Msg) UnmarshalJSON(data []byte) error {
+	next := *m
 	var j round2MsgJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	m.Decommitment, err = hex.DecodeString(j.Decommitment)
+	next.Decommitment, err = hex.DecodeString(j.Decommitment)
 	if err != nil {
 		return err
 	}
-	m.Salt, err = hexToFixed32(j.Salt)
+	next.Salt, err = hexToFixed32(j.Salt)
 	if err != nil {
 		return err
 	}
-	m.VoleMsg = j.VoleMsg
-	m.GammaU, err = hex.DecodeString(j.GammaU)
+	next.VoleMsg = j.VoleMsg
+	next.GammaU, err = hex.DecodeString(j.GammaU)
 	if err != nil {
 		return err
 	}
-	m.GammaV, err = hex.DecodeString(j.GammaV)
+	next.GammaV, err = hex.DecodeString(j.GammaV)
 	if err != nil {
 		return err
 	}
-	m.Psi, err = hex.DecodeString(j.Psi)
+	next.Psi, err = hex.DecodeString(j.Psi)
 	if err != nil {
 		return err
 	}
-	m.PKi, err = hex.DecodeString(j.PKi)
-	return err
+	next.PKi, err = hex.DecodeString(j.PKi)
+	if err != nil {
+		return err
+	}
+	*m = next
+	return nil
 }
 
 // =====================================================================
@@ -841,17 +883,22 @@ func (m *Round3Msg) MarshalJSON() ([]byte, error) {
 }
 
 func (m *Round3Msg) UnmarshalJSON(data []byte) error {
+	next := *m
 	var j round3MsgJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	m.W_i, err = hex.DecodeString(j.WI)
+	next.W_i, err = hex.DecodeString(j.WI)
 	if err != nil {
 		return err
 	}
-	m.U_i, err = hex.DecodeString(j.UI)
-	return err
+	next.U_i, err = hex.DecodeString(j.UI)
+	if err != nil {
+		return err
+	}
+	*m = next
+	return nil
 }
 
 // =====================================================================
@@ -877,29 +924,34 @@ func (o *RefreshRound1Output) MarshalJSON() ([]byte, error) {
 }
 
 func (o *RefreshRound1Output) UnmarshalJSON(data []byte) error {
+	next := *o
 	var j refreshRound1OutputJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	o.FeldmanCommitments, err = decodeBytesSlice(j.FeldmanCommitments)
+	next.FeldmanCommitments, err = decodeBytesSlice(j.FeldmanCommitments)
 	if err != nil {
 		return err
 	}
-	o.PairwiseCommitments, err = jsonToIntMap32(j.PairwiseCommitments)
+	next.PairwiseCommitments, err = jsonToIntMap32(j.PairwiseCommitments)
 	if err != nil {
 		return err
 	}
-	o.PairwiseSalts, err = jsonToIntMap32(j.PairwiseSalts)
+	next.PairwiseSalts, err = jsonToIntMap32(j.PairwiseSalts)
 	if err != nil {
 		return err
 	}
-	o.SeedCommitment, err = hexToFixed32(j.SeedCommitment)
+	next.SeedCommitment, err = hexToFixed32(j.SeedCommitment)
 	if err != nil {
 		return err
 	}
-	o.SeedSalt, err = hexToFixed32(j.SeedSalt)
-	return err
+	next.SeedSalt, err = hexToFixed32(j.SeedSalt)
+	if err != nil {
+		return err
+	}
+	*o = next
+	return nil
 }
 
 // =====================================================================
@@ -919,17 +971,22 @@ func (o *RefreshRound2Output) MarshalJSON() ([]byte, error) {
 }
 
 func (o *RefreshRound2Output) UnmarshalJSON(data []byte) error {
+	next := *o
 	var j refreshRound2OutputJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
 	var err error
-	o.SecretShares, err = jsonToIntMapBytes(j.SecretShares)
+	next.SecretShares, err = jsonToIntMapBytes(j.SecretShares)
 	if err != nil {
 		return err
 	}
-	o.Seed, err = hexToFixed16(j.Seed)
-	return err
+	next.Seed, err = hexToFixed16(j.Seed)
+	if err != nil {
+		return err
+	}
+	*o = next
+	return nil
 }
 
 // =====================================================================

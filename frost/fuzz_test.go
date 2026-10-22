@@ -9,7 +9,7 @@ import (
 // These verify that arbitrary byte inputs never panic during deserialization.
 
 func FuzzUnmarshalKeyShare(f *testing.F) {
-	f.Add([]byte(`{"id":1,"secret_share":"","public_key":"","verification_share":"","group_commitments":[],"threshold":1,"all_ids":[1]}`))
+	f.Add([]byte(`{"version":1,"id":1,"secret_share":"","public_key":"","verification_share":"","group_commitments":[],"threshold":1,"all_ids":[1]}`))
 	f.Add([]byte(`{}`))
 	f.Add([]byte(`null`))
 	f.Fuzz(func(t *testing.T, data []byte) {
@@ -19,7 +19,7 @@ func FuzzUnmarshalKeyShare(f *testing.F) {
 }
 
 func FuzzUnmarshalSignerState(f *testing.F) {
-	f.Add([]byte(`{"key_share":null,"blacklist":{}}`))
+	f.Add([]byte(`{"version":1,"key_share":{"version":1},"blacklist":{}}`))
 	f.Add([]byte(`{}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var v SignerState

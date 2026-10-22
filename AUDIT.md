@@ -6,7 +6,7 @@
 **Auditor**: Automated cryptographic review (not a substitute for an independent third-party audit)
 
 **2026-10-21 hardening addendum**: see FU-HIGH-2, FU-HIGH-3 and
-FU-MED-5 through FU-MED-8 below. These include implementation fixes, an open
+FU-MED-5 through FU-MED-9 and FU-LOW-7 below. These include implementation fixes, an open
 state-association finding and regression evidence from an automated source
 review, not an independent audit or a
 production-security certification. Remaining gates are in
@@ -285,6 +285,14 @@ successful share, including across restored wrappers, and verify the resulting
 signature with `crypto/ed25519`.
 The RFC Appendix E.1 vector test is unchanged.
 
+**Tested**: `TestSignConcurrentNonceConsumption` requires exactly one success
+and independently verifies the aggregate for original, copied, restored-wrapper
+and raw-state cases. `TestSignCopiedNonceStateIsSingleUse` verifies the winning
+share after a sequential retry. `TestSignRejectsChangedNonceAssociation` tests
+different public keys and participant sets; the other signer/epoch and
+restoration tests are mapped in SECURITY.md. These tests do not demonstrate
+resistance to manually duplicated independent secret nonce material.
+
 ### FU-HIGH-3: Variable-time operations on DKLS23 secrets — FIX IMPLEMENTED
 
 **Files**: `dkls23/curve.go`, `ot.go`, `dkg.go`, `sign.go`, `refresh.go`
@@ -313,6 +321,14 @@ integration has received an independent audit. No practical timing/cache
 key-recovery exploit was demonstrated. Independent review and target-specific
 side-channel analysis remain production gates.
 
+**Tested**: `TestCurveOperationsMatchBTCEC` and
+`TestPointDecodeRequiresCompressedSEC1` check arithmetic and accepted encodings.
+`TestProductionAvoidsVariableTimeAPIs` parses both packages' production source
+to reject `math/big` imports and calls named `NonConst`.
+**Only read**: pinned backend multiplication, complete addition, coordinate
+encoding and scalar conversion source, with references in `curve.go`. Neither
+the differential tests nor the source-policy test measures compiled timing.
+
 ### FU-MED-5: FZero secret output treated as public — FIX IMPLEMENTED
 
 **Files**: `dkls23/params.go`, `commitment.go`, `vole.go`, `reduction_test.go`
@@ -333,6 +349,13 @@ an independently encoded FZero transcript verify identical results, including
 zero, all-ones and group-order boundaries. Production code no longer imports
 `math/big`; reference calculations use it only in tests.
 
+**Tested**: `TestReduce64MatchesBigInt` and
+`TestFZeroMatchesReferenceReduction` check the exact reduction and PRF
+transcript; `TestProductionAvoidsVariableTimeAPIs` checks the import policy.
+**Only read**: timing properties of the dependency's scalar methods and the
+explicit buffer clear. The tests establish arithmetic compatibility, not
+compiled constant-time behavior or removal of memory copies.
+
 ### FU-MED-6: Persisted DKLS23 signing state lacks key/epoch association — OPEN
 
 **Files**: `dkls23/sign.go`, `dkls23/encoding.go`
@@ -352,6 +375,13 @@ behavior; it does not add process-identity restrictions or redesign persistence.
 The missing persisted association remains open and requires a separately
 reviewed compatibility change. Regression tests finish signing after valid
 setup and round-state restoration and independently verify the signatures.
+
+**Tested**: `TestSignResumesWithRestoredSetup`,
+`TestSignResumesWithRestoredRoundState` and `TestSignResumesAfterInPlaceRestore`
+check valid restoration and independent ECDSA verification.
+**Only read**: the missing key/epoch fields in the persisted schema. No test
+establishes safe association of arbitrary stale or mismatched private state;
+that remains a Known Limitation, not a resolved guarantee.
 
 ### FU-MED-7: Duplicate refresh finalization accepted — LOCAL REPLAY FIX IMPLEMENTED
 
@@ -386,6 +416,14 @@ epoch activation. KMOS21 conformance, the corruption/erasure model and refresh
 auxiliary-state security remain independent-review gates. Earlier claims that
 an epoch counter alone prevents replay are superseded by this entry.
 
+**Tested**: each package's `TestRefreshFinalizeIsSingleUse` races eight calls,
+requires one successful epoch increment, retries sequentially, verifies a
+signature independently and rejects an older contribution after another
+refresh. `TestRefreshPreservesPendingContribution` and
+`TestRejectedImportPreservesPendingRefresh` exercise restoration and failed
+imports. **Only read**: the local completion record's omission from JSON.
+The tests do not establish durable replay protection or proactive security.
+
 ### FU-MED-8: Rejected private-state imports modify active sessions — FIX IMPLEMENTED
 
 **Files**: both packages' `encoding.go`, signing and refresh session tests
@@ -409,6 +447,95 @@ and complete the original operation with independent signature verification.
 Additional tests finish pending refresh after a rejected import and verify a
 signature under the refreshed shares. Persisted field layouts and valid
 restoration behavior are unchanged.
+
+**Tested**: each package's `TestRejectedImportPreservesSigningSession` compares
+serialized state before and after rejected inputs and completes signing with
+an independent verifier. `TestRejectedImportPreservesPendingRefresh` does the
+same for pending refresh. This entry originally covered signer and DKLS23
+private round-state decoders; FU-MED-9 covers the remaining custom decoders.
+
+### FU-MED-9: Other custom JSON decoders mutate receivers on rejection — FIX IMPLEMENTED
+
+**Files**: both packages' `encoding.go`, `dkls23/setup_messages.go`, both
+`unmarshal_errors_test.go` files
+**Severity**: Medium
+**Category**: Failed-import side effects / state integrity
+**Requirement**: CLAUDE.md rule 11 requires a receiver-preservation test for
+every custom `UnmarshalJSON`; this is an API-state property, not a protocol
+construction or wire-format change.
+
+The claim-evidence review extended FU-MED-8's rejection tests to every custom
+decoder. These tests failed on the existing DKG messages, OT seed states,
+VOLE states/messages, signing messages, refresh messages, FZero messages and
+FROST key-share/nonce/signature decoders: a malformed field could overwrite
+that field or publish earlier fields before an error was returned.
+
+**Resolution**: decode through a temporary receiver and publish only on success.
+These types have no mutex; signer decoders continue to retain and lock their
+existing mutexes. Temporary copies preserve existing successful decoding
+behavior, including fixed-array copy behavior. No new input restrictions,
+wire fields, versions, hash inputs or protocol checks were introduced.
+
+**Tested**: `TestRejectedUnmarshalPreservesReceiver` in each package corrupts
+fields of populated receivers and requires byte-identical serialized state
+after rejection. The tests failed before this fix and pass after it. Existing
+round-trip and restoration tests check successful imports. The already
+transactional OT-extension decoder is included in the rejection tests.
+**Only read**: the full set of decoder error paths for publication order.
+This does not assert complete semantic validation of a successfully decoded
+transcript; receiving rounds still perform protocol checks. The two base-OT
+message types use standard `encoding/json`, whose error behavior is outside
+the custom-decoder guarantee; callers must discard rejected messages.
+
+### FU-LOW-7: Security claims exceeded their regression evidence — CORRECTED
+
+**Files**: `SECURITY.md`, README files, `CLAUDE.md`, GoDoc and fuzz/error tests
+**Severity**: Low
+**Category**: Assurance and test-coverage claims
+
+The existing security document claimed strict subgroup/identity validation
+for every received group element, while FROST public signature verification
+intentionally uses RFC 8032 decoding and the cofactored equation required by
+RFC 9591 §6.1. It also described blacklists as permanent across all future
+sessions and fuzz/error coverage as universal. Four FROST key-share error
+cases and the blacklist-key case omitted the required version, so those
+tests rejected the version before reaching their named field.
+
+**Resolution**: distinguish strict protocol element decoding from signature
+verification, scope blacklist enforcement to retained state, and map the
+remaining implementation claims to named tests in SECURITY.md. Move untested
+timing, complete erasure, RNG-failure resistance and semantic-decoder
+assumptions to Known Limitations. Preserve the verifier and protected vectors.
+
+**Tested**: repaired malformed-field cases include valid versions and assert
+field-specific errors. Named fuzz targets now cover every custom decoder and
+both base-OT messages; valid-version FROST seeds reach field decoding.
+`TestSignSessionRoundsAreSingleUseConcurrent` races all three DKLS23 signing
+rounds, requires exactly one success, rejects an immediate sequential replay
+of each round and independently verifies the resulting ECDSA signature.
+The FROST cofactored-verification and invalid-element tests falsify the
+previous overly broad validation claim. The implementation-behavior tables
+in SECURITY.md identify the other existing positive and negative tests.
+
+The DKG cheating test stopped at the hash opening, and refresh Feldman tests
+could stop at point decoding. The new FROST
+`TestDKGRejectsShareInconsistentWithCommitments` recomputes the forged share's
+hash commitment, requires valid point decoding, rejects exactly the offending
+party and independently verifies a signature by unaffected recipients.
+Both packages' `TestRefreshBadFeldman` now use different valid points and
+require typed attribution, reaching the Feldman equation rather than relying
+on an earlier decoding error.
+`TestRefreshFZeroSeedsChangeAndMatchPeers` checks that every DKLS23 FZero
+pairwise seed changes, agrees across peers, and still permits independent
+signature verification; base-OT correlation tests alone do not test this.
+
+**Only read**: RFC 9591 §6.1 and dependency sources cited in GoDoc, including
+scalar arithmetic, point multiplication/addition/encoding and explicit
+clears. No new compiled timing, cache-side-channel or memory-erasure
+experiment was performed. Historical "resolved" and "verified" labels above
+and below record earlier reviews; they do not supply missing evidence for
+the broader security claims. The current SECURITY.md evidence and Known
+Limitations take precedence over such historical assurances.
 
 ---
 

@@ -12,6 +12,15 @@ import (
 // multiplication. These are the same secp256k1 group operations required by
 // DKLS23 Protocols 3.6 and 7.1 and MR19 Figure 8 / Appendix D.1; encodings,
 // hash inputs, and protocol equations are unchanged.
+//
+// Source inspected at v0.5.0: Element.Multiply uses 256 iterations with
+// conditional swaps; Add/Subtract use addProjectiveComplete; Encode and
+// EncodeUncompressed use affine coordinates and constant-time selections.
+// selectPoint's DecodeUncompressed checks already validated finite coordinates.
+// These source observations do not establish compiled timing behavior.
+//
+// https://github.com/bytemare/secp256k1/blob/v0.5.0/element.go
+// https://github.com/bytemare/secp256k1/blob/v0.5.0/internal/field/element.go
 type curvePoint = secp256k1.Element
 
 func newCurvePoint() *curvePoint { return secp256k1.NewElement() }
@@ -19,6 +28,11 @@ func newCurvePoint() *curvePoint { return secp256k1.NewElement() }
 // curveScalar converts a canonical btcec scalar without math/big. Bytes always
 // returns exactly 32 bytes encoding a value below q, so Decode cannot fail.
 // This helper is never used to decode received, unvalidated scalar bytes.
+// ModNScalar.Bytes documents constant-time encoding; the backend's Decode
+// takes its valid 32-byte path for these canonical inputs (v0.5.0 scalar.go).
+//
+// https://github.com/decred/dcrd/blob/dcrec/secp256k1/v4.4.1/dcrec/secp256k1/modnscalar.go
+// https://github.com/bytemare/secp256k1/blob/v0.5.0/scalar.go
 func curveScalar(s *btcec.ModNScalar) *secp256k1.Scalar {
 	encoded := s.Bytes()
 	defer clear(encoded[:])

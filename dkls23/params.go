@@ -22,6 +22,12 @@
 // verification; detected parties are blacklisted and excluded from future
 // sessions.
 //
+// ModNScalar's fixed-width arithmetic and byte conversion are documented
+// and implemented in the underlying decred v4.4.1 dependency:
+// https://github.com/decred/dcrd/blob/dcrec/secp256k1/v4.4.1/dcrec/secp256k1/modnscalar.go
+// Point backend source references are in curve.go. These source references
+// do not establish the compiled integration's timing behavior.
+//
 // Only the base-OT seeds and FZero seeds are persistent (Section 8.2). The
 // OT-extension batch and the VOLE correlation derived from it are specific
 // to one signing session and are never stored or reused: reuse would reveal
@@ -121,9 +127,9 @@ func GadgetInnerProduct(beta [Xi]bool) btcec.ModNScalar {
 	return acc
 }
 
-// condUint32 returns 1 if b is true, 0 otherwise.
-// On Go 1.20+ this compiles to a branchless conditional-move instruction
-// (CSEL on ARM64, CMOV on x86-64).
+// condUint32 returns 1 if b is true, 0 otherwise. The source conditional must
+// compile without a secret-dependent branch. This has not been verified for
+// every toolchain and architecture; see SECURITY.md's Known Limitations.
 func condUint32(b bool) uint32 {
 	var v uint32
 	if b {
@@ -148,6 +154,8 @@ var orderMinus2 = [32]byte{
 // The exponent q-2 is a public constant, so the square-and-multiply
 // loop's branch pattern is fixed and leaks no information about val.
 // All arithmetic uses constant-time ModNScalar.Square and ModNScalar.Mul.
+// Those methods' documentation and fixed-width source are in:
+// https://github.com/decred/dcrd/blob/dcrec/secp256k1/v4.4.1/dcrec/secp256k1/modnscalar.go
 //
 // This replaces btcec's InverseValNonConst, which uses math/big internally.
 func scalarInverse(val *btcec.ModNScalar) btcec.ModNScalar {
@@ -170,6 +178,8 @@ func scalarInverse(val *btcec.ModNScalar) btcec.ModNScalar {
 // For b = high*2^256 + low, reduce both halves with ModNScalar and combine
 // using the existing gadget[256] = 2^256 mod q. No hash input or distribution
 // changes. The array parameter fixes the input width independently of value.
+// The same ModNScalar source cited by scalarInverse documents SetByteSlice,
+// Mul and Add; fixed 32-byte halves avoid length-dependent input paths.
 func reduce64(b *[64]byte) btcec.ModNScalar {
 	var high, low btcec.ModNScalar
 	high.SetByteSlice(b[:32])

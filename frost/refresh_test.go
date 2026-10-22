@@ -233,10 +233,15 @@ func TestRefreshBadFeldman(t *testing.T) {
 		allSeeds[id] = seed
 	}
 
-	// Party 2 corrupts Feldman commitments.
-	if len(allR1[2].FeldmanCommitments) > 0 {
-		allR1[2].FeldmanCommitments[0][1] ^= 0xff
+	// Use a different valid prime-order point so decoding succeeds and only
+	// the Feldman equation can detect the mismatch with the revealed shares.
+	changed := edwards25519.NewScalar().Add(allCoeffs[2][0], scalarFromUint64(1))
+	if changed.Equal(edwards25519.NewScalar()) == 1 {
+		changed.Set(scalarFromUint64(1))
 	}
+	allR1[2].FeldmanCommitments[0] = edwards25519.NewGeneratorPoint().ScalarBaseMult(changed).Bytes()
+	_, err := parseFeldmanCommitments(allR1[2].FeldmanCommitments)
+	require.NoError(t, err)
 
 	allR2 := make(map[int]*RefreshRound2Output)
 	for _, id := range allIDs {
@@ -245,9 +250,8 @@ func TestRefreshBadFeldman(t *testing.T) {
 		allR2[id] = r2
 	}
 
-	err := RefreshFinalize(states[1], allCoeffs[1], allSeeds[1], allR1, allR2)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "2")
+	err = RefreshFinalize(states[1], allCoeffs[1], allSeeds[1], allR1, allR2)
+	requireCheating(t, err, 2)
 }
 
 func TestRefreshVerificationShareUpdated(t *testing.T) {

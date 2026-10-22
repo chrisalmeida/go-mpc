@@ -83,6 +83,9 @@ func TestRefreshFinalizeIsSingleUse(t *testing.T) {
 	}
 	require.Equal(t, 1, successes)
 	require.Equal(t, 1, setups[1].Epoch)
+	var replay *CorruptStateError
+	require.ErrorAs(t, RefreshFinalize(setups[1], coeffs[1], seeds[1], r1, r2), &replay)
+	require.Equal(t, 1, setups[1].Epoch, "sequential replay must not advance the epoch")
 	for _, id := range []int{2, 3} {
 		require.NoError(t, RefreshFinalize(setups[id], coeffs[id], seeds[id], r1, r2))
 	}
