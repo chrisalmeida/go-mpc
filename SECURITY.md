@@ -80,7 +80,7 @@ secrets and DKLS23's auxiliary-state refresh, still requires specialist review.
 
 #### dkls23
 - Shamir shares re-randomized using zero-constant Feldman VSS polynomials.
-- Base-OT seeds (the only persistent OT material) and FZero seeds refreshed
+- Base-OT seeds (the only OT material in the long-term setup) and FZero seeds refreshed
   alongside shares (KMOS21). Fresh OT-extension batches and VOLE correlations
   are generated for each signing session and never reused across sessions.
 - Successful `RefreshFinalize` calls record the local seed contribution,
@@ -196,8 +196,10 @@ properties are Known Limitations and independent-review production gates.
   or a DKLS23 OT/VOLE correlation in more than one signing session.
 - DKLS23 must reserve a globally unique session id durably before sending its
   first round output. Before sending later outputs, persist session progress
-  and blacklist changes. If persistence fails, send nothing and abort the
-  session. Restoring state must not roll back completed rounds or recycle ids.
+  and blacklist changes. If persistence fails, send nothing: inspect authoritative
+  records for a committed cached output before retrying or aborting. A confirmed
+  rollback may be retried using fresh decoded objects. Restoring state must not
+  roll back completed rounds or recycle ids.
 - Encrypted serialization does not supply atomic writes, durable reservation,
   rollback detection or coordination of the same ephemeral secrets across
   copies. Supply transactional storage for those properties. Snapshot
@@ -214,8 +216,8 @@ properties are Known Limitations and independent-review production gates.
   nonce under another session or epoch, which is how cloned RNG state would
   surface. The guard cannot supply the backend's durability, authenticate
   peers, notice a store and signer restored together from one old snapshot,
-  or agree on activation with the group. The repository ships only the
-  in-memory test model, not a backend. A rolled-back attempt can be recomputed
+  or agree on activation with the group. The library chooses no backend; an
+  example Linux/macOS file adapter is provided separately. A rolled-back attempt can be recomputed
   by a later explicit `Advance` call; `Compute` must decode fresh checkpoints,
   avoid external side effects and return output only through `Update`.
   `storetest.Run` checks rollback from empty and populated storage, retaining
@@ -226,10 +228,58 @@ properties are Known Limitations and independent-review production gates.
   agree on success, and persist the new epoch consistently across the group.
   A local one-use guard cannot solve a partial distributed commit or recovery
   from old backups. Recovery must not silently activate mixed epochs.
-- The examples demonstrate protocol calls and encryption, not a production
-  storage or recovery system. Their colocated encryption keys and direct
-  `os.WriteFile` calls do not meet these requirements, and they do not yet
-  use the `session` package.
+- Bound private-state wrappers use an `envelope` over caller-supplied
+  authenticated encryption and independently trusted `KeyBinding`. `Open`
+  checks protocol, kind, payload version, key, party, epoch, operation and round
+  before decryption, then matches the encrypted context before releasing bytes.
+  `Peek` is unauthenticated metadata. Protocol wrappers check the decoded binding
+  and local semantics; the new envelope path rejects noncanonical/reduced scalar
+  encodings by strict decoding and canonical re-encoding. Legacy plaintext
+  import behavior is unchanged. Bare FROST keys have no epoch; persist the
+  `SignerState` to retain epoch and blacklist.
+- Both `SessionCodec` implementations restore fresh authoritative encrypted
+  key and operation checkpoints on every callback. They seal every outgoing
+  message before the guard caches it. Open committed output with `OpenOutput`
+  before transport; `OpenRefreshRound2` parses secret share updates for
+  confidential peer delivery. Separate output kinds prevent substitution as
+  private round state. Completion and abort remove the current private
+  operation checkpoint; output ciphertext and spent identifiers remain retained.
+- Cold devices use resumable checkpoints across processes or machines. Online
+  callers may select `session.Memory.Advance`; no private round checkpoint
+  reaches the store in that mode, while encrypted key and output containers do.
+  Confirmed commits clear superseded in-memory checkpoint buffers for that
+  operation; commit errors retain the state needed to follow authoritative
+  progress. Tests observe the retained Go buffers, not physical memory erasure.
+  Losing Memory requires an explicit abort of pending operations. Existing zero
+  modes remain resumable. New nonce indexes are SHA-256 digests; existing raw
+  reservations are also checked and retained. No process identity restriction
+  is introduced for resumable operations.
+- The ordinary examples use the guard and environment-supplied wrapping keys.
+  A fresh data key encrypts each blob, its wrapping-key ID is authenticated, and
+  `PreviousKeys` permits rotation with distinct IDs. Follow Go's random-nonce GCM
+  limit of fewer than 2^32 encryptions per wrapping key. No key is written beside
+  encrypted shares. The example file adapter uses kernel locks, temporary files,
+  file sync, atomic rename and directory sync on local Linux/macOS filesystems.
+  Conformance and process-kill tests check specific crash boundaries, not all
+  hardware power failures or storage deployments. The demos' colocated DKG and
+  editable public configuration are demonstration provisioning, not production
+  custody or transport authentication. Whole-store rollback remains undetected.
+  See FU-MED-13 and FU-MED-14 for the tested scope.
+- The offline command examples support FROST and DKLS23 file handoffs, including
+  request building. Relocating a complete device directory and retrying after
+  failed output delivery are exercised by the process tests below. Transport
+  authentication/confidentiality, message approval, independent device provisioning
+  and whole-store rollback controls remain the application's responsibility.
+  FROST node snapshot helpers retain epoch and blacklist; bare-key helpers do not
+  retain that progress. See FU-LOW-9 for tests and the compatibility boundary.
+- Example store scope locks use a fixed encoding, and partition discovery uses
+  the stored scope so Go's Gob type-registration order cannot hide an existing
+  partition. Existing filenames and pending progress are retained; duplicate
+  scope files fail before the callback. Tests cover different Gob histories,
+  retained checkpoint/output/nonce records and mixed concurrent writers
+  (FU-MED-15). All processes must use the corrected adapter. Lookup scans state
+  files in the private directory and fails closed on corrupt candidates; large
+  directory performance has not been measured.
 
 ## Evidence and Test Coverage
 
@@ -238,7 +288,7 @@ race detector, and runs every fuzz target for five seconds. A finite fuzz pass
 does not establish rejection of all malformed inputs or absence of panics.
 
 Every custom JSON decoder has a named unmarshal fuzz target in each package's
-`fuzz_test.go`; DKLS23 also fuzzes its two base-OT message types that use the
+`fuzz_test.go` or the private-state test files; DKLS23 also fuzzes its two base-OT message types that use the
 standard JSON decoder. Receiver-preservation tests cover each custom decoder,
 with separate live-session tests for signer and DKLS23 private round state.
 
@@ -302,9 +352,19 @@ only, as described under Known Limitations.
 | Reject invalid local refresh material before output or mutation | DKLS23 `TestRefreshRejectsInvalidSetupBeforeOutputOrMutation`, FROST `TestRefreshRejectsInvalidKeyBeforeOutputOrMutation`, and both `TestRefreshRound2RejectsWrongLocalPolynomialSize` |
 | Session guard: at most one committed result per round across connections; rolled-back attempts can be recomputed without releasing uncommitted output; stale backups, nonce reuse, failed commits, callback errors and panics, protocol aborts | `TestRoundsCommitOnceAcrossConnections`, `TestRolledBackRoundCanBeRecomputedBeforeCommit`, `TestStaleBackupAndNonceReuseAreRejected`, `TestCommitFailuresReleaseNoOutputAndRecoverFromStore`, `TestComputationFailureAndPanicRollBack`, `TestProtocolAbortCommitsBlacklistButWithholdsOutput` in [session/guard_test.go](session/guard_test.go); end to end, DKLS23 `TestTransactionalSigningRecoversCommittedRoundAndRejectsCopies` and FROST `TestTransactionalSigningRecoversCommitmentAndConsumesRestoredNoncesOnce` in each `store_test.go` |
 | Session guard: refresh quiescence and activation, durable abort and blacklist, invalid requests and updates, corrupt records, store faults and contract violations | `TestRefreshQuiescesSigningAndRequiresExplicitActivation`, `TestAbortAndBlacklistSurviveReopening` in [session/guard_test.go](session/guard_test.go); `TestInvalidRequestsAreRejectedBeforeCompute`, `TestInvalidUpdatesAreRejectedWithoutCommit`, `TestCorruptRecordsAreReportedNotRepaired`, `TestProgressAndAbortRulesAcrossOperations`, `TestRefreshAbortAndActivationConsistency`, `TestStoreErrorsPropagateAndCommitNothing`, `TestStoreContractViolationsAreReported` in [session/guard_rules_test.go](session/guard_rules_test.go) |
-| Store contract checks (atomic commit, rollback on error and panic preserving complete committed records and nonce reservations, no aliasing, serialized connections, namespaces) and the test model's fault injection | `storetest.Run` via `TestModelStorageContract`, `TestConformanceRejectsDestructiveRollback` and `TestModelInjectsOneCommitFailureAndHonorsCancellation` in [session/storetest](session/storetest); a finite conformance run does not establish every part of the contract or a backend's physical durability |
+| Store contract checks (atomic commit, rollback on error and panic preserving complete committed records and nonce reservations, both operation modes across reopening, no aliasing, serialized connections, namespaces) and the test model's fault injection | `storetest.Run` via `TestModelStorageContract`, `TestConformanceRejectsDestructiveRollback`, `TestConformanceRejectsDroppedMode` and `TestModelInjectsOneCommitFailureAndHonorsCancellation` in [session/storetest](session/storetest); a finite conformance run does not establish every part of the contract or a backend's physical durability |
 | DKLS23 message enters at round 3; a presignature completes exactly one message | `TestSignPresignatureCompletesExactlyOneMessage` in [dkls23/presign_test.go](dkls23/presign_test.go); specification check in AUDIT.md FU-LOW-8 |
 | Persistence version checks | DKLS23 `TestEncodingSignerSetupVersion`; FROST `TestWireFormatVersion` in each `encoding_test.go` |
+| Standalone envelope: canonical context, authenticated legacy/AAD round trips, rejection before decryption, header substitution, malformed documents, no payload on errors and owned in-place buffers | `TestCanonicalContextEncoding`, `TestRoundTripAllKindsAndEncryptorInterfaces`, `TestOpenRejectsEveryContextFieldBeforeDecryption`, `TestSplicedHeaderIsRejectedAfterDecryption`, `TestTruncationTamperingAndWrongKeyReleaseNoPlaintext`, `TestOwnedBuffersAndInPlaceEncryption`, `TestEncryptorErrorsPreserveCauseAndReleaseNoPlaintext`, malformed-input tests, `FuzzOpen` and `FuzzPeek` in [envelope](envelope/); FU-MED-13 scopes the encryptor contract; FU-MED-14 covers protocol integration |
+
+| Bound key, round and refresh imports reject covered context/payload substitution and legacy unbound ciphertext; new schemas preserve receivers on errors | `TestBoundSetupRejectsLegacyAndMismatchedOrNoncanonicalPayload`, `TestBoundSigningStateRejectsPayloadAndOperationSubstitution`, FROST `TestBoundSignerAndNonceRejectSubstitution`, both `TestEncryptedRefreshRejectsForeignAndMalformedCheckpoints`, `TestRefreshStateUnmarshalErrorsPreserveReceiver`, FROST `TestNonceUnmarshalErrorsPreserveReceiver`, private-state fuzz targets; `TestStrictDecodeRejectsAmbiguousAndNoncanonicalDocuments` in `internal/statejson` |
+| Encrypted signing and refresh complete across restored connections with one committed round, lost acknowledgements, opaque operation IDs and independent signature verification | Both `TestEncryptedSessionCodecSigningRefreshAndRestart`; FROST `TestEncryptedNonceRestoreSingleUse` also verifies the winning signature after sequential/concurrent local-copy reuse attempts |
+| Cached confidential refresh outputs authenticate binding, remain ciphertext and reject malformed scalar encodings or private-state substitution | Both `TestConfidentialRefreshOutputIsBoundEncryptedAndStrict`; both codec integration tests decrypt only outside the guard and compare retained output ciphertext |
+| In-memory checkpoints never enter the store; loss requires abort; confirmed commits clear superseded buffers; uncertain commit state remains selectable by authoritative progress; other scopes/operations retain their checkpoints; digest and legacy nonce reservations | `TestMemoryModeNeverStoresPrivateRoundStateAndRequiresAbortAfterLoss`, `TestMemoryModeClearsSupersededCheckpointsOnlyAfterConfirmedCommit`, `TestMemoryModeCommitFailureRetainsOnlyAuthoritativeRound`, `TestMemoryModeRejectsInvalidUpdatesAndPreservesProgress`, `TestNonceMarkersAreDigestsAndLegacyReservationsStillReject` |
+| Example file store conformance, process-death commit boundaries, cross-process serialization and binary IDs; authenticated data-key wrapping/rotation | `TestFileStoreConformance`, `TestFileStoreCrashAndConcurrentProcesses`, `TestFileStorePreservesBinaryIdentifiersAndRejectsCorruption`, `TestFileStoreDoesNotInheritMetadataWhenDecoding`, `TestEnvelopeEncryptionAuthenticationAndKeyRotation` in `example/shared` |
+| Real process restarts across cold signing and DKLS23 refresh, independently verified signatures and identical recovered FROST output | `TestColdSigningSeparateProcessesAndCachedOutput` in `example/cold-frost`; `TestDKLSColdSigningAndRefreshAcrossProcesses` in `example/dkls23` |
+| Offline CLI request routing, device relocation, failed output delivery and cached retry, independent ECDSA/Ed25519 verification; FROST signer snapshots retain epoch/blacklist | `TestColdDKLSCommandsRestartRelocateAndRecoverOutput`, `TestColdSigningSeparateProcessesAndCachedOutput`, `TestSignerSnapshotRetainsRefreshedEpochAndBlacklist` in the example module; FU-LOW-9 |
+| Example store lookup retains pending progress across different Gob encoding histories, with shared cross-process locks and duplicate-scope rejection | `TestFileStoreReopensAfterUnrelatedGobEncoding`, `TestFileStoreCrashAndConcurrentProcesses`, `TestFileStoreRejectsDuplicateScopeFiles` in `example/shared`; FU-MED-15 |
 
 ## Known Limitations
 
@@ -324,14 +384,21 @@ only, as described under Known Limitations.
   Local checks before signing/refresh cannot detect a noncanonical original
   DKLS23 scalar once a legacy decoder has reduced it, authenticate a stored
   transcript, prove DKLS23 share-to-group-key correspondence, or establish
-  correlations with a peer's secret setup material. Strict raw import
-  validation remains open alongside state association; durable recovery needs
-  a conforming `session.Store` backend, which this repository does not ship.
+  correlations with a peer's secret setup material. Strict legacy plaintext import
+  validation remains open; bound encrypted imports check canonical representation
+  and context. Neither path can prove peer secret correlations or protect a fully
+  rolled-back store. Durable recovery needs a deployment-appropriate conforming
+  `session.Store`; the file adapter is an example, not a production certification.
 - **Randomness and protocol assumptions**: The tests do not establish
   resistance to every malicious participant or failure of the CSPRNG. Hedged
   nonce derivation does not permit repeated randomness or RNG-state cloning.
   Protocol security arguments and their corruption assumptions are not an
   implementation-wide proof for this repository.
+- **Example backend and cipher limits**: The file adapter is implemented for
+  local Linux/macOS filesystems under a trusted private directory. It does not
+  prevent hostile local file replacement, establish physical erasure or protect
+  a restored old filesystem snapshot. Go AES/GCM timing depends on enabled
+  hardware support; it is not an implementation-wide constant-time guarantee.
 - **Memory retention**: Go's garbage collector may retain copies of
   intermediate stack values after zeroization. No memory pinning or `mlock`
   is used. (Applies to both packages.)
@@ -359,6 +426,10 @@ only, as described under Known Limitations.
   it but warns that it is for those who accept the risk. A stored round-2 state
   is nonce material: it must complete exactly one message, must never rest
   unencrypted, and must be consumed or aborted before a refresh.
+  `SessionCodec` requires an explicit `AllowPreSigning` for message-free round 2,
+  but cannot determine when a caller actually chose or approved a message.
+  `TestSessionCodecRequiresExplicitPreSigningOptIn` checks the codec gate and
+  completes an independently verified signature after opt-in.
   `TestSignPresignatureCompletesExactlyOneMessage` backs the single-use claim;
   AUDIT.md FU-LOW-8 records the specification check.
 - **Peer transcript replay and distributed recovery**: Local lifetime checks
@@ -366,9 +437,12 @@ only, as described under Known Limitations.
   envelopes, distributed commit, or backup rollback protection. Implement
   these at the integration layer and test them against crashes and replay.
 - **Private state association**: DKLS23's existing round-state JSON does not
-  carry a key or epoch binding. Callers must restore it with its matching
-  setup and progress record. This remains open as AUDIT.md FU-MED-6; the
-  security fixes retain the existing formats and restoration behavior.
+  carry a key or epoch binding. Restore it only with its matching setup and
+  progress record. New encrypted wrappers and library session codecs provide
+  that association; raw JSON or repeatedly reopening the same envelope cannot
+  enforce one-use across copies. FU-MED-14 closes the bound-path integration
+  portion of FU-MED-6. Caller-supplied transport and authoritative progress remain
+  necessary, and legacy plaintext imports remain unchanged.
 - **No independent human audit**: Both packages were first reviewed by an
   automated audit (Claude Code, Anthropic Claude Opus 4.6). A 2026-10-16
   follow-up review (Claude Code, Anthropic Claude Fable 5.1) found that this

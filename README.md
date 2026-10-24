@@ -71,7 +71,12 @@ r, s, err := dkls23.SignCombine(setup, &rx, &myW, &myU, inboundFrags, message)
 The [example/dkls23](example/dkls23/) program runs the whole flow for three in-process parties, including persistence and refresh:
 
 ```bash
-cd example/dkls23 && go run .
+# Run from the repository root. Generate a key and choose a new directory once.
+export MPC_WRAPPING_KEY="$(openssl rand -hex 32)"
+export MPC_DEMO_DIR="$(mktemp -d)"
+go -C example/dkls23 run .
+# Run again with the same key and directory to reload the group.
+go -C example/dkls23 run .
 ```
 
 ## FROST — Threshold Schnorr over Ed25519
@@ -110,8 +115,18 @@ ok := frost.Verify(keyShare.PublicKey, msg, sig)   // or ed25519.Verify(pk, msg,
 The [example/frost](example/frost/) program runs a 2-of-3 flow with every signer subset, persistence, and refresh:
 
 ```bash
-cd example/frost && go run .
+# Run from the repository root. Generate a key and choose a new directory once.
+export MPC_WRAPPING_KEY="$(openssl rand -hex 32)"
+export MPC_DEMO_DIR="$(mktemp -d)"
+go -C example/frost run .
+go -C example/frost run .
 ```
+
+Both online demos use `session.Memory` for private round state and the example
+file store for encrypted signer state and committed outputs. Keep the same
+wrapping key and store directory between runs. For a separate demo group, choose
+a new empty directory. Legacy directories containing `enc.key` require explicit
+migration; the demos never replace them automatically.
 
 ## What the library does not do
 
@@ -130,8 +145,7 @@ constant-time primitives. Treat exported state fields as read-only.
 
 Both packages reject repeated application of a completed refresh contribution
 on a live signer. Rejected custom JSON imports leave their receivers unchanged;
-successful decoding does not imply complete semantic validation. Existing APIs,
-persisted formats, protocol transcripts and restoration behavior are retained;
+successful decoding does not imply complete semantic validation. The earlier security fixes retained plaintext formats, protocol transcripts and restoration behavior;
 the RFC 9591 Appendix E.1 vectors and fresh-VOLE regression remain unchanged.
 
 Signing and refresh now reject malformed local configuration and key material
@@ -146,9 +160,137 @@ protocols: at most one committed result per round, outputs cached for
 retransmission after a lost acknowledgement, nonce markers that reject cloned
 randomness, a revision check that rejects stale backups, and a prepare/activate
 gate for refresh. It needs a transactional `session.Store` from the
-application; the repository ships only the in-memory test model. Rolled-back
+application; the example module includes a Linux/macOS file adapter, separate from the production library. Rolled-back
 attempts can be recomputed by a later explicit call using freshly decoded
 checkpoints. See [session/README.md](session/README.md) and AUDIT.md FU-MED-6.
+
+Cold signing now supports shutting down between signing or refresh rounds for
+both protocols. Each package's `SessionCodec` restores fresh authoritative state,
+runs the existing protocol round, and returns encrypted key, private round and
+outbound message containers to `session.Advance`. Open committed receipt bytes
+with `codec.OpenOutput` before transport; recover identical committed ciphertext
+with `session.Output` after a lost acknowledgement. Complete or
+abort unused signing operations before refresh. Activate a prepared refresh only
+after coordinating with every participant.
+
+The [envelope package](envelope/README.md) binds private state to protocol, kind,
+version, group key, party, epoch, operation and round. Applications supply
+**authenticated** encryption, trusted key bindings, transport and a conforming
+`session.Store`. `Request.Mode` defaults to resumable storage. Online signers can
+use `session.Memory.Advance` to keep private round state out of storage; after
+losing that process state, abort the pending operation and choose a fresh ID.
+Confirmed rounds clear superseded in-memory checkpoint buffers; commit errors
+retain the candidates needed to follow authoritative progress.
+No object or process identity is required for resumable signing.
+
+The [cold FROST](example/cold-frost/main.go) and
+[cold DKLS23](example/cold-dkls23/main.go) demos exchange protocol message files
+between device directories, launching a new process for every signing round:
+
+```bash
+# Demo keys only. Keep this wrapping key available across all device commands.
+export MPC_WRAPPING_KEY="$(openssl rand -hex 32)"
+mpc_frost_dir=$(mktemp -d)
+mpc_dkls_dir=$(mktemp -d)
+go -C example/cold-frost run . demo "$mpc_frost_dir"
+go -C example/cold-dkls23 run . demo "$mpc_dkls_dir"
+```
+
+`demo` runs the full command sequence automatically. To drive FROST manually,
+keep the wrapping key above and use a fresh directory:
+
+```bash
+mpc_cold_dir=$(mktemp -d)
+mpc_operation=$(openssl rand -hex 16)
+go -C example/cold-frost run . init "$mpc_cold_dir"
+printf '%s' 'offline file transfer signing' > "$mpc_cold_dir/message.txt"
+go -C example/cold-frost run . commit "$mpc_cold_dir/device-1" "$mpc_operation" "$mpc_cold_dir/commitment-1.json"
+go -C example/cold-frost run . commit "$mpc_cold_dir/device-2" "$mpc_operation" "$mpc_cold_dir/commitment-2.json"
+go -C example/cold-frost run . request "$mpc_cold_dir" "$mpc_operation" "$mpc_cold_dir/message.txt" "$mpc_cold_dir/commitment-1.json" "$mpc_cold_dir/commitment-2.json" "$mpc_cold_dir/request.json"
+go -C example/cold-frost run . sign "$mpc_cold_dir/device-1" "$mpc_operation" "$mpc_cold_dir/request.json" "$mpc_cold_dir/share-1.json"
+go -C example/cold-frost run . sign "$mpc_cold_dir/device-2" "$mpc_operation" "$mpc_cold_dir/request.json" "$mpc_cold_dir/share-2.json"
+go -C example/cold-frost run . aggregate "$mpc_cold_dir" "$mpc_cold_dir/request.json" "$mpc_cold_dir/share-1.json" "$mpc_cold_dir/share-2.json" "$mpc_cold_dir/signature.bin"
+```
+
+FROST's `request` command takes commitment files in configured participant order
+(device 1, then device 2). Its signature file contains the standard 64-byte
+Ed25519 signature, checked with `crypto/ed25519` before writing.
+
+For DKLS23, the coordinator builds each recipient's request from the previous
+round's replies. Each `round` invocation runs on that party's device:
+
+```bash
+mpc_cold_dir=$(mktemp -d)
+mpc_operation=$(openssl rand -hex 16)
+go -C example/cold-dkls23 run . init "$mpc_cold_dir"
+printf '%s' 'offline file transfer signing' > "$mpc_cold_dir/message.txt"
+for round in 1 2 3; do
+  go -C example/cold-dkls23 run . request "$mpc_cold_dir" "$mpc_operation" "$round" "$mpc_cold_dir/message.txt"
+  for party in 1 2 3; do
+    go -C example/cold-dkls23 run . round "$mpc_cold_dir/device-$party" "$mpc_cold_dir/request-$round-$party.json" "$mpc_cold_dir/round-$round-$party.json"
+  done
+done
+go -C example/cold-dkls23 run . combine "$mpc_cold_dir" "$mpc_operation" "$mpc_cold_dir/message.txt" "$mpc_cold_dir/signature.der"
+```
+
+DKLS23 writes a DER-encoded ECDSA signature over SHA-256 of the message file.
+Both demos have `--help`. Repeating a device command for the same operation and
+round recovers its committed output, even after a failed output-file write.
+A changed message on retry still returns the original result. Use a fresh
+operation ID for a new signature. A device directory can move between machines
+with its wrapping key and authoritative progress; retire the old copy rather
+than operate both copies independently.
+
+`init` uses colocated demo DKG; each demo uses one environment wrapping key for
+all its devices. Production deployments provision separate devices and keys,
+authenticate public configuration and provide authenticated confidential file
+transport. Only protocol messages cross devices; encrypted key/private round
+checkpoints and authoritative progress stay in each device directory. Neither
+demo implements a message approval policy. The example file store targets local
+Linux/macOS filesystems; it does not detect a restored old store snapshot.
+The corrected adapter locates existing partitions independently of Go's Gob
+type-registration order and retains their filenames and pending progress;
+duplicate scope files are rejected. Use the corrected adapter in every process
+accessing a device store (AUDIT.md FU-MED-15).
+See the single [design note](docs/encrypted-state-and-cold-signing.md) for format
+details and [SECURITY.md](SECURITY.md) for assurance limits.
+
+DKLS23 pipelining can stop after round 1. Running round 2 without a chosen message
+requires `SessionSignInput.AllowPreSigning = true`, accepting the paper's §3.3
+stronger assumption. The message is used cryptographically only at round 3;
+applications remain responsible for choosing and approving it.
+
+### Encrypted-import migration (breaking)
+
+`UnmarshalEncrypted(blob, enc, expected)` now requires `KeyBinding` in both
+packages. Supply the public key, party and epoch from trusted application records:
+
+```go
+expected := dkls23.KeyBinding{PublicKey: trustedPK, PartyID: myID, Epoch: epoch}
+setup, err := dkls23.UnmarshalEncrypted(blob, enc, expected)
+```
+
+`SetupEncryptor` is an alias of `envelope.Encryptor`; existing authenticated
+implementations keep their method signatures. Ciphertext now uses a versioned
+bound envelope. Legacy unbound ciphertext is deliberately rejected: explicitly
+`enc.Decrypt`, call the existing plaintext importer, validate its binding and
+progress against trusted records, then reseal it with `MarshalEncrypted`. Preserve
+legitimate pending state and its authoritative progress during migration; do not
+restart it or reset reservations automatically. Plaintext and protocol message
+formats remain unchanged. Bare FROST `KeyShare` is epoch zero; use
+`MarshalSignerEncrypted` / `UnmarshalSignerEncrypted` to retain epochs and
+blacklists. `Binding()` is useful when exporting an already trusted live key;
+reading an untrusted blob is not a way to establish the expected binding.
+When migrating a refreshed bare FROST key, restore its known epoch and blacklist
+into a `SignerState` before sealing. Adopting an already pending operation into
+the guard also requires its trusted operation record, cached outputs and spent
+nonce history; the guard does not infer these from a key blob. Existing direct
+protocol restoration remains supported.
+
+Store adapters must retain the new operation `Mode` field and accept 32-byte
+nonce-marker keys. Existing zero modes remain resumable, and legacy raw nonce
+reservations remain checked. Retain authoritative progress independently of
+restorable signer backups; rolling back both defeats the guard.
 
 ## Upgrading from v0.2.x
 
@@ -178,7 +320,9 @@ dkls23/              Threshold ECDSA (secp256k1)
   commitment.go      FCom / FZero primitives
   setup_messages.go  Wire types for the one-time pairwise setup
   encoding.go        Versioned JSON wire format
-  persistence.go     Encrypted key share serialization
+  persistence.go     Bound encrypted key/setup import and export
+  state_encoding.go  Private round and refresh checkpoint envelopes
+  session.go         Library signing and refresh callbacks for session.Advance
   errors.go          Typed error categories
   params.go          Security parameters and constants
 frost/               Threshold Schnorr / Ed25519 (RFC 9591)
@@ -188,17 +332,25 @@ frost/               Threshold Schnorr / Ed25519 (RFC 9591)
   verify.go          Cofactored Ed25519 verification
   hash.go            H1-H5 and the DKG proof hash
   encoding.go        Versioned JSON wire format
-  persistence.go     Encrypted key share serialization
+  persistence.go     Bound encrypted key and signer-state import and export
+  state_encoding.go  Private nonce and refresh checkpoint envelopes
+  session.go         Signing, refresh and outbound-output codecs
   errors.go          Typed error categories
   params.go          Ciphersuite constants and element decoding
 session/             Transactional progress guard over a caller-supplied store
   store.go           Scope, versions, records, the Store contract, sentinel errors
   guard.go           Initialize, Advance, Output, Abort, Blacklist, Activate
   storetest/         Store conformance suite and in-memory fault-injecting model
+internal/statejson/  Canonical JSON validation for private envelopes
+envelope/            Context-bound container over caller-authenticated encryption
+  envelope.go        Seal, Open, Peek, encryptor interfaces and typed errors
+  context.go         Canonical context encoding and metadata validation
 example/
-  shared/            AES-256-GCM encryptor (shared by both demos)
-  dkls23/            Complete 3-of-3 DKLS23 demo
-  frost/             Complete 2-of-3 FROST demo
+  shared/            AES-GCM envelope encryptor and example Linux/macOS file store
+  dkls23/            Online 3-of-3 DKLS23 demo with persistence and refresh
+  frost/             Online 2-of-3 FROST demo with persistence and refresh
+  cold-dkls23/       Offline 3-of-3 ECDSA commands with per-party request routing
+  cold-frost/        Offline 2-of-2 Ed25519 commands with a request builder
 ```
 
 ## Development
@@ -209,7 +361,7 @@ make test-race     # run with the race detector
 make lint          # gofmt, go vet, staticcheck
 make fuzz          # run every fuzz target briefly
 make vuln          # govulncheck
-make examples      # build and run both demos
+make examples      # vet/race-test examples; run online reloads and both cold demos
 make ci            # everything CI runs
 ```
 

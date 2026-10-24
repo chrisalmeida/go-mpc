@@ -20,7 +20,8 @@ type Factory func(t *testing.T) (session.Store, func() session.Store)
 // Run tests transaction atomicity, rollback of tentative writes while preserving
 // committed records, namespace separation, copying, concurrent serialization and
 // visibility through reopened connections. Run it under -race for each production
-// Store adapter. Passing is necessary, but does not establish every part of the
+// Store adapter; both resumable and in-memory modes must survive reopening.
+// Passing is necessary, but does not establish every part of the
 // Store contract or simulate power loss or restoration of an old database snapshot.
 func Run(t *testing.T, factory Factory) {
 	t.Helper()
@@ -71,6 +72,30 @@ func Run(t *testing.T, factory Factory) {
 			}
 			return err
 		}))
+	})
+	t.Run("operation modes survive reopening", func(t *testing.T) {
+		t.Parallel()
+		store, reopen := factory(t)
+		for _, mode := range []session.Mode{session.InMemory, session.Resumable} {
+			expected := record()
+			expected.Mode = mode
+			if mode == session.InMemory {
+				expected.Checkpoint = nil
+			}
+			check(t, store.Transact(context.Background(), owner, func(tx session.Transaction) error {
+				return tx.PutSession(id, expected)
+			}))
+			check(t, reopen().Transact(context.Background(), owner, func(tx session.Transaction) error {
+				got, found, err := tx.Session(id)
+				if err != nil {
+					return err
+				}
+				if !found || got.Mode != mode {
+					t.Errorf("operation mode not recovered: want %q, got %q (found=%v)", mode, got.Mode, found)
+				}
+				return nil
+			}))
+		}
 	})
 	for _, panics := range []bool{false, true} {
 		for _, populated := range []bool{false, true} {

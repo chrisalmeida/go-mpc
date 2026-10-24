@@ -20,12 +20,12 @@ func (n *Node) SaveSetup(path string, enc dkls23.SetupEncryptor) error {
 }
 
 // LoadSetup reads an encrypted SignerSetup from path and restores it.
-func (n *Node) LoadSetup(path string, enc dkls23.SetupEncryptor) error {
+func (n *Node) LoadSetup(path string, enc dkls23.SetupEncryptor, expect dkls23.KeyBinding) error {
 	blob, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("node %d LoadSetup: read: %w", n.ID, err)
 	}
-	setup, err := dkls23.UnmarshalEncrypted(blob, enc)
+	setup, err := dkls23.UnmarshalEncrypted(blob, enc, expect)
 	if err != nil {
 		return fmt.Errorf("node %d LoadSetup: %w", n.ID, err)
 	}
@@ -37,9 +37,9 @@ func (n *Node) LoadSetup(path string, enc dkls23.SetupEncryptor) error {
 }
 
 // NewFromFile creates a Node by loading an encrypted setup from disk.
-func NewFromFile(path string, enc dkls23.SetupEncryptor) (*Node, error) {
+func NewFromFile(path string, enc dkls23.SetupEncryptor, expect dkls23.KeyBinding) (*Node, error) {
 	n := &Node{}
-	if err := n.LoadSetup(path, enc); err != nil {
+	if err := n.LoadSetup(path, enc, expect); err != nil {
 		return nil, err
 	}
 	return n, nil

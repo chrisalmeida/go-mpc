@@ -1,41 +1,65 @@
 // This example demonstrates a complete 2-of-3 FROST threshold Ed25519 flow:
 //
 //  1. Key Generation  — Feldman VSS DKG, no trusted dealer (2 rounds)
-//  2. Key Refresh     — rotate shares without changing the public key
-//  3. Signing         — 2-round threshold Schnorr signing
-//  4. Verification    — cofactored Ed25519 + crypto/ed25519 cross-check
-//  5. Persistence     — encrypted key shares saved to disk and reloaded
+//  2. Persistence     — encrypted signer state and authoritative session progress
+//  3. Signing         — all 2-of-3 subsets, checked with crypto/ed25519
+//  4. Key Refresh     — prepare every party, activate, reload, and sign again
 //
-// On the first run, DKG executes and shares are saved to shares/.
-// On subsequent runs, shares are loaded from disk and DKG is skipped.
+// Set MPC_WRAPPING_KEY to a 32-byte hex demo key and retain it between runs.
+// MPC_DEMO_DIR selects the store directory (default shares/). The first run
+// creates a group; subsequent runs reload it and skip DKG. Choose a new empty
+// directory for a separate demo group.
 //
-// Delete the shares/ directory to start fresh.
+// Private round checkpoints stay in session.Memory for this online demo.
+// See example/cold-frost for resumable signing across process restarts.
 //
 // Each Node is an independent party. The orchestrator here is a stand-in for
 // whatever transport you use in production (HTTP, gRPC, message queue, etc.).
 //
-// Run: cd example/frost && go run .
+// Run from the repository root: go -C example/frost run .
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
-	"path/filepath"
 
 	"go-mpc-example/frost/node"
 	"go-mpc-example/shared"
 
 	"github.com/chrisalmeida/go-mpc/frost"
+	"github.com/chrisalmeida/go-mpc/session"
 )
 
 const (
-	shareDir  = "shares"
 	threshold = 2
 )
 
 var allIDs = []int{1, 2, 3}
+var shareDir = shared.DemoDirectory()
+var demoEncryptor *shared.AESEncryptor
+var demoStore = &shared.FileStore{Directory: shareDir}
+var guards = make(map[int]*shared.Guard)
+
+func must(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+func round(id int, kind session.Kind, operation string, phase int, parties []int, compute session.Compute) []byte {
+	op, err := guards[id].ID(kind, operation)
+	must(err)
+	output, err := guards[id].Advance(op, phase, parties, compute)
+	must(err)
+	if kind == session.Signing || phase == 1 {
+		output, err = (frost.SessionCodec{Encryptor: demoEncryptor}).OpenOutput(output, frost.KeyBinding{PublicKey: []byte(guards[id].Scope.PublicKey), PartyID: id, Epoch: op.Epoch}, op, phase)
+		must(err)
+	}
+	return output
+}
 
 func main() {
 	fmt.Println("FROST Threshold Ed25519 — 2-of-3 Demo")
@@ -67,6 +91,7 @@ func main() {
 // loadOrGenerate loads existing shares from disk or runs the full DKG.
 func loadOrGenerate() (nodes []*node.Node, pubKey []byte) {
 	enc, loaded, err := shared.LoadOrCreateKey(shareDir)
+	demoEncryptor = enc
 	if err != nil {
 		log.Fatalf("encryption key: %v", err)
 	}
@@ -76,24 +101,23 @@ func loadOrGenerate() (nodes []*node.Node, pubKey []byte) {
 	return generateAndSave(enc)
 }
 
-// loadShares reads encrypted share files and returns ready-to-sign nodes.
 func loadShares(enc *shared.AESEncryptor) ([]*node.Node, []byte) {
-	fmt.Println("Loading key shares from disk...")
-
+	m, err := shared.LoadManifest(shareDir)
+	must(err)
+	if m.Protocol != "frost" {
+		log.Fatal("wrong protocol in demo manifest")
+	}
 	nodes := make([]*node.Node, len(allIDs))
 	for i, id := range allIDs {
-		p := filepath.Join(shareDir, fmt.Sprintf("node-%d.enc", id))
-		n, err := node.NewFromFile(p, enc)
-		if err != nil {
-			log.Fatalf("load node %d: %v", id, err)
-		}
-		nodes[i] = n
-		fmt.Printf("  node %d loaded\n", n.ID)
+		scope := session.Scope{Protocol: session.FROST, PublicKey: string(m.PublicKey), PartyID: id}
+		key, err := session.InspectKey(context.Background(), demoStore, scope)
+		must(err)
+		state, err := frost.UnmarshalSignerEncrypted(key.Checkpoint, enc, frost.KeyBinding{PublicKey: m.PublicKey, PartyID: id, Epoch: key.Epoch})
+		must(err)
+		nodes[i] = &node.Node{ID: id, AllIDs: allIDs, Threshold: threshold, State: state}
+		guards[id] = &shared.Guard{Store: demoStore, Scope: scope}
 	}
-
-	pubKey := nodes[0].PublicKey()
-	fmt.Printf("  public key: %s\n\n", hex.EncodeToString(pubKey))
-	return nodes, pubKey
+	return nodes, m.PublicKey
 }
 
 // generateAndSave runs the 2-round DKG and saves encrypted shares to disk.
@@ -145,18 +169,15 @@ func generateAndSave(enc *shared.AESEncryptor) ([]*node.Node, []byte) {
 	pubKey := nodes[0].PublicKey()
 	fmt.Printf("  public key: %s\n\n", hex.EncodeToString(pubKey))
 
-	// ── Persist ─────────────────────────────────────────────────
-
-	fmt.Println("Phase 2: Saving Key Shares")
-
 	for _, n := range nodes {
-		p := filepath.Join(shareDir, fmt.Sprintf("node-%d.enc", n.ID))
-		if err := n.SaveKeyShare(p, enc); err != nil {
-			log.Fatalf("save node %d: %v", n.ID, err)
-		}
-		fmt.Printf("  node %d → %s\n", n.ID, p)
+		scope := session.Scope{Protocol: session.FROST, PublicKey: string(pubKey), PartyID: n.ID}
+		checkpoint, err := frost.MarshalSignerEncrypted(n.State, enc)
+		must(err)
+		_, err = session.Initialize(context.Background(), demoStore, scope, 0, checkpoint)
+		must(err)
+		guards[n.ID] = &shared.Guard{Store: demoStore, Scope: scope}
 	}
-	fmt.Println()
+	must(shared.SaveManifest(shareDir, shared.Manifest{Protocol: "frost", PublicKey: pubKey, Parties: allIDs}))
 
 	return nodes, pubKey
 }
@@ -197,72 +218,59 @@ func signAndPrint(nodes []*node.Node, pubKey []byte, message []byte) {
 	fmt.Println()
 }
 
-// refresh runs the 2-round key refresh protocol across all nodes.
+// refresh runs each round through encrypted authoritative state and activates
+// only after every participant has prepared its candidate in this demo.
 func refresh(nodes []*node.Node) {
-	allRefR1 := make(map[int]*frost.RefreshRound1Output)
+	operation := node.SessionID()
+	codec := frost.SessionCodec{Encryptor: demoEncryptor}
+	r1 := make(map[int]*frost.RefreshRound1Output)
+	r2 := make(map[int]*frost.RefreshRound2Output)
 	for _, n := range nodes {
-		out, err := n.RefreshRound1()
-		if err != nil {
-			log.Fatalf("refresh round 1 node %d: %v", n.ID, err)
-		}
-		allRefR1[n.ID] = out
+		var out frost.RefreshRound1Output
+		must(json.Unmarshal(round(n.ID, session.Refresh, operation, 1, allIDs, codec.Refresh(nil, nil)), &out))
+		r1[n.ID] = &out
+	}
+	for _, n := range nodes {
+		blob := round(n.ID, session.Refresh, operation, 2, allIDs, codec.Refresh(r1, nil))
+		out, err := codec.OpenRefreshRound2(blob, n.State.Binding(), operation)
+		must(err)
+		r2[n.ID] = out
 	}
 
-	allRefR2 := make(map[int]*frost.RefreshRound2Output)
 	for _, n := range nodes {
-		out, err := n.RefreshRound2()
-		if err != nil {
-			log.Fatalf("refresh round 2 node %d: %v", n.ID, err)
-		}
-		allRefR2[n.ID] = out
+		round(n.ID, session.Refresh, operation, 3, allIDs, codec.Refresh(r1, r2))
 	}
-
 	for _, n := range nodes {
-		if err := n.RefreshFinalize(allRefR1, allRefR2); err != nil {
-			log.Fatalf("refresh finalize node %d: %v", n.ID, err)
-		}
+		must(guards[n.ID].Activate(operation))
+	}
+	restored, _ := loadShares(demoEncryptor)
+	for i := range nodes {
+		*nodes[i] = *restored[i]
 	}
 }
 
-// sign runs the 2-round FROST signing protocol across the given nodes.
+// sign runs RFC 9591 through the guard with in-memory private checkpoints.
 func sign(nodes []*node.Node, signers []int, message []byte) *frost.Signature {
-	nodeMap := make(map[int]*node.Node, len(nodes))
+	operation := node.SessionID()
+	codec := frost.SessionCodec{Encryptor: demoEncryptor}
+	commitments := make(map[int]*frost.NonceCommitment)
+	shares := make(map[int]*frost.SignatureShare)
+	for _, id := range signers {
+		var out frost.NonceCommitment
+		must(json.Unmarshal(round(id, session.Signing, operation, 1, signers, codec.Signing(nil)), &out))
+		commitments[id] = &out
+	}
+	input := &frost.Round2Input{Message: message, AllCommitments: commitments}
+	for _, id := range signers {
+		var out frost.SignatureShare
+		must(json.Unmarshal(round(id, session.Signing, operation, 2, signers, codec.Signing(input)), &out))
+		shares[id] = &out
+	}
+	verification := make(map[int][]byte)
 	for _, n := range nodes {
-		nodeMap[n.ID] = n
+		verification[n.ID] = n.KeyShare().VerificationShare
 	}
-
-	// Round 1: generate nonce commitments.
-	r1States := make(map[int]*frost.Round1State)
-	allCommitments := make(map[int]*frost.NonceCommitment)
-	for _, id := range signers {
-		st, comm, err := nodeMap[id].SignRound1(signers)
-		if err != nil {
-			log.Fatalf("sign round 1 node %d: %v", id, err)
-		}
-		r1States[id] = st
-		allCommitments[id] = comm
-	}
-
-	// Round 2: compute signature shares.
-	allShares := make(map[int]*frost.SignatureShare)
-	input := &frost.Round2Input{Message: message, AllCommitments: allCommitments}
-	for _, id := range signers {
-		share, err := nodeMap[id].SignRound2(r1States[id], input)
-		if err != nil {
-			log.Fatalf("sign round 2 node %d: %v", id, err)
-		}
-		allShares[id] = share
-	}
-
-	// Aggregate: combine shares into final signature.
-	verShares := make(map[int][]byte)
-	for _, id := range signers {
-		verShares[id] = nodeMap[id].KeyShare().VerificationShare
-	}
-
-	sig, err := frost.Aggregate(allCommitments, allShares, message, nodeMap[signers[0]].PublicKey(), verShares, signers)
-	if err != nil {
-		log.Fatalf("aggregate: %v", err)
-	}
+	sig, err := frost.Aggregate(commitments, shares, message, nodes[0].PublicKey(), verification, signers)
+	must(err)
 	return sig
 }

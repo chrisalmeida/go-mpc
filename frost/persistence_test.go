@@ -46,7 +46,7 @@ func TestEncryptedRoundTrip(t *testing.T) {
 	ct, err := MarshalEncrypted(ks, enc)
 	require.NoError(t, err)
 
-	got, err := UnmarshalEncrypted(ct, enc)
+	got, err := UnmarshalEncrypted(ct, enc, ks.Binding())
 	require.NoError(t, err)
 	assert.Equal(t, ks.ID, got.ID)
 	assert.Equal(t, ks.SecretShare, got.SecretShare)
@@ -60,7 +60,7 @@ func TestEncryptedErrors(t *testing.T) {
 	_, err := MarshalEncrypted(keyShares[1], enc)
 	assert.Error(t, err)
 
-	_, err = UnmarshalEncrypted([]byte("garbage"), enc)
+	_, err = UnmarshalEncrypted([]byte("garbage"), enc, keyShares[1].Binding())
 	assert.Error(t, err)
 }
 
@@ -88,7 +88,7 @@ func TestEncryptedRoundTripFunctional(t *testing.T) {
 	for id, ks := range keyShares {
 		ct, err := MarshalEncrypted(ks, enc)
 		require.NoError(t, err)
-		got, err := UnmarshalEncrypted(ct, enc)
+		got, err := UnmarshalEncrypted(ct, enc, ks.Binding())
 		require.NoError(t, err)
 		restored[id] = got
 	}

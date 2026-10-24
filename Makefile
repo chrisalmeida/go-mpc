@@ -20,13 +20,13 @@ bench:
 
 # Show test coverage
 cover:
-	go test -coverprofile=coverage.out ./dkls23 ./frost ./session
+	go test -coverprofile=coverage.out ./dkls23 ./frost ./session ./envelope ./internal/statejson
 	go tool cover -func=coverage.out | tail -1
 	@rm -f coverage.out
 
 # Check formatting
 fmt:
-	@out=$$(gofmt -l ./dkls23 ./frost ./example); \
+	@out=$$(gofmt -l ./dkls23 ./frost ./session ./envelope ./internal ./example); \
 	if [ -n "$$out" ]; then echo "unformatted files:"; echo "$$out"; exit 1; fi
 
 # Run go vet
@@ -43,7 +43,7 @@ lint: fmt vet staticcheck
 
 # Run every fuzz target briefly (see scripts/fuzz-smoke.sh for the retry rule)
 fuzz:
-	@for pkg in ./dkls23 ./frost; do \
+	@for pkg in ./dkls23 ./frost ./envelope; do \
 		for target in $$(go test -list 'Fuzz.*' $$pkg | grep '^Fuzz'); do \
 			./scripts/fuzz-smoke.sh $$pkg $$target 5s || exit 1; \
 		done; \
@@ -54,11 +54,11 @@ vuln:
 	go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
 	go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
-# Build and run the example modules
+# Vet/race-test examples, run online reloads and both cold command flows
 examples:
 	cd example && go vet ./...
-	cd example/dkls23 && go run .
-	cd example/frost && go run .
+	cd example && go test -race -timeout 600s ./...
+	./scripts/run-examples.sh
 
 # Run the full CI pipeline locally
 ci: lint test-race cover examples fuzz vuln

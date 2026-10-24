@@ -17,7 +17,7 @@ jobs:
 
       - name: gofmt
         run: |
-          out=$(gofmt -l ./dkls23 ./frost ./example)
+          out=$(gofmt -l ./dkls23 ./frost ./session ./envelope ./internal ./example)
           if [ -n "$out" ]; then echo "unformatted files:"; echo "$out"; exit 1; fi
 
       - name: go mod tidy check
@@ -42,13 +42,14 @@ jobs:
 
       - name: Example modules
         run: |
-          cd example && go vet ./...
-          cd dkls23 && go run . && cd ..
-          cd frost && go run .
+          go -C example mod tidy -diff
+          go -C example vet ./...
+          go -C example test -race -timeout 600s ./...
+          ./scripts/run-examples.sh
 
       - name: Fuzz smoke
         run: |
-          for pkg in ./dkls23 ./frost; do
+          for pkg in ./dkls23 ./frost ./envelope; do
             for target in $(go test -list 'Fuzz.*' $pkg | grep '^Fuzz'); do
               ./scripts/fuzz-smoke.sh $pkg $target 5s
             done

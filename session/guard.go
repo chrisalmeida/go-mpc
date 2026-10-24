@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"math"
 	"slices"
@@ -84,7 +85,7 @@ func InspectSession(ctx context.Context, store Store, scope Scope, id ID) (Recor
 // activation or abort. Local finalization saves a candidate for Activate, which
 // the application calls only after coordinating agreement with peers.
 func Advance(ctx context.Context, store Store, scope Scope, req Request, compute Compute) (*Receipt, error) {
-	if !validID(req.ID) || req.Epoch != req.ID.Epoch || req.Revision == 0 || req.Round < 1 || req.Round > finalRound(scope.Protocol, req.ID.Kind) || compute == nil {
+	if !validMode(req.Mode) || !validID(req.ID) || req.Epoch != req.ID.Epoch || req.Revision == 0 || req.Round < 1 || req.Round > finalRound(scope.Protocol, req.ID.Kind) || compute == nil {
 		return nil, ErrInvalid
 	}
 	participants, err := partySet(req.Participants, scope.PartyID)
@@ -112,7 +113,7 @@ func Advance(ctx context.Context, store Store, scope Scope, req Request, compute
 			if req.Round != 1 {
 				return ErrProgress
 			}
-			record = Record{Participants: slices.Clone(participants), Outputs: make(map[int][]byte)}
+			record = Record{Mode: req.Mode, Participants: slices.Clone(participants), Outputs: make(map[int][]byte)}
 		} else {
 			if record.Aborted {
 				return ErrAborted
@@ -120,7 +121,7 @@ func Advance(ctx context.Context, store Store, scope Scope, req Request, compute
 			if record.Completed || record.Round+1 != req.Round {
 				return ErrProgress
 			}
-			if !slices.Equal(record.Participants, participants) {
+			if record.Mode != req.Mode || !slices.Equal(record.Participants, participants) {
 				return ErrInvalid
 			}
 		}
@@ -173,7 +174,7 @@ func Advance(ctx context.Context, store Store, scope Scope, req Request, compute
 			aborted = u.Abort
 		} else {
 			terminal := req.Round == finalRound(scope.Protocol, req.ID.Kind)
-			if terminal != (len(u.Checkpoint) == 0) {
+			if (req.Mode == Resumable && terminal != (len(u.Checkpoint) == 0)) || (req.Mode == InMemory && len(u.Checkpoint) != 0) {
 				return ErrInvalid
 			}
 			if len(u.Output) == 0 && !(terminal && req.ID.Kind == Refresh) {
@@ -187,6 +188,7 @@ func Advance(ctx context.Context, store Store, scope Scope, req Request, compute
 				if len(u.NonceID) != width {
 					return ErrInvalid
 				}
+				// Read legacy raw markers as well, so existing stores retain their guard.
 				used, err := tx.NonceUsed(u.NonceID)
 				if err != nil {
 					return err
@@ -194,7 +196,15 @@ func Advance(ctx context.Context, store Store, scope Scope, req Request, compute
 				if used {
 					return ErrNonceUsed
 				}
-				if err := tx.UseNonce(u.NonceID); err != nil {
+				marker := NonceMarker([]byte(u.NonceID))
+				used, err = tx.NonceUsed(marker)
+				if err != nil {
+					return err
+				}
+				if used {
+					return ErrNonceUsed
+				}
+				if err := tx.UseNonce(marker); err != nil {
 					return err
 				}
 			} else if u.NonceID != "" {
@@ -456,10 +466,10 @@ func loadSession(tx Transaction, scope Scope, id ID) (Record, bool, error) {
 	}
 	last := finalRound(scope.Protocol, id.Kind)
 	parties, err := partySet(record.Participants, scope.PartyID)
-	if err != nil || !slices.Equal(parties, record.Participants) || record.Round < 0 || record.Round > last ||
+	if err != nil || !validMode(record.Mode) || !slices.Equal(parties, record.Participants) || record.Round < 0 || record.Round > last ||
 		(record.Completed && record.Aborted) || (record.Round == 0 && !record.Aborted) ||
 		(!record.Aborted && record.Completed != (record.Round == last)) ||
-		((record.Aborted || record.Completed) != (len(record.Checkpoint) == 0)) || len(record.Outputs) != record.Round {
+		((record.Aborted || record.Completed || record.Mode == InMemory) != (len(record.Checkpoint) == 0)) || len(record.Outputs) != record.Round {
 		return Record{}, true, ErrCorrupt
 	}
 	for round := 1; round <= record.Round; round++ {
@@ -542,3 +552,12 @@ func cloneRecord(record Record) Record {
 	record.Outputs = outputs
 	return record
 }
+
+func validMode(mode Mode) bool { return mode == Resumable || mode == InMemory }
+
+// NonceMarker returns the SHA-256 digest used as a local storage index for nonce
+// commitments. This does not change any protocol hash or transcript. Advance
+// accepts raw encoded commitments and stores only this digest for new records.
+// Source inspected: Go 1.26.1 crypto/sha256/sha256.go and the fixed-round
+// crypto/internal/fips140/sha256/sha256block.go; compiled timing is not measured.
+func NonceMarker(encoded []byte) string { digest := sha256.Sum256(encoded); return string(digest[:]) }

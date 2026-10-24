@@ -1,7 +1,6 @@
 # Encrypted state and cold signing — design note
 
-**Status**: proposal for maintainer review, 2026-10-21. Nothing in this note is
-implemented yet. It complements [SECURITY.md](../SECURITY.md#session-lifetime-and-persistence),
+**Status**: full workflow implemented on 2026-10-22. It complements [SECURITY.md](../SECURITY.md#session-lifetime-and-persistence),
 [session/README.md](../session/README.md) and AUDIT.md FU-MED-6, and it changes
 no protocol message, hash input, security parameter or test vector.
 
@@ -32,7 +31,7 @@ the protocols themselves.
 - **Resumable mode**: private round state is persisted (encrypted) between
   rounds. This is what the session guard does today.
 - **In-memory mode**: private round state lives only in process memory; a
-  restart aborts the session. New, proposed default for online signers.
+  restart aborts the session. Explicit opt-in for online signers through `session.Memory.Advance`; the existing resumable zero value is retained.
 - **Envelope**: the encrypted container described in section 1.
 
 ## 1. Envelope package
@@ -41,7 +40,9 @@ A new package `envelope` owns the container format. The two protocol packages
 and the session codecs use it; it imports neither.
 
 **Encryptor interface.** Unchanged shape: encrypt bytes to bytes, decrypt bytes
-to bytes. `dkls23.SetupEncryptor` and `frost.SetupEncryptor` become aliases of
+to bytes. Both interfaces require authenticated encryption: `Decrypt` must
+reject changed ciphertext. The embedded context does not add integrity to a
+malleable cipher. `dkls23.SetupEncryptor` and `frost.SetupEncryptor` are aliases of
 `envelope.Encryptor`, so existing implementations keep compiling. An optional
 second interface, `ContextEncryptor`, adds an associated-data parameter; when an
 encryptor implements it, the envelope passes the clear header as associated
@@ -51,7 +52,7 @@ context is authenticated server-side. The binding below does not depend on it.
 **Context.** A struct with the fields: protocol tag, blob kind, wire version,
 group public key bytes, party id, epoch, operation id (empty for key material),
 round (zero for key material). Encoded canonically as length-prefixed fields in
-declaration order. The library composes it; callers never type it by hand.
+declaration order. Protocol wrappers compose it from `KeyBinding` and trusted operation progress; callers do not compose raw envelope contexts for these APIs.
 
 **Blob layout.**
 
@@ -89,15 +90,15 @@ context; the session guard's revision check covers that.
 
 ## 2. Encodings and wrappers
 
-| Protocol | State | Today | Planned |
+| Protocol | State | Plaintext format | Implemented encrypted format |
 | --- | --- | --- | --- |
-| dkls23 | `SignerSetup` | JSON; encrypted wrapper without binding | Bound envelope, kind `setup` |
-| dkls23 | `Round1State`, `Round2State` | JSON only | Bound envelopes, kinds `sign-1`, `sign-2`; context carries session id and round |
-| dkls23 | Refresh coefficients and seed | No encoding | Strict JSON and bound envelopes, kinds `refresh-1`, `refresh-2` (needed for cold refresh) |
-| frost | `KeyShare` | JSON; encrypted wrapper without binding | Bound envelope, kind `key` |
-| frost | `SignerState` | JSON only | Bound envelope, kind `signer` |
-| frost | `Round1State` (nonces) | No encoding | Strict JSON (canonical scalars, commitment, signers) and bound envelope, kind `sign-1`; a restored state receives a fresh single-use record |
-| frost | Refresh coefficients and seed | No encoding | Strict JSON and bound envelope, kinds `refresh-1`, `refresh-2` |
+| dkls23 | `SignerSetup` | Existing JSON | Bound envelope, kind `setup` |
+| dkls23 | `Round1State`, `Round2State` | Existing JSON | Bound envelopes, kinds `sign-1`, `sign-2`; context carries session id and round |
+| dkls23 | Refresh coefficients and seed | New strict versioned JSON | Strict JSON and bound envelopes, kinds `refresh-1`, `refresh-2` (implemented for cold refresh) |
+| frost | `KeyShare` | Existing JSON | Bound envelope, kind `key` |
+| frost | `SignerState` | Existing JSON | Bound envelope, kind `signer` |
+| frost | `Round1State` (nonces) | New strict versioned JSON | Strict JSON (canonical scalars, commitment, signers) and bound envelope, kind `sign-1`; a restored state receives a fresh single-use record |
+| frost | Refresh coefficients and seed | New strict versioned JSON | Strict JSON and bound envelope, kinds `refresh-1`, `refresh-2` |
 
 Rules that apply to every new encoding, from CLAUDE.md: strict `UnmarshalJSON`
 with receiver preservation, a fuzz target, an unmarshal error table, and
@@ -109,18 +110,15 @@ binding use `Peek` and then validate what they learn against their own records.
 ## 3. Session guard modes
 
 - **Resumable mode** is the current behaviour and stays the mode for cold
-  devices that power down: the codec encrypts the round checkpoint, the guard
+  devices that power down: the codec encrypts the round checkpoint and outgoing messages, the guard
   commits it with the progress record and nonce marker, and deletes it when the
   round completes. One use per round is enforced by the progress record even
   after a restart.
 - **In-memory mode** is new: the guard accepts an empty round checkpoint while
   an operation is open, and after a restart the only permitted action on that
-  operation is `Abort`. Nothing ephemeral reaches storage. It becomes the
-  documented default for online signers; the codec chooses the mode per
-  operation.
+  operation is `Abort`. Nothing ephemeral reaches storage. Use `session.Memory.Advance` for online signers and keep that object between rounds. `Request.Mode` stays resumable by default for compatibility. A new Memory instance returns `ErrUnavailable` on a pending operation; explicitly `Abort` it.
 - **Nonce marker** becomes a 32-byte digest of the committed nonce point(s)
-  instead of the raw encoding, so the store's plaintext index never holds a
-  value the protocol has not yet revealed. Uniqueness is unaffected.
+  instead of the raw encoding for new reservations. `Update.NonceID` still supplies the actual encoded point(s); `Advance` hashes them before storage. Legacy raw reservations are also checked and retained. This index does not expose the unrevealed nonce commitment; collision resistance is a SHA-256 assumption, not a proof of mathematical uniqueness.
 - **Refresh interaction.** FROST round-1 state is already bound to the key
   epoch, and the guard already refuses to start a refresh while operations are
   open. Pre-generated commitments must therefore be consumed or aborted before
@@ -171,11 +169,7 @@ round-1 and round-2 messages are tens of kilobytes per counterparty and need
 removable media or multi-part QR; a compact binary encoding is out of scope for
 this work.
 
-**Device policy.** The store and the signer must be backed up and restored
-together or not at all; the guard cannot detect a store restored from an old
-snapshot alongside the signer. A file-backed store with write-to-temporary,
-sync and rename under a directory lock is the recommended backend for a device
-without a database.
+**Rollback boundary.** Keep authoritative progress independently of restorable signer backups. The guard cannot detect the entire store and signer being restored from the same old snapshot; backing them up together does not solve rollback. The example file adapter uses write-to-temporary, file sync, rename and directory sync under a per-scope kernel lock. Deployment durability and rollback controls remain the caller's responsibility.
 
 ## 5. Store and demos
 
@@ -229,12 +223,11 @@ CLAUDE.md updates the Documentation Duties require.
 - **File-backed store**: example only (decided 2026-10-21). Storage backends are
   the caller's, and a file store is no exception; the example shows the pattern
   and passes the conformance suite, nothing more.
-- **`session` stays in this module** (proposed default): it is protocol-specific
+- **`session` stays in this module** (implemented): it is protocol-specific
   and tested against the real packages; a separate module would only add
   versioning friction. The alternative, splitting it out, would exist to keep an
   external crypto audit's surface smaller.
-- **Encrypted unmarshal functions gain an expected-binding parameter** (proposed
-  default): a compile error forces every caller onto the bound path. The
+- **Encrypted unmarshal functions gain an expected-binding parameter** (implemented): a compile error forces every caller onto the bound path. The
   alternative, new names beside the old functions, would leave the unbound path
   available.
 - **DKLS23 pre-signing**: paper read (§3.3) and recorded as AUDIT.md FU-LOW-8
@@ -259,4 +252,82 @@ commit, and what remains.
   the round trip, a mismatch matrix over every field, a spliced header,
   truncation, an unknown version, invalid contexts, and a fuzz target for
   `Open`; coverage at or above 90%; `envelope/README.md`; CLAUDE.md map and
-  documents list; CHANGELOG "Added". Nothing of increment 1 exists in the tree.
+  documents list; CHANGELOG "Added". Nothing of increment 1 exists in the tree
+  at the time of this handoff.
+- 2026-10-22: increment 1 implemented: standalone `envelope`
+  with canonical context framing, both encryptor interfaces, trusted-context
+  checks before decryption and payload release, typed errors, owned buffers,
+  authenticated substitution/malformed-input tests and two fuzz targets.
+  Authenticated encryption is explicitly required from the caller. Protocol
+  wrappers, state encodings, guard modes, codecs and demos remain increments
+  2–6; existing encrypted APIs and protocol formats are unchanged. See FU-MED-13.
+  Validation: `make ci` green, envelope coverage 98.6%; both modules'
+  `go mod tidy -diff` and the protected vector/fresh-VOLE source checks pass.
+
+- 2026-10-22: increments 2–6 implemented together. Both packages
+  have trusted bound key imports, encrypted signing/refresh private state and
+  stateless `SessionCodec` callbacks. DKLS23's new bound payloads preserve opaque
+  operation IDs as base64 without changing legacy plaintext formats. `session`
+  adds explicit in-memory mode and digest nonce indexes, retaining the resumable
+  zero value and checking existing raw reservations. Both ordinary demos run
+  through the guard. The Linux/macOS example file store passes conformance and
+  real-process crash/serialization checks; cold FROST and DKLS23 tests restart
+  processes for every round and verify signatures independently. No protocol
+  equation, transcript or protected vector source is changed. See FU-MED-14.
+
+- 2026-10-23: completed the runnable examples for both protocols. Cold DKLS23
+  has per-recipient request/round/combine commands; cold FROST has a manual
+  request builder. README commands and `--help` describe both flows. Process
+  tests relocate device state between rounds, recover after failed output-file
+  delivery and verify cached retries; coordinator aggregation needs no wrapping
+  key. FROST node snapshot helpers retain epoch/blacklist without changing the
+  old bare-key helpers. See AUDIT.md FU-LOW-9 for evidence and limits.
+  The same review found and fixed example-store lookup/locking depending on
+  process-local Gob type IDs. Existing files, private checkpoints and nonce
+  history are retained without migration; mixed-history process tests and
+  duplicate-scope rejection are recorded in FU-MED-15.
+
+### Implemented API and output handling
+
+- `MarshalEncrypted` / `UnmarshalEncrypted(blob, enc, expected KeyBinding)`:
+  bound DKLS23 setup and FROST bare key. Bare FROST keys are epoch zero.
+- FROST `MarshalSignerEncrypted` / `UnmarshalSignerEncrypted`: retain refresh
+  epoch and blacklist. Signing state uses `MarshalRound1Encrypted`; DKLS23
+  also supplies `MarshalRound2Encrypted`, with corresponding import functions.
+- Both packages' `RefreshState` and `MarshalRefreshEncrypted` /
+  `UnmarshalRefreshEncrypted`: strict private refresh schema, rounds 1 and 2.
+- Both packages' `SessionCodec.Signing` and `.Refresh`: restore fresh encrypted
+  authoritative checkpoints inside the transaction. `OpenOutput` opens committed
+  outbound ciphertext using trusted sender/operation/round binding.
+  `OpenRefreshRound2` additionally parses canonical private refresh messages.
+
+Review found that refresh round-2 messages contain secret share updates. Treating
+all outgoing messages as public would persist those secrets in `Record.Outputs`.
+The implemented codecs therefore seal **every cached outgoing message**, using
+separate local kinds `sign-output` and `refresh-output`. Signing output contexts
+allow protocol rounds 1–3 (FROST 1–2); refresh output contexts allow rounds 1–2,
+with no output at finalization. These kinds prevent an outbound message from
+being loaded as private nonce or coefficient state. Decrypt only after commit,
+then send through the application's authenticated confidential transport. This
+container change does not alter a protocol message. Tests reject altered outputs,
+wrong operations and private-state substitution; the output cache is ciphertext.
+
+`session.Memory` removes private round checkpoints from storage while still
+committing encrypted key checkpoints and encrypted outbound caches. Pending
+operations are only resumable in the Memory object that retains their private
+checkpoint; losing it requires abort. No process identity check is added to
+resumable mode. Kernel locks are backend concurrency controls and are released
+on process death.
+
+Confirmed Memory commits clear superseded checkpoint buffers for that operation;
+uncertain outcomes retain candidates and preceding state until progress is
+confirmed. The store conformance suite tests both `Record.Mode` values across
+reopening and rejects an adapter that silently drops the field. These review
+corrections do not change mode defaults or storage formats (FU-MED-16, FU-LOW-10).
+
+The example encryptor wraps a fresh data key per blob with an environment-supplied
+AES-256 wrapping key. Its authenticated key ID and `PreviousKeys` support rotation;
+use a distinct key ID for a new wrapping key. Go's random-nonce GCM contract limits
+a wrapping key to fewer than 2^32 encryptions. Timing depends on enabled AES/GCM
+hardware support and is not measured here. No keys are saved alongside shares.
+`MPC_WRAPPING_KEY` must remain available between device commands.

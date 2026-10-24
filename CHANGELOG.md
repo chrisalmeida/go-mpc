@@ -8,6 +8,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Complete command-line cold-signing examples for DKLS23 and FROST, with manual
+  request builders, `--help`, runnable README commands and both demos in CI.
+  Process tests cover device relocation, failed file delivery, cached retries,
+  wrong-key rejection and independent signature verification. Add FROST signer
+  snapshot helpers that retain refreshed epochs and blacklists; preserve the
+  legacy bare-key helpers. (AUDIT.md FU-LOW-9)
+- **Portable cold signing and refresh for both protocols.** Add bound private
+  signing and refresh codecs, trusted key bindings, stateless `SessionCodec`
+  callbacks, encrypted outbound caches and explicit post-commit `OpenOutput`.
+  Confidential refresh shares also have `OpenRefreshRound2`. Add optional
+  `session.Memory` for online operations; resumable remains the zero mode.
+  Add the example Linux/macOS file store with conformance and process-crash
+  tests, both demos through the guard, FROST file-transfer commands and real
+  process-restart signing/refresh tests. No protocol transcript or vector changes.
+  (FU-MED-14)
+- **`envelope` package.** Add `Seal`, `Open`, `Peek`, canonical context encoding,
+  typed errors and caller-supplied authenticated encryption with optional header
+  associated data. Check trusted expected binding before decryption and embedded
+  context before private payload release. (FU-MED-13)
 - **`session` package: transactional progress guard** for DKLS23 and FROST
   signing and refresh over a caller-supplied `session.Store`. `Advance` commits
   at most one result per operation and round, saving the key checkpoint,
@@ -20,8 +39,35 @@ All notable changes to this project are documented here. The format follows
   fault-injecting model. No protocol, wire format or persisted format changes;
   the repository ships no production backend. (AUDIT.md FU-MED-6)
 
+### Changed
+
+- **Breaking: encrypted imports require `KeyBinding`.** Both
+  `UnmarshalEncrypted` functions now take the trusted expected key/party/epoch.
+  `SetupEncryptor` aliases `envelope.Encryptor`; authenticated implementations
+  retain their methods. Legacy unbound ciphertext requires explicit
+  decrypt/validate/reseal migration. Existing plaintext and protocol formats
+  remain unchanged; legitimate pending state and authoritative progress can be
+  retained. FROST signer envelopes retain epoch/blacklist; bare keys are epoch zero.
+- New nonce reservations are SHA-256 digests; existing raw reservations remain
+  checked. Store adapters must retain operation mode and accept 32-byte markers.
+- Example wrapping keys come from the environment, with no colocated `enc.key`.
+  Each blob gets a wrapped fresh data key and authenticated key ID. Legacy demo
+  directories fail explicitly; CI uses disposable fixtures and never overwrites
+  a maintainer's shares directory.
+
 ### Security
 
+- **session: verify mode persistence and clear superseded memory checkpoints.**
+  The store conformance suite checks both mode values across reopening and
+  rejects an adapter that drops `Record.Mode`. `Memory.Advance` clears older
+  checkpoint buffers after confirmed commits while retaining needed state on
+  uncertain outcomes and preserving other operations/scopes. Mode defaults,
+  stored formats and protocol transcripts are unchanged. (FU-MED-16, FU-LOW-10)
+- Fix example file-store lookup and locking across processes with different Gob
+  type histories. Retain existing partition filenames and pending progress;
+  reject duplicate scope files before running a transaction. Add a failing-first
+  restart regression and concurrent writers with different encoding histories.
+  (AUDIT.md FU-MED-15)
 - **dkls23: document pipelining and pre-signing per DKLS23 §3.3.** Rounds 1
   and 2 take no message and round 3 does, which is the paper's pre-signing
   point. Pipelining is acceptable generally; pre-signing is an explicit opt-in

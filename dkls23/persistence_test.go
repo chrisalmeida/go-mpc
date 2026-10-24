@@ -86,7 +86,7 @@ func TestMarshalEncryptedRoundTrip(t *testing.T) {
 		require.NoError(t, err, "party %d encrypt", id)
 		require.NotEmpty(t, ct)
 
-		got, err := UnmarshalEncrypted(ct, enc)
+		got, err := UnmarshalEncrypted(ct, enc, s.Binding())
 		require.NoError(t, err, "party %d decrypt", id)
 		require.Equal(t, s.MyID, got.MyID)
 		require.True(t, s.Share.Equals(&got.Share))
@@ -102,7 +102,7 @@ func TestUnmarshalEncryptedWrongKey(t *testing.T) {
 	ct, err := MarshalEncrypted(setups[1], enc1)
 	require.NoError(t, err)
 
-	_, err = UnmarshalEncrypted(ct, enc2)
+	_, err = UnmarshalEncrypted(ct, enc2, setups[1].Binding())
 	require.Error(t, err, "decrypting with wrong key should fail")
 }
 
@@ -149,7 +149,10 @@ func TestMarshalEncryptedEncryptError(t *testing.T) {
 }
 
 func TestUnmarshalEncryptedDecryptError(t *testing.T) {
-	_, err := UnmarshalEncrypted([]byte("data"), &failingEncryptor{})
+	setups := fullSetup(t)
+	ct, err := MarshalEncrypted(setups[1], newTestEncryptor())
+	require.NoError(t, err)
+	_, err = UnmarshalEncrypted(ct, &failingEncryptor{}, setups[1].Binding())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "decrypt")
 }
@@ -164,7 +167,7 @@ func TestMarshalEncryptedFunctional(t *testing.T) {
 	for id, s := range setups {
 		ct, err := MarshalEncrypted(s, enc)
 		require.NoError(t, err)
-		r, err := UnmarshalEncrypted(ct, enc)
+		r, err := UnmarshalEncrypted(ct, enc, s.Binding())
 		require.NoError(t, err)
 		restored[id] = r
 	}

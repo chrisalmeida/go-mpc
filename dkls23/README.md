@@ -23,6 +23,8 @@ Paper: https://eprint.iacr.org/2023/765.pdf
 | `encoding.go` | Custom JSON marshaling for all protocol message types (versioned `SignerSetup` wire format) | |
 | `validation.go` | Validate local setup, selected peers and locally recomputable private signing state before use | Protocols 3.6, 5.2 |
 | `setup_messages.go` | Wire types for the one-time base OT and FZero setup messages | |
+| `state_encoding.go` | Bound private signing and refresh checkpoints; strict versioned refresh JSON | Local persistence format |
+| `session.go` | `SessionCodec.Signing` / `.Refresh` callbacks using encrypted authoritative state | Existing signing and refresh rounds |
 | `errors.go` | Typed errors: `CheatingPartyError`, `InvalidInputError`, `CorruptStateError`, `BlacklistedPartyError` | |
 
 ---
@@ -109,3 +111,48 @@ properties from independent side-channel evidence.
 - `github.com/btcsuite/btcd/btcec/v2` — constant-time `ModNScalar` arithmetic and independent verification of final ECDSA signatures
 - `golang.org/x/crypto/sha3` — SHAKE-256 (PRG expansion, Fiat-Shamir)
 - Standard library: `crypto/rand`, `crypto/sha256`, `crypto/subtle`
+
+## Cold signing and encrypted imports
+
+`SessionCodec{Encryptor: enc}.Signing(...)` and `.Refresh(...)` return callbacks
+for `session.Advance`. Initialize the store with the bound encrypted key checkpoint,
+then pass the current authoritative version, operation, participants and round.
+`Advance` returns encrypted outbound bytes only after commit; `session.Output` recovers exact
+cached ciphertext. Use `codec.OpenOutput` before decoding and transport. Refresh
+round-2 messages contain secret shares; `OpenRefreshRound2` parses them after
+commit and each share needs confidential delivery. Each callback decodes fresh key and round objects. Refresh prepares
+a candidate before caller-coordinated `Activate`.
+
+For devices that shut down, use the default `session.Resumable` mode. For online
+operations use `session.Memory.Advance` and retain that Memory object between
+rounds; losing it requires an explicit abort. Encryption and serialization alone
+do not stop replay of a backup. Never roll back the authoritative progress store.
+Memory clears superseded checkpoint buffers after confirmed commits and retains
+state across uncertain outcomes; see [session](../session/README.md) and FU-LOW-10.
+
+Encrypted imports now require an expected `KeyBinding` from trusted application
+records. `SetupEncryptor` aliases `envelope.Encryptor` and requires authenticated
+encryption. The root README gives the explicit legacy decrypt/validate/reseal
+migration; existing plaintext and protocol wire formats are unchanged.
+
+`TestEncryptedSessionCodecSigningRefreshAndRestart` checks encrypted signing,
+refresh and post-refresh signing, lost commit acknowledgement, concurrent and
+sequential reuse, and independently verified signatures. New private JSON types
+have receiver-preservation error tables and fuzz targets. The example module also
+runs real processes against the file store; see AUDIT.md FU-MED-14.
+
+Run `go -C example/cold-dkls23 run . demo DIRECTORY` from the repository root
+with `MPC_WRAPPING_KEY` set to a 32-byte hex demo key and an empty directory.
+`init`, `request`, `round` and `combine` also run individually; `--help` and the
+[root README](../README.md) show the file flow. Each device retains its encrypted
+private state; the coordinator routes per-recipient protocol messages and combines
+without a secret key. `TestColdDKLSCommandsRestartRelocateAndRecoverOutput` checks
+these commands across restarts and relocation, lost file delivery and cached
+retry, with independent ECDSA verification. See AUDIT.md FU-LOW-9.
+
+`MarshalRound1Encrypted` / `MarshalRound2Encrypted` bind the existing round state
+to its setup and signing ID. New envelope payloads preserve arbitrary operation
+ID bytes with base64; legacy plaintext JSON remains unchanged. These ephemeral
+OT/VOLE values belong to one operation only. Stopping before the message after
+round 2 requires `SessionSignInput.AllowPreSigning`; the protocol still consumes
+the message only at round 3, under the §3.3 assumptions already documented above.

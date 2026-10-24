@@ -11,7 +11,7 @@ Threshold signing library in Go. Two protocols, implemented strictly from their 
 
 - **Module**: `github.com/chrisalmeida/go-mpc`
 - **Go**: `go 1.26.0` minimum (required by `golang.org/x/crypto`), `toolchain go1.26.1` pinned in `go.mod` (CI reads it via `go-version-file`)
-- **Scope**: cryptography, plus `session/`, a storage-agnostic progress guard for the signing and refresh rounds. Callers still supply transport, authentication, broadcast, session ids, and the storage backend behind `session.Store`. No resharing (changing t or n), no key derivation.
+- **Scope**: cryptography, `envelope/` for context-bound caller-encrypted containers, and `session/`, a storage-agnostic progress guard for the signing and refresh rounds. Callers still supply transport, authentication, broadcast, session ids, authenticated encryption and keys, and the storage backend behind `session.Store`. No resharing (changing t or n), no key derivation.
 
 ## Repository Map
 
@@ -29,7 +29,9 @@ Threshold signing library in Go. Two protocols, implemented strictly from their 
   - `setup_messages.go` — wire types for the one-time pairwise setup (FZero messages; base-OT messages live in `ot.go`)
   - `encoding.go` — JSON marshaling for every type; `SetupWireVersion`
   - `validation.go` — local setup and selected-peer checks; private signing-state consistency checks before later-round output
-  - `persistence.go` — `SetupEncryptor` interface, `MarshalEncrypted`/`UnmarshalEncrypted`
+  - `persistence.go` — `SetupEncryptor` alias, `KeyBinding`, bound encrypted setup import/export; byte-exact session IDs in a new versioned envelope payload
+  - `state_encoding.go` — bound signing-round envelopes and strict versioned `RefreshState` codec
+  - `session.go` — `SessionCodec.Signing` and `.Refresh`: fresh encrypted authoritative state per round
   - `errors.go` — `CheatingPartyError`, `InvalidInputError`, `CorruptStateError`, `BlacklistedPartyError`
 - `frost/` — FROST package. Every file is security-critical.
   - `params.go` — ciphersuite constants, `decodePoint` (RFC 8032 §5.1.3), `deserializeElement` (RFC 9591 §6.1), scalar helpers, package doc
@@ -40,18 +42,31 @@ Threshold signing library in Go. Two protocols, implemented strictly from their 
   - `refresh.go` — proactive refresh with zero-constant polynomials
   - `encoding.go` — JSON marshaling; `WireFormatVersion`
   - `validation.go` — configured key/participant checks, optional verification/DKG metadata validation, local refresh polynomial checks
-  - `persistence.go`, `errors.go` — as in dkls23
+  - `persistence.go` — bound encrypted `KeyShare` and `SignerState` persistence with trusted expected `KeyBinding`
+  - `state_encoding.go` — strict versioned nonce/refresh encodings and bound envelopes; fresh restored nonce-use records
+  - `session.go` — `SessionCodec.Signing` and `.Refresh` callbacks
+  - `errors.go` — typed protocol errors
 - `session/` — caller-side transactional progress guard for both protocols (AUDIT.md FU-MED-6); it chooses neither a database nor a private-state format.
   - `store.go` — `Scope`, `ID`, `Version`, `KeyRecord`, `Record`; the `Store`/`Transaction` contract; `Request`, `Input`, `Update`, `Compute`; sentinel errors
   - `guard.go` — `Initialize`, `InspectKey`, `InspectSession`, `Advance` (at most one committed result per round, nonce-marker reservation, cached outputs, refresh prepare), `Output`, `Abort`, `Blacklist`, `Activate`; rolled-back attempts can be recomputed by a later explicit call
-  - `storetest/` — `Run`, the `Store` conformance suite every adapter must pass under `-race`, and `Model`, an in-memory fault-injecting store for tests (not a backend)
+  - `memory.go` — optional `Memory.Advance`, `Forget`, `Close`; no private round checkpoint in storage, clear superseded buffers after confirmed commits, retain candidates on uncertainty, abort after losing process state
+  - `storetest/` — `Run`, the `Store` conformance suite every adapter must pass under `-race`, including mode persistence across reopening and rejection of a mode-dropping adapter; `Model`, an in-memory fault-injecting store for tests (not a backend)
   - `dkls23/store_test.go`, `frost/store_test.go` — complete signing sessions driven through `Advance`, with a lost commit acknowledgement, concurrent calls and a stale backup
+- `envelope/` — context-bound containers used by protocol persistence and session codecs; no cipher or key is chosen by the library.
+  - `binding.go` — trusted public key, party and epoch binding for encrypted imports
+  - `envelope.go` — `Encryptor`, optional `ContextEncryptor`, typed errors, `Seal`, `Open`, `Peek`; header check before decryption and embedded context check before payload release
+  - `context.go` — `Context`, protocol/kind metadata, canonical length-prefixed encoding and strict header decoding
+  - `envelope_test.go`, `decoding_test.go`, `fuzz_test.go` — authenticated legacy/AAD tests, context substitution, malformed input, ownership, failures, `FuzzOpen` and `FuzzPeek`
+- `internal/statejson/` — canonical private-envelope JSON validation: recursive duplicate checks and re-encoding comparison; legacy plaintext import behavior is unchanged.
 - `example/` — separate module (`go.mod` with `replace github.com/chrisalmeida/go-mpc => ../`), not part of `go test ./...`
-  - `shared/` — AES-256-GCM `SetupEncryptor` used by both demos
+  - `shared/` — AES-256-GCM envelope encryption with an environment wrapping key, key IDs and rotation; example `FileStore` with Linux/macOS kernel locks, atomic file replacement and sync; fixed scope-lock encoding and discovery of existing partitions independent of Gob type history; conformance, crash and cross-process tests
   - `dkls23/` — 3-of-3 demo: DKG → base OT + FZero → persist → sign → refresh → persist → sign; `node/` wraps the package per party
   - `frost/` — 2-of-3 demo with every signer subset, persistence and refresh
-  - Each demo writes `shares/` (gitignored); delete it to start from a fresh DKG
-- Documents: `README.md` (user-facing, includes "Upgrading from v0.x"), `dkls23/README.md` and `frost/README.md` (per-package file maps and protocol flow), `SECURITY.md` (threat model, timing design and evidence, limitations, disclosure), `AUDIT.md` (findings with IDs; the 2026-10-16 follow-up section and the 2026-10-21 hardening addendum supersede the original text where they disagree), `CHANGELOG.md` (Keep a Changelog), `CONTRIBUTING.md`, `session/README.md` (the guard's flow and the `Store` contract), `docs/encrypted-state-and-cold-signing.md` (design note under review: envelope binding, state encodings, guard modes, cold-signing flows; not yet implemented), `AGENTS.md` (a pointer to this file for agents that read that name instead; keep it a pointer, not a copy)
+  - `cold-frost/` — two device directories, public message files and a separate process per signing round; commands `init`, `commit`, `request`, `sign`, `aggregate`, `demo`
+  - `cold-dkls23/` — three device directories and a separate process per signing round; commands `init`, `request`, `round`, `combine`, `demo`; coordinator requests contain only each recipient's inbound protocol messages
+  - `frost/node/persist.go` — additive `SaveSignerState` / `LoadSignerState` snapshot helpers retain epoch and blacklist; legacy bare-key helpers remain, with their epoch-zero limitation documented
+  - Ordinary demos use `session.Memory`; cold flows use resumable checkpoints. Set `MPC_WRAPPING_KEY` and optionally `MPC_DEMO_DIR`; no encryption keys are written beside shares. CI uses disposable directories via `scripts/run-examples.sh`.
+- Documents: `README.md` (user-facing, includes "Upgrading from v0.x"), `dkls23/README.md` and `frost/README.md` (per-package file maps and protocol flow), `SECURITY.md` (threat model, timing design and evidence, limitations, disclosure), `AUDIT.md` (findings with IDs; the 2026-10-16 follow-up section and later hardening addenda supersede the original text where they disagree), `CHANGELOG.md` (Keep a Changelog), `CONTRIBUTING.md`, `session/README.md` (the guard's flow and the `Store` contract), `envelope/README.md` (the container format and encryption contract), `docs/encrypted-state-and-cold-signing.md` (design, implemented APIs, compatibility changes and restart evidence), `AGENTS.md` (a pointer to this file for agents that read that name instead; keep it a pointer, not a copy)
 
 ## Development Workflow
 
@@ -63,7 +78,7 @@ make cover         # coverage summary
 make bench         # benchmarks
 make fuzz          # every fuzz target, 5s each
 make vuln          # govulncheck (pinned v1.9.0)
-make examples      # vet and run both demos
+make examples      # vet, race-test adapters/processes, run online reloads and both cold flows
 make ci            # everything CI runs; must be green before any PR or commit to develop/main
 ```
 
@@ -87,7 +102,7 @@ make ci            # everything CI runs; must be green before any PR or commit t
 These rules exist because the 2026-10-16 review found that earlier code had drifted from the specifications in exploitable ways (AUDIT.md FU-CRIT-1 onward), and because the 2026-10-21 review then found five properties that function names, comments and SECURITY.md asserted but the code did not have (FU-HIGH-2, FU-HIGH-3, FU-MED-5, FU-MED-7, FU-MED-8). They apply to every change and every review under `dkls23/` and `frost/`.
 
 1. **Implement the cited specification; never invent.** dkls23 follows the DKLS23 paper and the papers it delegates to: KOS15 ([ePrint 2015/546](https://eprint.iacr.org/2015/546)) for the OT extension, Masny-Rindal ([ePrint 2019/706](https://eprint.iacr.org/2019/706)) for the base OT, KMOS21 ([ePrint 2019/1328](https://eprint.iacr.org/2019/1328)) for refresh. frost follows RFC 9591 and, for the DKG the RFC does not specify, the FROST paper. If the spec does not say it, do not add it; if a detail is open (an encoding, a domain tag, a hash input order), choose the simplest unambiguous option and document it in the GoDoc and in AUDIT.md.
-2. **Only one-time setup material is persistent in dkls23.** `SignerSetup` stores base-OT seeds (`AliceBaseOT`, `BobBaseOT`) and `FZeroSeeds`. OT-extension batches and VOLE correlations belong to one signing session and must never be stored, cached, or reused: reuse reveals nonce differences and recovers the key.
+2. **Only one-time setup material belongs in the long-term dkls23 setup.** `SignerSetup` stores base-OT seeds (`AliceBaseOT`, `BobBaseOT`) and `FZeroSeeds`. OT-extension batches and VOLE correlations belong to exactly one signing operation. The approved cold-signing flow permits their encrypted private round checkpoint only for resuming that same operation under authoritative `session.Store` progress. Never reuse or pool them across operations: reuse reveals nonce differences and recovers the key. Completion and abort remove the current private checkpoint; historical copies and whole-store rollback still require deployment controls.
 3. **Every signing session needs a fresh session id** (DKLS23 Protocol 3.6 step 4) and every FROST DKG a fresh `Context`. dkls23 enforces freshness per setup and epoch through `SignerSetup.SessionIDs` (each round of a session runs exactly once; reuse is `SessionIDReusedError`; `RefreshFinalize` clears the record because the new seeds re-key everything an id feeds into). Keep that enforcement when changing the signing rounds, and keep the caller-side requirement documented.
 4. **Validate everything received before use.** Lengths, canonical encodings, points on the curve, and for frost protocol elements the full RFC 9591 §6.1 rules through `deserializeElement` (non-identity, prime-order subgroup). Parse protocol elements with the strict helper, never with the raw library decoder. Public signature verification follows the separate RFC 8032 decoding and cofactored equation required by RFC 9591 §6.1; retain that distinction (see `Verify` and `TestVerifyCofactoredEquation`).
 5. **Attribute misbehaviour correctly.** Report with `CheatingPartyError.PartyIDs`; blacklist only where the specification's channel assumptions make the attribution sound (authenticated point-to-point channels; for FROST a coordinator that does not equivocate). Protocol-level inconsistency that cannot be pinned on a party is `CorruptStateError`, not a blacklist.
@@ -109,6 +124,7 @@ These rules exist because the 2026-10-16 review found that earlier code had drif
 - **dkls23**: the curve backend adapter and `selectPoint` in `curve.go`; `reduce64` on FZero output; DKG commitment opening and commitment-count check; base-OT message validation and identity rejection; OT-extension consistency check and pad handling; VOLE Fiat-Shamir proof; R-commitment decommitment and checks 1-3; final signature verification in `SignCombine`; refresh commitment opening and seed re-randomization; encryption key handling in persistence.
 - **frost**: DKG proof-of-knowledge verification and Feldman checks; `deserializeElement` on every received element; hedged nonce generation and the `consumed` guard plus shared `nonceUse` record against nonce reuse (round 2 holds the signer's write lock); binding-factor and commitment-list encoding; share verification in `Aggregate`; cofactored verification; refresh commitment and count checks; encryption key handling.
 - **session**: `Advance`'s version check, participant binding, nonce-marker reservation, output caching and refresh prepare/activate gating; the `loadKey`/`loadSession` corruption checks; the `Store` contract exercised by `storetest.Run`, including rollback that preserves previously committed records and nonce reservations. Passing the suite does not establish every part of the backend's contract or physical durability.
+- **envelope**: strict framing/context validation; matching trusted expected context before decryption and embedded bytes before payload release; authenticated encryption required from both encryptor interfaces; no plaintext on errors; owned buffers for in-place encryptors. Envelopes alone do not enforce replay or rollback protection.
 
 ## Testing
 
@@ -122,7 +138,7 @@ These rules exist because the 2026-10-16 review found that earlier code had drif
 - Every wire type has a `FuzzUnmarshal<Type>` target and a table of unmarshal error cases; every `UnmarshalJSON` must fail cleanly on bad input: no panic, and the rejection test asserts the receiver re-marshals byte-identical to its state before the call, not merely that an error is returned.
 - Every one-use or single-application guard has a sequential second-call test and a concurrent test under `-race`, each asserting exactly one success and that the resulting signature or state still verifies independently.
 - Every property stated in SECURITY.md or a GoDoc comment is backed by a test that would fail if it were false, and the test name or AUDIT.md entry says which claim it backs. A claim with no such test moves to Known Limitations (rule 11).
-- Coverage stays at 90%+ per production package (`dkls23`, `frost`, `session`; `make cover` measures exactly these). `session/storetest` is exempt only for the failure branches of its conformance harness, which run solely against a broken backend. Everything runs under `-race`.
+- Coverage stays at 90%+ per production package (`dkls23`, `frost`, `session`, `envelope`, `internal/statejson`; `make cover` measures exactly these). `session/storetest` is exempt only for the failure branches of its conformance harness, which run solely against a broken backend. Everything runs under `-race`.
 
 ### dkls23 fixtures (`helpers_test.go`, `sign_test.go`, `dkg_test.go`)
 
@@ -156,7 +172,10 @@ CI runners are 3-5× slower than a laptop. Every test that does crypto work (bas
 
 - JSON with hex-encoded byte fields; big arrays use base64 (`encodeVOLESlice`). Maps keyed by party ID use string keys.
 - `SignerSetup` JSON carries `"version": SetupWireVersion`; `KeyShare` and `SignerState` carry `"version": WireFormatVersion`. Unmarshaling rejects missing or different versions, so old key material is never misread.
-- `SetupEncryptor` is the caller's: the packages never choose a cipher or hold an encryption key. The demos' AES-256-GCM encryptor is an example, not a recommendation for key management.
+- `SetupEncryptor` aliases `envelope.Encryptor`: callers supply authenticated encryption and keys. Encrypted imports require a trusted `KeyBinding`; do not trust `Peek` by itself. Legacy unbound ciphertext requires explicit decrypt/validate/reseal migration. Bare FROST `KeyShare` has no epoch; persist `SignerState` for refresh and blacklist retention.
+- New private nonce and refresh schemas use `PrivateStateVersion = 1`; DKLS23 bound payloads separately preserve opaque signing IDs as base64. These do not change the existing plaintext key/round formats or protocol messages.
+- `session.Request.Mode` defaults to `Resumable`. For online operations use `session.Memory.Advance`; after losing Memory, abort pending operations. New nonce reservations contain only SHA-256 digests; legacy raw reservations are checked, not removed.
+- The demos' AES-GCM encryptor is an example with per-blob data keys and an environment wrapping key. It is not a production key-management recommendation; Go's AES timing depends on enabled hardware support.
 - Marshaled `SignerSetup` / `KeyShare` contain plaintext secret shares and seeds. Treat the output of `MarshalSetup` / `MarshalKeyShare` as secret; only the `*Encrypted` variants are safe to write to disk.
 
 ## Documentation Duties
@@ -173,7 +192,7 @@ Code changes are not done until the documents match:
 
 ## CI
 
-`.github/workflows/ci.yml` runs on pull requests and on pushes to `main`: gofmt check → `go mod tidy` check → `go vet` → staticcheck → `go test -race` with coverage → coverage summary → vet and run both example programs → 5-second fuzz pass over every fuzz target → govulncheck. `make ci` reproduces it locally and must pass before pushing.
+`.github/workflows/ci.yml` runs on pull requests and on pushes to `main`: gofmt check → `go mod tidy` check → `go vet` → staticcheck → `go test -race` with coverage → coverage summary → vet/race-test the example module, run both online demos twice and both cold flows → 5-second fuzz pass over every fuzz target → govulncheck. `make ci` reproduces it locally and must pass before pushing.
 
 ## Release Checklist
 

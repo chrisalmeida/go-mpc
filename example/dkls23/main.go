@@ -2,25 +2,26 @@
 //
 //  1. Key Generation  — Feldman VSS DKG (commit-then-reveal), no trusted dealer
 //  2. Pairwise Setup  — one-time base OTs + FZero seeds
-//  3. Signing         — 3-round threshold ECDSA; each session runs a fresh
-//     OT extension and VOLE over the base OTs
-//  4. Key Refresh     — rotate shares without changing the public key
-//  5. Persistence     — encrypted key shares saved to disk and reloaded
+//  3. Persistence     — encrypted setup and authoritative session progress
+//  4. Signing         — 3-round threshold ECDSA with fresh OT extension and VOLE
+//  5. Key Refresh     — prepare every party, activate, reload, and sign again
 //
-// On the first run, all five phases execute and shares are saved to shares/.
-// On subsequent runs, shares are loaded from disk — DKG and pairwise setup
-// are skipped, and the public key stays the same.
+// Set MPC_WRAPPING_KEY to a 32-byte hex demo key and retain it between runs.
+// MPC_DEMO_DIR selects the store directory (default shares/). The first run
+// creates a group; subsequent runs reload it and skip DKG and pairwise setup.
+// Choose a new empty directory for a separate demo group.
 //
-// Delete the shares/ directory to start fresh.
-//
-// Run: cd example/dkls23 && go run .
+// Private round checkpoints stay in session.Memory for this online demo.
+// See example/cold-dkls23 for resumable signing across process restarts.
+// Run from the repository root: go -C example/dkls23 run .
 package main
 
 import (
+	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
-	"path/filepath"
 
 	"go-mpc-example/dkls23/node"
 	"go-mpc-example/shared"
@@ -29,20 +30,41 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 
 	"github.com/chrisalmeida/go-mpc/dkls23"
+	"github.com/chrisalmeida/go-mpc/session"
 )
 
 const (
-	shareDir  = "shares"
 	threshold = 3
 )
 
 var allIDs = []int{1, 2, 3}
+var shareDir = shared.DemoDirectory()
+var demoEncryptor *shared.AESEncryptor
+var demoStore = &shared.FileStore{Directory: shareDir}
+var guards = make(map[int]*shared.Guard)
+
+func must(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+func round(id int, kind session.Kind, operation string, phase int, parties []int, compute session.Compute) []byte {
+	op, err := guards[id].ID(kind, operation)
+	must(err)
+	output, err := guards[id].Advance(op, phase, parties, compute)
+	must(err)
+	if kind == session.Signing || phase == 1 {
+		output, err = (dkls23.SessionCodec{Encryptor: demoEncryptor}).OpenOutput(output, dkls23.KeyBinding{PublicKey: []byte(guards[id].Scope.PublicKey), PartyID: id, Epoch: op.Epoch}, op, phase)
+		must(err)
+	}
+	return output
+}
 
 func main() {
 	fmt.Println("DKLS23 Threshold ECDSA — 3-of-3 Demo")
 	fmt.Println()
 
-	nodes, pubKey, enc := loadOrGenerate()
+	nodes, pubKey, _ := loadOrGenerate()
 
 	// ── Signing (before refresh) ────────────────────────────────────
 
@@ -55,9 +77,7 @@ func main() {
 	fmt.Println("Phase: Key Refresh")
 	refresh(nodes)
 	fmt.Println("  shares rotated, public key unchanged")
-	// Persist the refreshed shares: the pre-refresh shares on disk are now
-	// stale and must not be used again.
-	saveShares(nodes, enc)
+	// Activation has persisted the refreshed setup and advanced the epoch.
 	fmt.Printf("  refreshed shares saved (epoch %d)\n", nodes[0].Epoch())
 	fmt.Println()
 
@@ -70,9 +90,10 @@ func main() {
 }
 
 // loadOrGenerate loads existing shares from disk or runs the full ceremony
-// (DKG → pairwise setup → refresh → persist) if no shares exist.
+// (DKG → pairwise setup → initialize the store) if no manifest exists.
 func loadOrGenerate() (nodes []*node.Node, pubKey []byte, enc *shared.AESEncryptor) {
 	enc, loaded, err := shared.LoadOrCreateKey(shareDir)
+	demoEncryptor = enc
 	if err != nil {
 		log.Fatalf("encryption key: %v", err)
 	}
@@ -84,37 +105,26 @@ func loadOrGenerate() (nodes []*node.Node, pubKey []byte, enc *shared.AESEncrypt
 	return nodes, pubKey, enc
 }
 
-// saveShares encrypts and writes every node's SignerSetup to disk.
-func saveShares(nodes []*node.Node, enc *shared.AESEncryptor) {
-	for _, n := range nodes {
-		p := filepath.Join(shareDir, fmt.Sprintf("node-%d.enc", n.ID))
-		if err := n.SaveSetup(p, enc); err != nil {
-			log.Fatalf("save node %d: %v", n.ID, err)
-		}
-	}
-}
-
-// loadShares reads encrypted share files and returns ready-to-sign nodes.
 func loadShares(enc *shared.AESEncryptor) ([]*node.Node, []byte) {
-	fmt.Println("Loading key shares from disk...")
-
+	m, err := shared.LoadManifest(shareDir)
+	must(err)
+	if m.Protocol != "dkls23" {
+		log.Fatal("wrong protocol in demo manifest")
+	}
 	nodes := make([]*node.Node, len(allIDs))
 	for i, id := range allIDs {
-		p := filepath.Join(shareDir, fmt.Sprintf("node-%d.enc", id))
-		n, err := node.NewFromFile(p, enc)
-		if err != nil {
-			log.Fatalf("load node %d: %v", id, err)
-		}
-		nodes[i] = n
-		fmt.Printf("  node %d loaded (epoch %d)\n", n.ID, n.Epoch())
+		scope := session.Scope{Protocol: session.DKLS23, PublicKey: string(m.PublicKey), PartyID: id}
+		key, err := session.InspectKey(context.Background(), demoStore, scope)
+		must(err)
+		setup, err := dkls23.UnmarshalEncrypted(key.Checkpoint, enc, dkls23.KeyBinding{PublicKey: m.PublicKey, PartyID: id, Epoch: key.Epoch})
+		must(err)
+		nodes[i] = &node.Node{ID: id, AllIDs: allIDs, Threshold: threshold, Setup: setup}
+		guards[id] = &shared.Guard{Store: demoStore, Scope: scope}
 	}
-
-	pubKey := nodes[0].PublicKey()
-	fmt.Printf("  public key: %s\n\n", hex.EncodeToString(pubKey))
-	return nodes, pubKey
+	return nodes, m.PublicKey
 }
 
-// generateAndSave runs DKG, pairwise setup, refresh, and saves to disk.
+// generateAndSave runs DKG and pairwise setup, then initializes the store.
 func generateAndSave(enc *shared.AESEncryptor) ([]*node.Node, []byte) {
 	// ── DKG ─────────────────────────────────────────────────────
 
@@ -167,15 +177,15 @@ func generateAndSave(enc *shared.AESEncryptor) ([]*node.Node, []byte) {
 	}
 	fmt.Println()
 
-	// ── Persist ─────────────────────────────────────────────────
-
-	fmt.Println("Phase 3: Saving Key Shares")
-
-	saveShares(nodes, enc)
 	for _, n := range nodes {
-		fmt.Printf("  node %d → %s\n", n.ID, filepath.Join(shareDir, fmt.Sprintf("node-%d.enc", n.ID)))
+		scope := session.Scope{Protocol: session.DKLS23, PublicKey: string(pubKey), PartyID: n.ID}
+		checkpoint, err := dkls23.MarshalEncrypted(n.Setup, enc)
+		must(err)
+		_, err = session.Initialize(context.Background(), demoStore, scope, 0, checkpoint)
+		must(err)
+		guards[n.ID] = &shared.Guard{Store: demoStore, Scope: scope}
 	}
-	fmt.Println()
+	must(shared.SaveManifest(shareDir, shared.Manifest{Protocol: "dkls23", PublicKey: pubKey, Parties: allIDs}))
 
 	return nodes, pubKey
 }
@@ -212,97 +222,84 @@ func signAndPrint(nodes []*node.Node, pubKey []byte, signers []int, message []by
 	fmt.Println()
 }
 
-// refresh runs the 2-round key refresh protocol across all nodes.
+// refresh runs each round through encrypted authoritative state and activates
+// only after every participant has prepared its candidate in this demo.
 func refresh(nodes []*node.Node) {
-	allRefR1 := make(map[int]*dkls23.RefreshRound1Output)
+	operation := node.SessionID()
+	codec := dkls23.SessionCodec{Encryptor: demoEncryptor}
+	r1 := make(map[int]*dkls23.RefreshRound1Output)
+	r2 := make(map[int]*dkls23.RefreshRound2Output)
 	for _, n := range nodes {
-		out, err := n.RefreshRound1()
-		if err != nil {
-			log.Fatalf("refresh round 1 node %d: %v", n.ID, err)
-		}
-		allRefR1[n.ID] = out
+		var out dkls23.RefreshRound1Output
+		must(json.Unmarshal(round(n.ID, session.Refresh, operation, 1, allIDs, codec.Refresh(nil, nil)), &out))
+		r1[n.ID] = &out
+	}
+	for _, n := range nodes {
+		blob := round(n.ID, session.Refresh, operation, 2, allIDs, codec.Refresh(r1, nil))
+		out, err := codec.OpenRefreshRound2(blob, n.Setup.Binding(), operation)
+		must(err)
+		r2[n.ID] = out
 	}
 
-	allRefR2 := make(map[int]*dkls23.RefreshRound2Output)
 	for _, n := range nodes {
-		out, err := n.RefreshRound2(allRefR1)
-		if err != nil {
-			log.Fatalf("refresh round 2 node %d: %v", n.ID, err)
-		}
-		allRefR2[n.ID] = out
+		round(n.ID, session.Refresh, operation, 3, allIDs, codec.Refresh(r1, r2))
 	}
-
 	for _, n := range nodes {
-		if err := n.RefreshFinalize(allRefR1, allRefR2); err != nil {
-			log.Fatalf("refresh finalize node %d: %v", n.ID, err)
-		}
+		must(guards[n.ID].Activate(operation))
+	}
+	restored, _ := loadShares(demoEncryptor)
+	for i := range nodes {
+		*nodes[i] = *restored[i]
 	}
 }
 
-// sign runs the 3-round signing protocol across all nodes and returns (r, s).
-func sign(nodes []*node.Node, signers []int, message []byte) (r, s []byte) {
-	nodeMap := make(map[int]*node.Node, len(nodes))
-	for _, n := range nodes {
-		nodeMap[n.ID] = n
+// sign runs three guarded rounds; no private round state leaves a codec.
+func sign(nodes []*node.Node, signers []int, message []byte) ([]byte, []byte) {
+	operation := node.SessionID()
+	codec := dkls23.SessionCodec{Encryptor: demoEncryptor}
+	r1 := make(map[int]map[int]*dkls23.Round1Msg)
+	r2 := make(map[int]map[int]*dkls23.Round2Msg)
+	r3 := make(map[int]map[int]*dkls23.Round3Msg)
+	for _, id := range signers {
+		var out map[int]*dkls23.Round1Msg
+		must(json.Unmarshal(round(id, session.Signing, operation, 1, signers, codec.Signing(dkls23.SessionSignInput{})), &out))
+		r1[id] = out
 	}
-
-	sigID := node.SessionID()
-
-	// Round 1: nonce commitments.
-	r1States := make(map[int]*dkls23.Round1State)
-	r1Msgs := make(map[int]map[int]*dkls23.Round1Msg)
-	for _, n := range nodes {
-		st, msgs, err := n.SignRound1(sigID, signers)
-		if err != nil {
-			log.Fatalf("sign round 1 node %d: %v", n.ID, err)
+	for _, id := range signers {
+		var out map[int]*dkls23.Round2Msg
+		input := dkls23.SessionSignInput{Round1: routeMsgs(signers, id, r1), Message: message}
+		must(json.Unmarshal(round(id, session.Signing, operation, 2, signers, codec.Signing(input)), &out))
+		r2[id] = out
+	}
+	for _, id := range signers {
+		var out map[int]*dkls23.Round3Msg
+		input := dkls23.SessionSignInput{Round2: routeMsgs(signers, id, r2), Message: message}
+		must(json.Unmarshal(round(id, session.Signing, operation, 3, signers, codec.Signing(input)), &out))
+		r3[id] = out
+	}
+	points := make(map[int][]byte)
+	fragments := make(map[int]*dkls23.Round3Msg)
+	for _, id := range signers {
+		for _, out := range r2[id] {
+			points[id] = out.Decommitment
+			break
 		}
-		r1States[n.ID] = st
-		r1Msgs[n.ID] = msgs
+		fragments[id] = r3[id][signers[0]]
 	}
-
-	// Round 2: VOLE multiply, decommit nonces.
-	r2States := make(map[int]*dkls23.Round2State)
-	r2Msgs := make(map[int]map[int]*dkls23.Round2Msg)
+	rx, err := dkls23.ComputeRx(points)
+	must(err)
+	own := fragments[signers[0]]
+	var w, u btcec.ModNScalar
+	w.SetByteSlice(own.W_i)
+	u.SetByteSlice(own.U_i)
+	var combiner *node.Node
 	for _, n := range nodes {
-		in := routeMsgs(signers, n.ID, r1Msgs)
-		st, msgs, err := n.SignRound2(r1States[n.ID], in)
-		if err != nil {
-			log.Fatalf("sign round 2 node %d: %v", n.ID, err)
-		}
-		r2States[n.ID] = st
-		r2Msgs[n.ID] = msgs
-	}
-
-	// Round 3: consistency checks, compute signature fragments.
-	r3Frags := make(map[int]map[int]*dkls23.Round3Msg)
-	for _, n := range nodes {
-		in := routeMsgs(signers, n.ID, r2Msgs)
-		frags, err := n.SignRound3(r2States[n.ID], message, in)
-		if err != nil {
-			log.Fatalf("sign round 3 node %d: %v", n.ID, err)
-		}
-		r3Frags[n.ID] = frags
-	}
-
-	// Combine: node 1 aggregates fragments into (r, s).
-	combiner := nodeMap[1]
-	rx := node.ComputeRx(signers, r2States)
-	myFrag := r3Frags[1][1]
-	var myW, myU btcec.ModNScalar
-	myW.SetByteSlice(myFrag.W_i)
-	myU.SetByteSlice(myFrag.U_i)
-
-	allFrags := make(map[int]*dkls23.Round3Msg)
-	for _, j := range signers {
-		if j != 1 {
-			allFrags[j] = r3Frags[j][1]
+		if n.ID == signers[0] {
+			combiner = n
 		}
 	}
-
-	r, s, err := combiner.SignCombine(&rx, &myW, &myU, allFrags, message)
-	if err != nil {
-		log.Fatalf("sign combine: %v", err)
-	}
+	r, s, err := combiner.SignCombine(&rx, &w, &u, fragments, message)
+	must(err)
 	return r, s
 }
 

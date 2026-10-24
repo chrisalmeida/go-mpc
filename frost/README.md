@@ -20,6 +20,8 @@ Implementation of **RFC 9591** ("Two-Round Threshold Schnorr Signatures with FRO
 | `encoding.go` | Versioned JSON wire format for every message and persisted type | |
 | `validation.go` | Validate local keys, participant membership, optional public metadata and refresh polynomial size before use | RFC 9591 §5 |
 | `persistence.go` | Pluggable encrypted storage for `KeyShare` and `SignerState` | |
+| `state_encoding.go` | Bound private signing and refresh checkpoints; strict versioned refresh JSON | Local persistence format |
+| `session.go` | `SessionCodec.Signing` / `.Refresh` callbacks using encrypted authoritative state | Existing signing and refresh rounds |
 | `errors.go` | Typed errors: `CheatingPartyError`, `InvalidInputError`, `CorruptStateError`, `BlacklistedPartyError` | |
 
 ---
@@ -77,3 +79,50 @@ for these behaviors and the limits of timing and memory-erasure assurance.
 
 - `filippo.io/edwards25519` — constant-time Ed25519 scalar and point arithmetic
 - Standard library: `crypto/rand`, `crypto/sha256`, `crypto/sha512`, `crypto/subtle`
+
+## Cold signing and encrypted imports
+
+`SessionCodec{Encryptor: enc}.Signing(...)` and `.Refresh(...)` return callbacks
+for `session.Advance`. Initialize the store with the bound encrypted key checkpoint,
+then pass the current authoritative version, operation, participants and round.
+`Advance` returns encrypted outbound bytes only after commit; `session.Output` recovers exact
+cached ciphertext. Use `codec.OpenOutput` before decoding and transport. Refresh
+round-2 messages contain secret shares; `OpenRefreshRound2` parses them after
+commit and each share needs confidential delivery. Each callback decodes fresh key and round objects. Refresh prepares
+a candidate before caller-coordinated `Activate`.
+
+For devices that shut down, use the default `session.Resumable` mode. For online
+operations use `session.Memory.Advance` and retain that Memory object between
+rounds; losing it requires an explicit abort. Encryption and serialization alone
+do not stop replay of a backup. Never roll back the authoritative progress store.
+Memory clears superseded checkpoint buffers after confirmed commits and retains
+state across uncertain outcomes; see [session](../session/README.md) and FU-LOW-10.
+
+Encrypted imports now require an expected `KeyBinding` from trusted application
+records. `SetupEncryptor` aliases `envelope.Encryptor` and requires authenticated
+encryption. The root README gives the explicit legacy decrypt/validate/reseal
+migration; existing plaintext and protocol wire formats are unchanged.
+
+`TestEncryptedSessionCodecSigningRefreshAndRestart` checks encrypted signing,
+refresh and post-refresh signing, lost commit acknowledgement, concurrent and
+sequential reuse, and independently verified signatures. New private JSON types
+have receiver-preservation error tables and fuzz targets. The example module also
+runs real processes against the file store; see AUDIT.md FU-MED-14.
+
+Run `go -C example/cold-frost run . demo DIRECTORY` from the repository root
+with `MPC_WRAPPING_KEY` set to a 32-byte hex demo key and an empty directory.
+`init`, `commit`, `request`, `sign` and `aggregate` also run individually; `--help`
+and the [root README](../README.md) show the file flow. The request builder takes
+commitments in participant order. `TestColdSigningSeparateProcessesAndCachedOutput`
+checks the commands across restarts, relocation, failed file delivery and cached
+retry, then verifies the signature with `crypto/ed25519`. The example node's
+`SaveSignerState` / `LoadSignerState` retain epochs and blacklists;
+`TestSignerSnapshotRetainsRefreshedEpochAndBlacklist` checks a real refresh,
+restoration, blacklist rejection and independently verified signing. Existing
+bare-key helpers retain their epoch-zero behavior. See AUDIT.md FU-LOW-9.
+
+`MarshalSignerEncrypted` retains the key, epoch and blacklist. Bare `KeyShare`
+encryption is epoch zero. `MarshalRound1Encrypted` seals unused RFC 9591 nonces;
+restoration gets a fresh shared local use record, while cross-restoration one-use
+comes from authoritative session progress. Raw JSON or reopening a blob twice
+cannot provide that guarantee by itself.

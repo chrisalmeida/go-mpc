@@ -64,6 +64,50 @@ func TestConformanceRejectsDestructiveRollback(t *testing.T) {
 	}
 }
 
+func TestConformanceRejectsDroppedMode(t *testing.T) {
+	const faultEnv = "GO_MPC_STORETEST_DROP_MODE"
+	if os.Getenv(faultEnv) == "1" {
+		storetest.Run(t, func(t *testing.T) (session.Store, func() session.Store) {
+			model := &storetest.Model{}
+			open := func() session.Store { return droppingModeConnection{model.Open()} }
+			return open(), open
+		})
+		return
+	}
+	t.Parallel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(executable, "-test.run=^TestConformanceRejectsDroppedMode$", "-test.v")
+	cmd.Env = append(os.Environ(), faultEnv+"=1")
+	output, err := cmd.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) {
+		t.Fatalf("conformance did not reject dropped mode: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "operation mode not recovered") {
+		t.Fatalf("missing mode persistence failure:\n%s", output)
+	}
+}
+
+// This adapter preserves every other field and transaction behavior, isolating
+// the mode-persistence check from unrelated storage contract failures.
+type droppingModeConnection struct{ session.Store }
+
+func (c droppingModeConnection) Transact(ctx context.Context, scope session.Scope, fn func(session.Transaction) error) error {
+	return c.Store.Transact(ctx, scope, func(tx session.Transaction) error {
+		return fn(droppingModeTransaction{tx})
+	})
+}
+
+type droppingModeTransaction struct{ session.Transaction }
+
+func (tx droppingModeTransaction) PutSession(id session.ID, record session.Record) error {
+	record.Mode = session.Resumable
+	return tx.Transaction.PutSession(id, record)
+}
+
 // This test-only backend violates rollback by erasing the scope's previously
 // committed records on either a callback error or a panic. All other behavior
 // comes from Model, so its rejection exercises the populated rollback checks.

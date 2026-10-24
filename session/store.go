@@ -83,11 +83,25 @@ type KeyRecord struct {
 	Refresh        *PendingRefresh
 }
 
-// Record holds an operation's latest private checkpoint and cached public outputs.
-// Outputs retain each completed round's bytes for identical retransmission after
+// Mode selects whether an operation's private checkpoint survives a process
+// restart. The zero value preserves the existing resumable behavior.
+type Mode string
+
+const (
+	// Resumable persists encrypted operation checkpoints between rounds.
+	Resumable Mode = ""
+	// InMemory retains operation checkpoints only in a session.Memory instance.
+	// After losing that instance the pending operation can only be aborted.
+	InMemory Mode = "memory"
+)
+
+// Record holds an operation's latest private checkpoint and cached outgoing bytes.
+// Protocol codecs encrypt confidential refresh outputs before returning them.
+// Outputs retain each completed round's encoded bytes for identical retransmission after
 // a crash. Completion or explicit abort removes the latest private checkpoint;
 // the Store's physical erasure and historical copies remain the caller's concern.
 type Record struct {
+	Mode         Mode
 	Round        int
 	Participants []int
 	Checkpoint   []byte
@@ -116,9 +130,11 @@ type Store interface {
 
 // Transaction accesses records inside Store.Transact. Missing records return
 // found=false and err=nil. Reads return owned copies; writes copy their arguments.
-// Retain operation and nonce records across restarts and signer restoration.
-// Nonce markers are scoped to the key and party, not to an epoch. Treat all data
-// as confidential: even a nonce commitment may precede its protocol decommitment.
+// Retain operation records, including Record.Mode, and nonce records across
+// restarts and signer restoration.
+// Nonce markers are scoped to the key and party, not to an epoch. New markers
+// are SHA-256 digests; existing raw reservations remain readable for migration.
+// Treat progress, outputs and checkpoints as confidential application data.
 type Transaction interface {
 	Key() (record KeyRecord, found bool, err error)
 	PutKey(record KeyRecord) error
@@ -132,6 +148,7 @@ type Transaction interface {
 // Participants is a set of positive, distinct party IDs including Scope.PartyID.
 // Advance sorts a copy for storage only; it does not encode protocol transcripts.
 type Request struct {
+	Mode Mode
 	Version
 	ID           ID
 	Round        int
@@ -156,7 +173,8 @@ type Input struct {
 //
 // Signing round 1 also supplies NonceID: DKLS23's encoded R_i, or FROST's encoded
 // D_i || E_i. Derive it from the generated state, never from a caller-chosen random
-// identifier. Repeating this marker is rejected even under another session/epoch.
+// identifier. Advance stores its SHA-256 digest and also checks legacy raw
+// reservations. Repeating it is rejected even under another session/epoch.
 //
 // Abort can report a terminal protocol error while atomically recording the
 // updated key and any caller-authorized Blacklist entries. An aborted update
@@ -197,5 +215,6 @@ var (
 	ErrNonceUsed     = errors.New("session: nonce marker already used")
 	ErrBusy          = errors.New("session: signing or refresh is still pending")
 	ErrCorrupt       = errors.New("session: corrupt progress record")
+	ErrUnavailable   = errors.New("session: in-memory checkpoint unavailable; abort the operation")
 	ErrStoreContract = errors.New("session: store violated callback contract")
 )
